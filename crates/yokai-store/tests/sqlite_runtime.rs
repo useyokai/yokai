@@ -11,6 +11,7 @@ use std::fmt::Display;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::sync::Barrier;
 
 use rusqlite::{Connection, OpenFlags};
 use yokai_store as store;
@@ -21,6 +22,9 @@ const SQLITE_CONSTRAINT_FOREIGNKEY: i32 = 787;
 const BUNDLED_VERSION: &str = "3.53.2";
 const BUNDLED_SOURCE_ID: &str =
     "2026-06-03 19:12:13 d6e03d8c777cfa2d35e3b60d8ec3e0187f3e9f99d8e2ee9cac695fd6fcdf1a24";
+/// R11: fresh paths raced, and concurrent `create_file` callers per path.
+const RACE_ROUNDS: usize = 64;
+const RACE_CREATORS: usize = 16;
 
 struct Checks {
     total: usize,
@@ -205,5 +209,96 @@ fn run(c: &mut Checks) -> Result<(), String> {
         &header == b"SQLite format 3\0" && size > 0,
         format!("header={:?} size={size}", String::from_utf8_lossy(&header)),
     );
+
+    // R11: concurrent creators of one path. Every round, RACE_CREATORS threads released by one
+    // barrier call `create_file` on the same new path: exactly one gets a connection to that
+    // file with the required settings, and every other caller gets `AlreadyExists`.
+    let canonical_dir = std::fs::canonicalize(&dir).map_err(|e| format!("canonicalize: {e}"))?;
+    let mut bad_rounds = Vec::new();
+    for round in 0..RACE_ROUNDS {
+        let race_path = dir.join(format!("race-{round}.db"));
+        let barrier = Barrier::new(RACE_CREATORS);
+        let outcomes: Vec<String> = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..RACE_CREATORS)
+                .map(|_| scope.spawn(|| creator_outcome(&barrier, &race_path, &canonical_dir)))
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap_or_else(|_| "panicked".into())).collect()
+        });
+        let created = outcomes.iter().filter(|o| *o == "created").count();
+        let refused = outcomes.iter().filter(|o| *o == "already_exists").count();
+        if created != 1 || refused != RACE_CREATORS - 1 {
+            bad_rounds.push(format!("round {round}: {outcomes:?}"));
+        }
+    }
+    c.record(
+        "R11_concurrent_create_exclusive",
+        bad_rounds.is_empty(),
+        format!("rounds={RACE_ROUNDS} creators={RACE_CREATORS} bad_rounds={bad_rounds:?}"),
+    );
+
+    // R12: an existing database, created outside the store with the default rollback journal,
+    // is refused and left byte-for-byte unchanged, without WAL or shared-memory files. On Unix,
+    // a dangling symbolic link is refused and its target is not created.
+    let existing_path = dir.join("existing.db");
+    let other = Connection::open(&existing_path).map_err(|e| format!("existing db: {e}"))?;
+    other
+        .execute_batch("CREATE TABLE marker(id INTEGER PRIMARY KEY); INSERT INTO marker(id) VALUES (7);")
+        .map_err(|e| format!("existing db schema: {e}"))?;
+    drop(other);
+    let before = std::fs::read(&existing_path).map_err(|e| format!("read existing: {e}"))?;
+    let refused = store::create_file(&existing_path);
+    let after = std::fs::read(&existing_path).map_err(|e| format!("read existing: {e}"))?;
+    let side_files = ["existing.db-wal", "existing.db-shm", "existing.db-journal"]
+        .into_iter()
+        .filter(|name| std::fs::symlink_metadata(dir.join(name)).is_ok())
+        .collect::<Vec<_>>();
+    let (link_refused, link_detail) = dangling_link_refused(&dir)?;
+    c.record(
+        "R12_existing_untouched",
+        matches!(refused, Err(store::StoreError::AlreadyExists(_)))
+            && before == after
+            && side_files.is_empty()
+            && link_refused,
+        format!(
+            "result={:?} unchanged={} side_files={side_files:?} {link_detail}",
+            refused.err(),
+            before == after
+        ),
+    );
     Ok(())
+}
+
+/// One R11 creator: waits at the barrier, calls `create_file`, and on success checks that the
+/// connection is backed by the raced file and has the required settings.
+fn creator_outcome(barrier: &Barrier, path: &Path, canonical_dir: &Path) -> String {
+    barrier.wait();
+    match store::create_file(path) {
+        Ok(conn) => {
+            let file = store::main_database_file(&conn);
+            let settings = store::read_settings(&conn);
+            let expected = canonical_dir.join(path.file_name().unwrap_or_default());
+            match (file, settings) {
+                (Ok(f), Ok(s)) if Path::new(&f) == expected && settings_ok(&s) => "created".into(),
+                (f, s) => format!("created_wrong file={f:?} settings={s:?}"),
+            }
+        }
+        Err(store::StoreError::AlreadyExists(_)) => "already_exists".into(),
+        Err(e) => format!("error {e}"),
+    }
+}
+
+#[cfg(unix)]
+fn dangling_link_refused(dir: &Path) -> Result<(bool, String), String> {
+    let link = dir.join("dangling.db");
+    let target = dir.join("dangling-target.db");
+    std::os::unix::fs::symlink(&target, &link).map_err(|e| format!("symlink: {e}"))?;
+    let result = store::create_file(&link);
+    let target_created = std::fs::symlink_metadata(&target).is_ok();
+    let ok = matches!(result, Err(store::StoreError::AlreadyExists(_))) && !target_created;
+    Ok((ok, format!("dangling_link={:?} target_created={target_created}", result.err())))
+}
+
+#[cfg(not(unix))]
+fn dangling_link_refused(_dir: &Path) -> Result<(bool, String), String> {
+    Ok((true, "dangling_link=not_checked".into()))
 }

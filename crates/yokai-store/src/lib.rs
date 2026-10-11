@@ -4,10 +4,13 @@
 //! components rely on. Application code opens connections only through [`create_file`] or
 //! [`open_file`]. Both refuse anything but an absolute path to a database file, refuse a SQLite
 //! older than [`MIN_SQLITE_VERSION`], and apply and then read back `journal_mode = WAL`,
-//! `synchronous = FULL`, `foreign_keys = ON` and the busy timeout.
+//! `synchronous = FULL`, `foreign_keys = ON` and the busy timeout. [`create_file`] creates the
+//! file exclusively: of any number of concurrent callers for one path, at most one succeeds.
 #![forbid(unsafe_code)]
 
 use std::fmt;
+use std::fs::OpenOptions;
+use std::io;
 use std::path::Path;
 use std::time::Duration;
 
@@ -24,6 +27,7 @@ pub enum StoreError {
     Sqlite(rusqlite::Error),
     NotAbsolutePath(String),
     AlreadyExists(String),
+    CreateFile { path: String, error: io::Error },
     NotFileBacked,
     InTransaction,
     Pragma { name: &'static str, expected: String, actual: String },
@@ -37,6 +41,7 @@ impl fmt::Display for StoreError {
             StoreError::Sqlite(e) => write!(f, "sqlite: {e} (extended code {:?})", ext_code(e)),
             StoreError::NotAbsolutePath(p) => write!(f, "database path must be absolute: {p}"),
             StoreError::AlreadyExists(p) => write!(f, "refusing to create over an existing path: {p}"),
+            StoreError::CreateFile { path, error } => write!(f, "cannot create {path}: {error}"),
             StoreError::NotFileBacked => write!(f, "the main database is not backed by a file"),
             StoreError::InTransaction => write!(f, "connection initializer called inside a transaction"),
             StoreError::Pragma { name, expected, actual } => write!(f, "pragma {name}: expected {expected}, got {actual}"),
@@ -50,6 +55,7 @@ impl std::error::Error for StoreError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             StoreError::Sqlite(e) => Some(e),
+            StoreError::CreateFile { error, .. } => Some(error),
             _ => None,
         }
     }
@@ -96,14 +102,38 @@ fn require_absolute(path: &Path) -> Result<(), StoreError> {
 
 /// Creates a new database file. Refuses any existing directory entry at `path`, including a
 /// dangling symbolic link.
+///
+/// The directory entry is claimed by one exclusive create (`O_CREAT | O_EXCL` on Unix,
+/// `CREATE_NEW` on Windows), so of any number of concurrent callers for one path at most one
+/// succeeds; every other caller gets [`StoreError::AlreadyExists`] and never opens the database.
+/// SQLite then opens the claimed, still empty file without `SQLITE_OPEN_CREATE` and without
+/// following a symbolic link, so it can only open an existing regular file and never creates
+/// one itself.
+///
+/// If a step after the claim fails, the file is left in place and `create_file` refuses it from
+/// then on; nothing is deleted.
 pub fn create_file(path: &Path) -> Result<Connection, StoreError> {
     require_absolute(path)?;
-    if std::fs::symlink_metadata(path).is_ok() {
-        return Err(StoreError::AlreadyExists(path.display().to_string()));
+    match claim_options().open(path) {
+        Ok(claim) => drop(claim),
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+            return Err(StoreError::AlreadyExists(path.display().to_string()));
+        }
+        Err(error) => return Err(StoreError::CreateFile { path: path.display().to_string(), error }),
     }
-    let conn = Connection::open_with_flags(path, rw_flags() | OpenFlags::SQLITE_OPEN_CREATE)?;
+    let conn = Connection::open_with_flags(path, rw_flags() | OpenFlags::SQLITE_OPEN_NOFOLLOW)?;
     prepare(&conn)?;
     Ok(conn)
+}
+
+/// Exclusive create of a new file. On Unix the mode is 0644 before the umask, the same as
+/// SQLite's own default for files it creates.
+fn claim_options() -> OpenOptions {
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o644);
+    options
 }
 
 /// Opens an existing database file, and refuses it if `foreign_key_check` reports a violation.
