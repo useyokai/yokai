@@ -1,0 +1,16 @@
+[package]
+name = "yokai-testsupport"
+description = "Test-only helpers. Used only as a dev-dependency."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+autobins = false
+autoexamples = false
+autotests = false
+autobenches = false
+
+[lib]
+test = false
+doctest = false

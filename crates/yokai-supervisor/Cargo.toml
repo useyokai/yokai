@@ -1,0 +1,16 @@
+[package]
+name = "yokai-supervisor"
+description = "Supervisor library."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+autobins = false
+autoexamples = false
+autotests = false
+autobenches = false
+
+[lib]
+test = false
+doctest = false
