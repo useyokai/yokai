@@ -1,2 +1,2 @@
-//! Credential storage behind a platform abstraction. Not implemented yet.
+//! Credential storage behind a platform abstraction.
 #![forbid(unsafe_code)]

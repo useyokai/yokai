@@ -30,7 +30,7 @@ publish = false
 rusqlite = { version = "=0.40.2", default-features = false, features = ["bundled", "cache"] }
 yokai-testsupport = { path = "crates/yokai-testsupport" }
 
-# Unwinding is kept explicitly: a panic must exit with status 101, never abort.
+# Use stack unwinding rather than aborting on panic.
 [profile.dev]
 panic = "unwind"
 

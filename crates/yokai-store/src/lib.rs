@@ -1,7 +1,6 @@
 //! Yokai's local storage: one SQLite database file per Instance.
 //!
-//! This version provides the connection initializer and the runtime checks that later storage
-//! components rely on. Application code opens connections only through [`create_file`] or
+//! Application code opens connections only through [`create_file`] or
 //! [`open_file`]. Both refuse anything but an absolute path to a database file, refuse a SQLite
 //! older than [`MIN_SQLITE_VERSION`], and apply and then read back `journal_mode = WAL`,
 //! `synchronous = FULL`, `foreign_keys = ON` and the busy timeout. [`create_file`] creates the
@@ -103,15 +102,12 @@ fn require_absolute(path: &Path) -> Result<(), StoreError> {
 /// Creates a new database file. Refuses any existing directory entry at `path`, including a
 /// dangling symbolic link.
 ///
-/// The directory entry is claimed by one exclusive create (`O_CREAT | O_EXCL` on Unix,
-/// `CREATE_NEW` on Windows), so of any number of concurrent callers for one path at most one
-/// succeeds; every other caller gets [`StoreError::AlreadyExists`] and never opens the database.
-/// SQLite then opens the claimed, still empty file without `SQLITE_OPEN_CREATE` and without
-/// following a symbolic link, so it can only open an existing regular file and never creates
-/// one itself.
+/// The path is claimed with an exclusive create, so of concurrent callers for one path at most
+/// one succeeds; the others get [`StoreError::AlreadyExists`]. The guarantee covers only that
+/// claim: the handle is then closed and SQLite reopens the file by path, so replacement of the
+/// file afterwards, and ownership of the Instance, are outside it.
 ///
-/// If a step after the claim fails, the file is left in place and `create_file` refuses it from
-/// then on; nothing is deleted.
+/// If initialization fails after the claim, the file is left in place and later calls refuse it.
 pub fn create_file(path: &Path) -> Result<Connection, StoreError> {
     require_absolute(path)?;
     match claim_options().open(path) {

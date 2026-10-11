@@ -1,2 +1,2 @@
-//! Local inter-process protocol: framing, handshake and role gates. Not implemented yet.
+//! Local inter-process protocol: framing, handshake and role gates.
 #![forbid(unsafe_code)]

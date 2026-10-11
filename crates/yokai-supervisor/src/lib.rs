@@ -1,5 +1,2 @@
-//! Supervisor library. Not implemented yet.
-//!
-//! The process that will host the Supervisor is deliberately undecided; nothing in this crate
-//! may assume it.
+//! Supervisor library. Nothing in this crate may assume which process hosts the Supervisor.
 #![forbid(unsafe_code)]
