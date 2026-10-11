@@ -1,9 +1,10 @@
 //! Test-only support code. This crate may appear only as a dev-dependency.
 //!
-//! Every test binary in the workspace uses a custom harness, calls [`make_non_dumpable`] as its
-//! first action, prints [`Dumpable::line`], and refuses to run any check unless
-//! [`Dumpable::ok`] holds, so that a crashing test never produces a core dump. Each process
-//! clears the flag for itself: `execve` resets it, so nothing set by a parent is relied on.
+//! Every test binary in the workspace must use a custom harness, call [`make_non_dumpable`] as its
+//! first action, print [`Dumpable::line`], and refuse to run any check unless [`Dumpable::ok`]
+//! holds, so that a crashing test does not produce a core dump (unless the host sets
+//! `fs.suid_dumpable=2`). Each process clears the flag for itself: `execve` resets it, so nothing
+//! set by a parent is relied on.
 #![deny(unsafe_code)]
 
 /// Values observed while clearing the dumpable flag.

@@ -5,7 +5,8 @@ use std::fmt;
 
 /// Identity of one Yokai Instance: 16 bytes chosen when the Instance is created.
 ///
-/// An Instance is identified by this value, never by its filesystem path.
+/// Instances are identified by this value rather than by filesystem path, because several paths
+/// can name the same directory (symbolic links, junctions, case and 8.3 aliases).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct InstanceId([u8; 16]);
 

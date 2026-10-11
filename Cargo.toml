@@ -1,7 +1,7 @@
 # Yokai workspace.
 #
-# Every member is listed explicitly, so a stray directory under crates/ never becomes part of
-# the build. Only `yokai-store` depends on an external crate.
+# Every member is listed explicitly, so a stray directory under crates/ is not built as a
+# workspace member.
 [workspace]
 resolver = "3"
 members = [

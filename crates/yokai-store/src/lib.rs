@@ -1,10 +1,11 @@
 //! Yokai's local storage: one SQLite database file per Instance.
 //!
-//! Application code opens connections only through [`create_file`] or
-//! [`open_file`]. Both refuse anything but an absolute path to a database file, refuse a SQLite
-//! older than [`MIN_SQLITE_VERSION`], and apply and then read back `journal_mode = WAL`,
+//! Application code should open connections through [`create_file`] or [`open_file`] rather
+//! than through `rusqlite` directly, so that the settings below are applied and checked. Both
+//! refuse anything but an absolute path to a database file, refuse a SQLite older than
+//! [`MIN_SQLITE_VERSION`], and apply and then read back `journal_mode = WAL`,
 //! `synchronous = FULL`, `foreign_keys = ON` and the busy timeout. [`create_file`] creates the
-//! file exclusively: of any number of concurrent callers for one path, at most one succeeds.
+//! file exclusively: of concurrent callers for one path, at most one succeeds.
 #![forbid(unsafe_code)]
 
 use std::fmt;
@@ -153,9 +154,8 @@ fn prepare(conn: &Connection) -> Result<(), StoreError> {
     Ok(())
 }
 
-/// The only way a connection is configured. It must run outside any transaction
-/// (`PRAGMA foreign_keys` is a no-op inside one), and it verifies every setting by reading it
-/// back.
+/// Configures a connection and verifies each setting by reading it back. It must run outside
+/// any transaction, because `PRAGMA foreign_keys` is a no-op inside one.
 pub fn init_connection(conn: &Connection) -> Result<ConnectionSettings, StoreError> {
     if !conn.is_autocommit() {
         return Err(StoreError::InTransaction);
