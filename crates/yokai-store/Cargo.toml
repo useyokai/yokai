@@ -1,6 +1,6 @@
 [package]
 name = "yokai-store"
-description = "Local storage: one SQLite database per Instance."
+description = "Local storage: one SQLite database file per Instance."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -17,12 +17,22 @@ doctest = false
 
 [dependencies]
 rusqlite.workspace = true
+yokai-platform.workspace = true
+yokai-types.workspace = true
 
 [dev-dependencies]
 yokai-testsupport.workspace = true
 
-# Custom harness: the binary clears its dumpable flag before anything else runs.
+[features]
+test-api = ["yokai-platform/test-api"]
+
 [[test]]
 name = "sqlite_runtime"
 path = "tests/sqlite_runtime.rs"
 harness = false
+
+[[test]]
+name = "instance_lifecycle"
+path = "tests/instance_lifecycle.rs"
+harness = false
+required-features = ["test-api"]

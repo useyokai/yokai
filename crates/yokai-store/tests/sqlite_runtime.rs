@@ -1,12 +1,10 @@
 //! SQLite runtime checks for `yokai-store`, run against a file-backed database.
 //!
-//! Custom harness (`harness = false`). The first action clears the dumpable flag; if that fails,
-//! no check runs and the exit status is 2. Output: one `CHECK <id> PASS|FAIL <detail>` line per
-//! check, then `RESULT PASS <n>/<n>` or `RESULT FAIL <failed>/<n>`. Exit status 0 only if every
-//! check passed.
-//!
-//! `YOKAI_TEST_DATA_DIR` must name an existing absolute directory. The test creates a fresh
-//! subdirectory in it and leaves the database there for inspection.
+//! Custom harness (harness = false). Linux clears the dumpable flag; Windows reports that
+//! the check is unsupported and requires the isolated-run opt-in documented by yokai-testsupport.
+//! Without the required status or opt-in, no check runs and the exit status is 2. Output is one
+//! CHECK line per check followed by a RESULT line.
+
 use std::fmt::Display;
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -44,8 +42,8 @@ impl Checks {
 fn main() -> ExitCode {
     let dumpable = yokai_testsupport::make_non_dumpable();
     println!("{}", dumpable.line());
-    if !dumpable.ok() {
-        println!("RESULT FAIL non-dumpable gate not met; no check was run");
+    if !dumpable.permits_checks() {
+        println!("RESULT FAIL dumpability status unavailable or not opted in; no check was run");
         return ExitCode::from(2);
     }
     let mut checks = Checks { total: 0, failed: 0 };
@@ -125,9 +123,13 @@ fn run(c: &mut Checks) -> Result<(), String> {
     // R4: the main database is the file at `path`.
     let file = store::main_database_file(&conn).map_err(|e| format!("main_database_file: {e}"))?;
     let canonical = std::fs::canonicalize(&path).map_err(|e| format!("canonicalize: {e}"))?;
+    let same_file = !file.is_empty()
+        && std::fs::canonicalize(Path::new(&file))
+            .map(|reported| reported.as_path() == canonical.as_path())
+            .unwrap_or(false);
     c.record(
         "R4_file_backed",
-        !file.is_empty() && Path::new(&file) == canonical.as_path() && path.is_file(),
+        same_file && path.is_file(),
         format!("database_list.file={file} canonical={}", canonical.display()),
     );
 
@@ -277,8 +279,11 @@ fn creator_outcome(barrier: &Barrier, path: &Path, canonical_dir: &Path) -> Stri
             let file = store::main_database_file(&conn);
             let settings = store::read_settings(&conn);
             let expected = canonical_dir.join(path.file_name().unwrap_or_default());
+            let same_file = file.as_ref().ok()
+                .and_then(|reported| std::fs::canonicalize(Path::new(reported)).ok())
+                .is_some_and(|resolved| resolved == expected);
             match (file, settings) {
-                (Ok(f), Ok(s)) if Path::new(&f) == expected && settings_ok(&s) => "created".into(),
+                (Ok(_), Ok(s)) if same_file && settings_ok(&s) => "created".into(),
                 (f, s) => format!("created_wrong file={f:?} settings={s:?}"),
             }
         }
