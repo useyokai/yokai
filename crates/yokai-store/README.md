@@ -180,6 +180,28 @@ observation does not establish controlled antivirus/indexer interference or a
 performance guarantee.
 
 These checks are partial Windows qualification. Physical NTFS exhaustion,
-power loss/OS crash, directory-entry durability, Windows dumpability and the
-Unix dangling-file-symlink subcheck retain their separate limits. WSL processing
+power loss/OS crash, directory-entry durability, Windows dumpability and
+capability-dependent dangling-file-symlink coverage retain separate limits. WSL processing
 of saved Windows output does not run these tests on Linux or change their scope.
+
+### Lock sharing and open-file observations
+
+On Windows the persistent Instance lock handle requests `FILE_SHARE_READ |
+FILE_SHARE_WRITE` (mask3), omits `FILE_SHARE_DELETE`, and takes an exclusive
+`File::try_lock`. Compatible raw handles can open the path; they do not become a
+second owner. This is distinct from share mode zero. Held-lock rename/delete
+refusal and separate synthetic share-zero/share-delete file observations are
+covered by `WV-OPEN-FILES`. These experiments preserve original synthetic bytes,
+measure byte-range-lock read refusal separately from compatible handle opens,
+and never delete an Instance database or root.
+Persistent lock bytes are compared before ownership and after confirmed close,
+when an ordinary read is permitted. The observations inform future filesystem
+work; they do not implement a discard operation or prove every SQLite/open-file
+case on every Windows host.
+
+R12 also attempts a dangling **file** symlink on Windows. When the existing host
+capability allows it, exclusive creation must refuse without creating the
+target or altering the link. The harness records the link inventory, then
+unlinks only that verified owned link to leave regular sealed evidence. Missing
+capability is reported as `not_checked`; no privileges or host settings change.
+This new observation does not change the scope of earlier Unix-only R12 runs.
