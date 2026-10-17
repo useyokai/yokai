@@ -402,3 +402,29 @@ cycles remain historical evidence, but their resource-stability text was
 unsupported. New counts are non-atomic samples on one host. They do not establish
 absence of transient leaks, all-time resource stability, other platform/host
 behavior, performance bounds, full IL-8/W2, or product/release acceptance.
+
+### Windows corruption with a genuine committed WAL
+
+`WV-PREFLIGHT-CORRUPTION` retains three independent closed V2 fixtures and
+commits a literal health marker into a genuine WAL without checkpointing.
+A read-only control must see that marker, version2 and integrity `ok` while
+leaving main/WAL bytes unchanged. WAL frames must affect only the metadata
+page, excluding page1 and the runs leaf, so replay cannot mask the main fault.
+
+The cases overwrite exactly16 magic bytes, change one empty non-header runs
+leaf fragmentation byte from0 to1, or truncate the13-page main to exactly half
+its length. The pinned fixture uses4096-byte pages. Exact `HeaderInvalid`
+magic/length refusals must happen before SQLite; the leaf must return the
+exact collected free-space `Integrity` result row through Stage-A read-only.
+Generic access/store errors or Stage-B fallback fail these observations.
+
+Pristine, healthy-WAL, damaged, post-refusal and child-repeat copies/inventories
+are retained. Main/WAL/id/lock and all protected names/types/bytes must remain
+unchanged; only the leaf's read-only SHM effects are allowed and recorded.
+Exclusive data opens and a fresh child repeating each exact refusal check
+released data handles and Instance ownership. No main/WAL/root is deleted or
+repaired. The historical broad PF6 and empty-WAL observations retain their
+original scope. These fixtures do not establish every corruption/geometry,
+absence of transient writes, file identity/metadata/race safety, full PF6/W2,
+power-loss durability, security or product acceptance. An Integrity result row
+is not a SQLite extended error code.

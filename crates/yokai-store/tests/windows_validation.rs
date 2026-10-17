@@ -57,6 +57,7 @@ mod native {
             ("WV-PREFLIGHT-INTEGRITY",preflight_integrity),
             ("WV-LOCK-SOAK",lock_soak),
             ("WV-RESOURCE-COUNTS",resource_counts),
+            ("WV-PREFLIGHT-CORRUPTION",preflight_corruption),
         ];
         let selected:Vec<_>=match args.as_slice(){
             [_]=>checks.iter().collect(),
@@ -173,6 +174,13 @@ mod native {
                     let before=access_snapshot(root)?;let outcome=semantic_refusal(root,case,expected)?;let after=access_snapshot(root)?;
                     semantic_preserved(&before,&after,true)?;
                     println!("INFO WV semantic_child case={case} outcome={outcome} exact_refusal=true lock_reacquired=true protected_bytes_unchanged=true inventory_before={:?} inventory_after={:?}",stageb_inventory(&before)?,stageb_inventory(&after)?);
+                },
+                "__corruption_refusal"=>{
+                    let case=args.get(3).ok_or("missing corruption case")?;
+                    let page=args.get(4).ok_or("missing corruption page")?.parse::<u32>().map_err(|e|e.to_string())?;
+                    let before=access_snapshot(root)?;let outcome=corruption_refusal(root,case,page)?;let after=access_snapshot(root)?;
+                    semantic_preserved(&before,&after,case=="leaf")?;
+                    println!("INFO WV corruption_child case={case} outcome={outcome} exact_refusal=true protected_bytes_unchanged=true inventory_before={:?} inventory_after={:?}",stageb_inventory(&before)?,stageb_inventory(&after)?);
                 },
                 "__close_error"=>{
                     store::test_api::fail_startup_close_once();
@@ -1046,6 +1054,95 @@ mod native {
         }
         Ok("one-byte empty runs-leaf fragmentation defect returns exact Integrity result row: StageB with no WAL and typed Stage-A read-only with empty WAL; complete retained inventories/protected bytes and handles/fresh-child ownership verified; not every corruption mode or a retained extended SQLite error code".into())
     }
+    fn corruption_refusal(root:&Path,case:&str,page:u32)->Result<String,String>{
+        store::test_api::clear();
+        let result=store::open_instance(root);let events=store::test_api::connection_events();
+        let (outcome,expected_events)=match (case,result) {
+            ("magic",Err(InstanceError::HeaderInvalid(field))) if field=="magic"=>("HeaderInvalid(magic)".to_owned(),Vec::<&str>::new()),
+            ("half",Err(InstanceError::HeaderInvalid(field))) if field=="database length"=>("HeaderInvalid(database length)".to_owned(),Vec::<&str>::new()),
+            ("leaf",Err(InstanceError::Integrity(detail)))=>{
+                let expected=format!("{:?}",vec![format!("*** in database main ***\nTree {page} page {page}: free space corruption")]);
+                if detail!=expected{return Err(format!("corruption Integrity row={detail:?} expected={expected:?}"));}
+                (format!("Integrity({detail:?})"),vec!["stage-a-read-only"])
+            },
+            (_,Ok(i))=>{i.close().map_err(|e|e.to_string())?;return Err(format!("{case} corrupt fixture unexpectedly opened; events={events:?}"));},
+            (_,Err(error))=>return Err(format!("{case} wrong corruption refusal {error:?}; events={events:?}")),
+        };
+        if events!=expected_events{return Err(format!("{case} wrong corruption route {events:?}"));}
+        Ok(outcome)
+    }
+    fn preflight_corruption()->Result<String,String>{
+        const MARKER:&str="2000-01-01T00:00:01Z";
+        for case in ["magic","leaf","half"] {
+            let i=instance("main-corruption")?;let root=i.root().to_owned();i.close().map_err(|e|e.to_string())?;
+            let pristine=access_snapshot(&root)?;let original=retain_damage_snapshot(&root,"retained-corruption-pristine",&pristine)?;
+            if pristine.keys().map(String::as_str).collect::<Vec<_>>()!=["instance.db","instance.id","instance.lock"]{return Err("corruption pristine has side files/extras".into());}
+            let c=Connection::open_with_flags(root.join("instance.db"),OpenFlags::SQLITE_OPEN_READ_WRITE|OpenFlags::SQLITE_OPEN_NO_MUTEX).map_err(|e|e.to_string())?;
+            c.set_db_config(DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE,true).map_err(|e|e.to_string())?;
+            c.execute_batch("PRAGMA wal_autocheckpoint=0;").map_err(|e|e.to_string())?;
+            let page:u32=c.query_row("SELECT rootpage FROM sqlite_schema WHERE name='runs'",[],|r|r.get(0)).map_err(|e|e.to_string())?;
+            let meta_page:u32=c.query_row("SELECT rootpage FROM sqlite_schema WHERE name='instance_meta'",[],|r|r.get(0)).map_err(|e|e.to_string())?;
+            let rows:i64=c.query_row("SELECT count(*) FROM runs",[],|r|r.get(0)).map_err(|e|e.to_string())?;
+            let version:i64=c.query_row("PRAGMA user_version",[],|r|r.get(0)).map_err(|e|e.to_string())?;
+            let integrity:String=c.query_row("PRAGMA integrity_check",[],|r|r.get(0)).map_err(|e|e.to_string())?;
+            if page<=1 || meta_page<=1 || page==meta_page || rows!=0 || version!=2 || integrity!="ok"
+                || !store::test_api::foreign_key_violations(&c).map_err(|e|e.to_string())?.is_empty(){return Err("corruption pristine V2 control failed".into());}
+            c.execute_batch("BEGIN IMMEDIATE;").map_err(|e|e.to_string())?;
+            if c.execute("UPDATE instance_meta SET last_health_check=?1 WHERE id=1",[MARKER]).map_err(|e|e.to_string())?!=1{return Err("corruption marker update did not affect one row".into());}
+            c.execute_batch("COMMIT;").map_err(|e|e.to_string())?;
+            c.close().map_err(|(_,e)|e.to_string())?;
+            let committed=access_snapshot(&root)?;
+            if committed.get("instance.db")!=pristine.get("instance.db"){return Err("corruption marker checkpointed into main".into());}
+            let wal=committed.get("instance.db-wal").and_then(Option::as_ref).ok_or("corruption WAL missing")?;
+            let main=pristine.get("instance.db").and_then(Option::as_ref).ok_or("corruption main missing")?;
+            let size=4096usize;
+            if main.len()!=13*size || main.get(16..18)!=Some([0x10,0].as_slice()) || wal.len()<=32
+                || (wal.len()-32)%(size+24)!=0 || wal.get(8..12)!=Some((size as u32).to_be_bytes().as_slice()) {
+                return Err("corruption fixture geometry/WAL framing mismatch".into());
+            }
+            let mut frame_pages=Vec::new();let frames=(wal.len()-32)/(size+24);
+            for (index,frame) in wal[32..].chunks_exact(size+24).enumerate(){
+                let number=u32::from_be_bytes(frame[..4].try_into().map_err(|_|"corruption frame page")?);
+                let commit=u32::from_be_bytes(frame[4..8].try_into().map_err(|_|"corruption frame commit")?);
+                if number!=meta_page || number==1 || number==page || frame[8..16]!=wal[16..24]
+                    || (index+1==frames && commit!=13) || (index+1<frames && commit!=0){return Err("corruption WAL masks main fault or lacks exact commit".into());}
+                frame_pages.push(number);
+            }
+            let control=ro(&root)?;
+            let marker:String=control.query_row("SELECT last_health_check FROM instance_meta WHERE id=1",[],|r|r.get(0)).map_err(|e|e.to_string())?;
+            let control_version:i64=control.query_row("PRAGMA user_version",[],|r|r.get(0)).map_err(|e|e.to_string())?;
+            let control_integrity:String=control.query_row("PRAGMA integrity_check",[],|r|r.get(0)).map_err(|e|e.to_string())?;
+            if marker!=MARKER || control_version!=2 || control_integrity!="ok"
+                || !store::test_api::foreign_key_violations(&control).map_err(|e|e.to_string())?.is_empty(){return Err("corruption read-only healthy WAL control failed".into());}
+            control.close().map_err(|(_,e)|e.to_string())?;
+            let healthy=access_snapshot(&root)?;semantic_preserved(&committed,&healthy,true)?;
+            if healthy.keys().map(String::as_str).collect::<Vec<_>>()!=["instance.db","instance.db-shm","instance.db-wal","instance.id","instance.lock"]{return Err("corruption healthy fixture has wrong entries".into());}
+            let healthy_copy=retain_damage_snapshot(&root,"retained-corruption-healthy",&healthy)?;
+            let offset=(page as usize-1).checked_mul(size).ok_or("corruption page offset overflow")?;
+            let empty=[13,0,0,0,0,0x10,0,0];
+            if main.get(offset..offset+8)!=Some(empty.as_slice()){return Err("corruption target is not an empty runs leaf".into());}
+            let mut damaged=main.clone();
+            match case {"magic"=>damaged[..16].fill(0xa5),"leaf"=>damaged[offset+7]=1,"half"=>damaged.truncate(main.len()/2),_=>unreachable!()}
+            fs::write(root.join("instance.db"),&damaged).map_err(|e|e.to_string())?;
+            let before=access_snapshot(&root)?;
+            if before.get("instance.db")!=Some(&Some(damaged)) || before.iter().any(|(name,bytes)|name!="instance.db" && healthy.get(name)!=Some(bytes)) {return Err("corruption setup changed another entry".into());}
+            let baseline=retain_damage_snapshot(&root,"retained-corruption-before",&before)?;
+            let outcome=corruption_refusal(&root,case,page)?;let after=access_snapshot(&root)?;
+            let allow_shm=case=="leaf";semantic_preserved(&before,&after,allow_shm)?;
+            let final_copy=retain_damage_snapshot(&root,"retained-corruption-after",&after)?;stageb_released(&root)?;
+            let mut probe=command("__corruption_refusal",&root)?;probe.arg(case).arg(page.to_string());
+            let (mut child,logs)=launch(probe,"corruption-probe")?;
+            if !wait(&mut child,Duration::from_secs(15))?.success(){return Err(format!("corruption child repeat failed; logs={}",logs.display()));}
+            let child_after=access_snapshot(&root)?;semantic_preserved(&after,&child_after,allow_shm)?;stageb_released(&root)?;
+            let child_copy=retain_damage_snapshot(&root,"retained-corruption-child-after",&child_after)?;
+            for (snapshot,path) in [(&pristine,&original),(&healthy,&healthy_copy),(&before,&baseline),(&after,&final_copy),(&child_after,&child_copy)]{
+                if access_snapshot(path)?!=*snapshot{return Err("corruption retained copy differs".into());}
+            }
+            println!("INFO WV preflight_corruption fixture={} case={case} pristine={} healthy={} baseline={} after={} child_after={} child_logs={} runs_page={page} meta_page={meta_page} frame_pages={frame_pages:?} commit_pages=13 marker={MARKER} original_bytes={} damaged_bytes={} fault_offset={} outcome={outcome} allow_shm={allow_shm} healthy_control_version=2 healthy_control_integrity=ok main_WAL_protected=true all_copies_verified=true exclusive_data_opens=allowed child_lock_reacquired=true shm_changed={} child_shm_changed={} inventory_before={:?} inventory_after={:?} inventory_child_after={:?}",root.display(),original.display(),healthy_copy.display(),baseline.display(),final_copy.display(),child_copy.display(),logs.display(),main.len(),before.get("instance.db").and_then(Option::as_ref).ok_or("missing damaged main")?.len(),if case=="leaf"{offset+7}else{0},before.get("instance.db-shm")!=after.get("instance.db-shm"),after.get("instance.db-shm")!=child_after.get("instance.db-shm"),stageb_inventory(&before)?,stageb_inventory(&after)?,stageb_inventory(&child_after)?);
+        }
+        Ok("three genuine committed-WAL main faults: exact header-magic and half-length refusals before SQLite, one-byte non-header leaf Integrity via Stage-A read-only; healthy marker control, all retained/protected bytes, inventories and fresh-child ownership verified; no full corruption/PF6/W2 acceptance".into())
+    }
+
     fn lock_soak()->Result<String,String>{
         let start=Instant::now();let i=instance("lock-soak")?;let root=i.root().to_owned();let until=Instant::now()+Duration::from_secs(20);let mut rounds=0;
         while rounds<64 && Instant::now()<until {
