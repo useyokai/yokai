@@ -153,7 +153,11 @@ fn validate_header(path: &Path, file_len: u64) -> Result<(u32, u64), InstanceErr
     if encoding != 1 && !(schema_format == 0 && encoding == 0) {
         return Err(InstanceError::HeaderInvalid("text encoding".into()));
     }
-    Ok((u32::from_be_bytes(header[60..64].try_into().expect("fixed slice")), page_size))
+    let version = u32::from_be_bytes(header[60..64].try_into().expect("fixed slice"));
+    #[cfg(feature = "test-api")]
+    crate::failpoint::record_header_version(version)
+        .map_err(|e| InstanceError::PreflightUnavailable(format!("test header observation: {e}")))?;
+    Ok((version, page_size))
 }
 
 fn validate_wal_header(path: &Path, database_page_size: u64) -> Result<(), InstanceError> {

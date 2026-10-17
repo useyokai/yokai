@@ -1229,28 +1229,83 @@ fn case_pf16(base: &Path) -> Result<String, String> {
         store::test_api::clear();
         let result = store::open_instance(&root);
         let named_field = matches!(&result, Err(InstanceError::HeaderInvalid(field)) if field.contains(expected_field));
-        if !named_field || !store::test_api::connection_events().is_empty() {
+        let decoded=store::test_api::header_versions()?;
+        if !named_field || !store::test_api::connection_events().is_empty() || !decoded.is_empty() {
             return Err(format!("{case} header result={}", describe_instance_result(&result)));
         }
     }
     Ok("nine malformed raw headers named the invalid field and refused before SQLite".into())
 }
 
+fn pf17_inventory(root:&Path)->Result<store::FileInventory,String>{
+    let mut entries=Vec::new();
+    for name in ["instance.db","instance.db-wal","instance.db-shm","instance.db-journal"] {
+        let path=root.join(name);
+        let entry=match fs::symlink_metadata(&path) {
+            Ok(meta)=>{
+                yokai_platform::location::validate_regular_single_link(&path,&meta).map_err(|e|e.to_string())?;
+                let bytes=fs::read(&path).map_err(|e|e.to_string())?;
+                store::InventoryEntry{name:name.into(),exists:true,entry_type:Some("regular".into()),size:bytes.len() as u64,
+                    sha256:Some(store::test_api::sha256_chunks_for_test(&[&bytes]))}
+            },
+            Err(e) if e.kind()==std::io::ErrorKind::NotFound=>store::InventoryEntry{name:name.into(),exists:false,entry_type:None,size:0,sha256:None},
+            Err(e)=>return Err(e.to_string()),
+        };
+        entries.push(entry);
+    }
+    Ok(store::FileInventory{entries})
+}
+fn pf17_retain(root:&Path,label:&str,snapshot:&BTreeMap<String,Vec<u8>>)->Result<PathBuf,String>{
+    let copy=root.parent().ok_or("PF17 root has no parent")?.join(label);fs::create_dir(&copy).map_err(|e|e.to_string())?;
+    for name in ["instance.db","instance.id","instance.lock"] {
+        let source=root.join(name);let meta=fs::symlink_metadata(&source).map_err(|e|e.to_string())?;
+        yokai_platform::location::validate_regular_single_link(&source,&meta).map_err(|e|e.to_string())?;
+        let bytes=snapshot.get(name).ok_or("PF17 missing retained entry")?;
+        if fs::read(&source).map_err(|e|e.to_string())?!=*bytes{return Err("PF17 snapshot changed before retention".into());}
+        let path=copy.join(name);let mut file=OpenOptions::new().write(true).create_new(true).open(&path).map_err(|e|e.to_string())?;
+        file.write_all(bytes).map_err(|e|e.to_string())?;file.sync_all().map_err(|e|e.to_string())?;drop(file);
+        let meta=fs::symlink_metadata(&path).map_err(|e|e.to_string())?;
+        yokai_platform::location::validate_regular_single_link(&path,&meta).map_err(|e|e.to_string())?;
+        if fs::read(&path).map_err(|e|e.to_string())?!=*bytes{return Err("PF17 retained bytes differ".into());}
+    }
+    Ok(copy)
+}
 fn case_pf17(base: &Path) -> Result<String, String> {
     for value in [0, 1, 2, 3, 255, 256, 65_536, 16_777_216, u32::MAX] {
         let root = if value==0 {legacy_root(base,"pf17")?}else{new_root(base,"pf17")?};
         if value==1 {let c=Connection::open(root.join("instance.db")).map_err(|e|e.to_string())?;
-            c.execute_batch("DROP TABLE events; DROP TABLE jobs; DROP TABLE commands; DROP TABLE runs; DROP TABLE runtime_epoch; DELETE FROM yokai_schema_history WHERE version=2; PRAGMA user_version=1;").map_err(|e|e.to_string())?;}
+            c.execute_batch("DROP TABLE events; DROP TABLE jobs; DROP TABLE commands; DROP TABLE runs; DROP TABLE runtime_epoch; DELETE FROM yokai_schema_history WHERE version=2; PRAGMA user_version=1;").map_err(|e|e.to_string())?;
+            c.close().map_err(|(_,e)|e.to_string())?;}
         set_header_u32(&root, 60, value)?;
-        let result = store::open_instance(&root);
-        if value <= 2 {
-            let instance = result.map_err(|e| e.to_string())?;
-            instance.close().map_err(|e| e.to_string())?;
-        } else if !matches!(&result, Err(InstanceError::SchemaTooNew { found, maximum: 2 }) if *found == value) {
-            return Err(format!("value {value} decoded incorrectly: {}", describe_instance_result(&result)));
-        }
+        let before=root_snapshot(&root)?;
+        if before.keys().map(String::as_str).collect::<Vec<_>>()!=["instance.db","instance.id","instance.lock"]{return Err("PF17 input has side files/extras".into());}
+        let main=before.get("instance.db").ok_or("PF17 input main missing")?;
+        if main.len()<100 || main[60..64]!=value.to_be_bytes(){return Err("PF17 requires a nonempty encoded header".into());}
+        let retained_before=pf17_retain(&root,"retained-pf17-before",&before)?;let inventory_before=pf17_inventory(&root)?;
+        store::test_api::clear();let result=store::open_instance(&root);
+        let decoded=store::test_api::header_versions()?;let second_take=store::test_api::header_versions()?;
+        let events=store::test_api::connection_events();
+        let (outcome,expected_events)=match result {
+            Ok(i) if value<=2=>{
+                let current=store::test_api::user_version(&i).map_err(|e|e.to_string())?;
+                i.close().map_err(|e|e.to_string())?;
+                if current!=2{return Err(format!("PF17 accepted input{value} ended at version{current}"));}
+                ("AcceptedV2".to_owned(),vec!["stage-b-read-write"])
+            },
+            Ok(i)=>{i.close().map_err(|e|e.to_string())?;return Err(format!("PF17 future input{value} unexpectedly opened"));},
+            Err(InstanceError::SchemaTooNew{found,maximum:2}) if value>2 && found==value=>(format!("SchemaTooNew({found},2)"),Vec::new()),
+            Err(error)=>return Err(format!("PF17 input{value} wrong outcome {error:?}")),
+        };
+        let after=root_snapshot(&root)?;let inventory_after=pf17_inventory(&root)?;
+        let retained_after=pf17_retain(&root,"retained-pf17-after",&after)?;
+        if decoded!=[value] || !second_take.is_empty() || events!=expected_events{return Err(format!("PF17 input{value} decoded={decoded:?} expected=[{value}] second_take={second_take:?} events={events:?}"));}
+        if before.get("instance.id")!=after.get("instance.id") || before.get("instance.lock")!=after.get("instance.lock")
+            || before.get("instance.lock")!=Some(&Vec::new()){return Err("PF17 identity/persistent empty lock changed".into());}
+        let changed=before.get("instance.db")!=after.get("instance.db");
+        if (value<=2 && !changed) || (value>2 && before!=after){return Err("PF17 unexpected accepted/refused closed effects".into());}
+        println!("INFO PF17 header_decode fixture={} value={value} retained_before={} retained_after={} input_bytes={} decoded={decoded:?} second_take={second_take:?} sqlite_events={events:?} outcome={outcome} main_changed={changed} identity_lock_bytes_unchanged=true inventories_scope=fixed_SQLite_names copies_scope=main_id_lock inventory_before={inventory_before:?} inventory_after={inventory_after:?}",root.display(),retained_before.display(),retained_after.display(),main.len());
     }
-    Ok("big-endian user_version values 0, 1, 2, 255, 256, 65536, 16777216, and u32::MAX decoded; valid V0 migrated V1 upgraded and V2 accepted".into())
+    Ok("nine exact raw-header decoded-version events include accepted0/1/2 and six future unsigned values; take drains,54 retained main/id/lock files and fixed-name inventories; accepted migrations/startup intentionally write, future refusals preserve the complete closed root".into())
 }
 
 fn case_pf18(base: &Path) -> Result<String, String> {
