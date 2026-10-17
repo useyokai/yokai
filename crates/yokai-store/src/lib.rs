@@ -169,7 +169,15 @@ pub fn init_connection(conn: &Connection) -> Result<ConnectionSettings, StoreErr
         return Err(StoreError::InTransaction);
     }
     let _: String = conn.query_row("PRAGMA journal_mode = WAL", [], |r| r.get(0))?;
-    conn.execute_batch("PRAGMA synchronous = FULL; PRAGMA foreign_keys = ON;")?;
+    conn.execute_batch("PRAGMA synchronous = FULL; PRAGMA foreign_keys = ON; PRAGMA trusted_schema = OFF; PRAGMA wal_autocheckpoint = 1000;")?;
+    conn.set_db_config(rusqlite::config::DbConfig::SQLITE_DBCONFIG_DEFENSIVE,true)?;
+    for (name,expected) in [("trusted_schema",0),("auto_vacuum",0),("wal_autocheckpoint",1000)] {
+        let actual:i64=conn.query_row(&format!("PRAGMA {name}"),[],|r|r.get(0))?;
+        if actual!=expected { return Err(StoreError::Pragma{name,expected:expected.to_string(),actual:actual.to_string()}); }
+    }
+    if !conn.db_config(rusqlite::config::DbConfig::SQLITE_DBCONFIG_DEFENSIVE)? {
+        return Err(StoreError::Pragma{name:"DEFENSIVE",expected:"true".into(),actual:"false".into()});
+    }
     conn.busy_timeout(Duration::from_millis(BUSY_TIMEOUT_MS))?;
     let settings = read_settings(conn)?;
     let checks: [(&'static str, String, String); 4] = [
@@ -254,6 +262,9 @@ pub fn foreign_key_violations(conn: &Connection) -> rusqlite::Result<Vec<String>
 
 mod instance;
 mod preflight;
+mod schema;
+mod snapshot;
+pub use snapshot::BackupUsage;
 #[cfg(feature = "test-api")]
 mod failpoint;
 pub use instance::{create_instance, open_instance, IncompleteReason, Instance, InstanceError};

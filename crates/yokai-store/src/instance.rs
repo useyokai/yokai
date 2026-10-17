@@ -10,7 +10,7 @@ use yokai_platform::{InstanceLock, random_instance_id};
 use yokai_types::InstanceId;
 
 use crate::preflight;
-use crate::{create_file, foreign_key_violations, init_connection};
+use crate::{create_file, init_connection};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum IncompleteReason { NoLockFile, NoIdentityFile, BadIdentityFile, NoDatabase }
@@ -36,6 +36,9 @@ pub enum InstanceError {
     SideFileStateUnverified { header_version: u32 },
     SchemaTooNew { found: u32, maximum: u32 },
     SchemaInconsistent(String),
+    MigrationDiverged(String),
+    Migration(String),
+    Snapshot(String),
     Integrity(String),
     ForeignKeyViolations(Vec<String>),
     PreflightUnavailable(String),
@@ -67,6 +70,9 @@ impl fmt::Display for InstanceError {
             Self::SideFileStateUnverified { header_version } => write!(f, "SHM exists without WAL; side-file state is unverified (raw header user_version={header_version})"),
             Self::SchemaTooNew { found, maximum } => write!(f, "schema {found} is newer than supported maximum {maximum}"),
             Self::SchemaInconsistent(e) => write!(f, "inconsistent schema: {e}"),
+            Self::MigrationDiverged(e) => write!(f, "migration history diverged: {e}"),
+            Self::Migration(e) => write!(f, "migration failed: {e}"),
+            Self::Snapshot(e) => write!(f, "recovery snapshot unavailable: {e}"),
             Self::Integrity(e) => write!(f, "integrity check failed: {e}"),
             Self::ForeignKeyViolations(e) => write!(f, "foreign-key violations: {e:?}"),
             Self::PreflightUnavailable(e) => write!(f, "read-only preflight unavailable: {e}"),
@@ -129,10 +135,13 @@ pub fn create_instance(parent: &Path) -> Result<Instance, InstanceError> {
     hit_failpoint("after-lock")?;
 
     let db_path = root.join("instance.db");
-    let connection = create_file(&db_path).map_err(|e| InstanceError::Store(e.to_string()))?;
+    let mut connection = create_file(&db_path).map_err(|e| InstanceError::Store(e.to_string()))?;
     hit_failpoint("after-db")?;
 
-    write_identity(&root.join("instance.id"), id)?;
+    let created = utc_timestamp().map_err(InstanceError::Identity)?;
+    crate::schema::migrate_new(&mut connection,id,&created)?;
+    hit_failpoint("after-migration")?;
+    write_identity(&root.join("instance.id"), id, &created)?;
     yokai_platform::location::flush_directory(&root)
         .map_err(|e| InstanceError::Io(format!("flush Instance directory: {e}")))?;
     yokai_platform::location::flush_directory(&parent)
@@ -141,6 +150,9 @@ pub fn create_instance(parent: &Path) -> Result<Instance, InstanceError> {
 }
 
 pub fn open_instance(root: &Path) -> Result<Instance, InstanceError> {
+    open_with_plan(root,crate::schema::production())
+}
+fn open_with_plan(root:&Path,plan:crate::schema::Plan)->Result<Instance,InstanceError>{
     let root = yokai_platform::location::validate_root(root).map_err(|e| path_error(e, false))?;
     let lock_path = root.join("instance.lock");
     let lock_meta = fs::symlink_metadata(&lock_path).map_err(|e| {
@@ -162,7 +174,7 @@ pub fn open_instance(root: &Path) -> Result<Instance, InstanceError> {
     })?;
     yokai_platform::location::validate_regular_single_link(&id_path, &id_meta)
         .map_err(|e| InstanceError::PathInvalid(e.to_string()))?;
-    let (id, _created) = read_identity(&id_path)?;
+    let (id, created) = read_identity(&id_path)?;
     if root.file_name().and_then(|name| name.to_str()) != Some(id.to_hex().as_str()) {
         return Err(InstanceError::IdentityMismatch);
     }
@@ -175,14 +187,14 @@ pub fn open_instance(root: &Path) -> Result<Instance, InstanceError> {
         Err(error) => return Err(InstanceError::PathInvalid(error.to_string())),
         Ok(_) => {}
     }
-    let accepted = preflight::stage_a(&root)?;
+    let accepted = preflight::stage_a(&root, id, &created,plan)?;
     let before = preflight::capture_inventory(&root)
         .map_err(|e| InstanceError::PreflightUnavailable(e.to_string()))?;
     let connection = open_rw_connection(&db_path);
     match connection {
-        Ok(connection) => {
+        Ok(mut connection) => {
             if !accepted.wal_present {
-                if let Err(error) = stage_b_validate(&connection) {
+                if let Err(error) = crate::schema::inspect(&connection,id,&created,plan) {
                     drop(connection);
                     let after = preflight::capture_inventory(&root)
                         .map_err(|e| InstanceError::PreflightUnavailable(e.to_string()))?;
@@ -192,6 +204,7 @@ pub fn open_instance(root: &Path) -> Result<Instance, InstanceError> {
                     });
                 }
             }
+            crate::schema::upgrade(&mut connection,&root,id,&created,plan)?;
             Ok(Instance::new(root, id, connection, lock))
         }
         Err(cause) => {
@@ -213,15 +226,14 @@ fn create_instance_dir(path: &Path) -> io::Result<()> {
     { fs::create_dir(path) }
 }
 
-fn hit_failpoint(boundary: &str) -> Result<(), InstanceError> {
+pub(crate) fn hit_failpoint(boundary: &str) -> Result<(), InstanceError> {
     #[cfg(feature = "test-api")]
     { return crate::failpoint::hit(boundary).map_err(InstanceError::Injected); }
     #[cfg(not(feature = "test-api"))]
     { let _ = boundary; Ok(()) }
 }
 
-fn write_identity(path: &Path, id: InstanceId) -> Result<(), InstanceError> {
-    let stamp = utc_timestamp().map_err(InstanceError::Identity)?;
+fn write_identity(path: &Path, id: InstanceId, stamp: &str) -> Result<(), InstanceError> {
     let mut options = OpenOptions::new();
     options.write(true).create_new(true);
     #[cfg(unix)]
@@ -277,7 +289,7 @@ fn parse_hex_id(hex: &str) -> Option<InstanceId> {
     Some(InstanceId::from_bytes(bytes))
 }
 
-fn valid_timestamp(value: &str) -> bool {
+pub(crate) fn valid_timestamp(value: &str) -> bool {
     let bytes = value.as_bytes();
     if bytes.len() != 20 || bytes[4] != b'-' || bytes[7] != b'-' || bytes[10] != b'T'
         || bytes[13] != b':' || bytes[16] != b':' || bytes[19] != b'Z' { return false; }
@@ -291,7 +303,7 @@ fn valid_timestamp(value: &str) -> bool {
     (1..=days).contains(&day)
 }
 
-fn utc_timestamp() -> Result<String, String> {
+pub(crate) fn utc_timestamp() -> Result<String, String> {
     let secs = SystemTime::now().duration_since(UNIX_EPOCH).map_err(|e| e.to_string())?.as_secs() as i64;
     let days = secs.div_euclid(86_400);
     let day_seconds = secs.rem_euclid(86_400);
@@ -326,23 +338,6 @@ fn open_rw_connection(path: &Path) -> Result<Connection, String> {
     Ok(conn)
 }
 
-fn stage_b_validate(conn: &Connection) -> Result<(), InstanceError> {
-    let version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))
-        .map_err(|e| InstanceError::SchemaInconsistent(e.to_string()))?;
-    if version != 0 {
-        return Err(InstanceError::SchemaTooNew { found: version.max(0) as u32, maximum: 0 });
-    }
-    let objects: i64 = conn.query_row("SELECT count(*) FROM sqlite_schema WHERE lower(substr(name, 1, 7)) <> 'sqlite_'", [], |row| row.get(0))
-        .map_err(|e| InstanceError::SchemaInconsistent(e.to_string()))?;
-    if objects != 0 { return Err(InstanceError::SchemaInconsistent(format!("{objects} schema objects at version 0"))); }
-    let integrity: String = conn.query_row("PRAGMA integrity_check", [], |row| row.get(0))
-        .map_err(|e| InstanceError::Integrity(e.to_string()))?;
-    if integrity != "ok" { return Err(InstanceError::Integrity(integrity)); }
-    let fk = foreign_key_violations(conn).map_err(|e| InstanceError::ForeignKeyViolations(vec![e.to_string()]))?;
-    if !fk.is_empty() { return Err(InstanceError::ForeignKeyViolations(fk)); }
-    Ok(())
-}
-
 pub struct Instance {
     pub(crate) root: PathBuf,
     pub(crate) id: InstanceId,
@@ -357,6 +352,10 @@ impl Instance {
     pub fn root(&self) -> &Path { &self.root }
     pub fn id(&self) -> InstanceId { self.id }
     pub fn is_locked(&self) -> bool { self.lock.as_ref().is_some_and(InstanceLock::is_locked) }
+    /// All retained backup bytes, including partial attempts. No automatic deletion occurs.
+    pub fn backup_usage(&self) -> Result<crate::BackupUsage, InstanceError> {
+        crate::snapshot::usage(&self.root)
+    }
 
     /// Closes the SQLite handle before releasing the persistent lock-file handle.
     pub fn close(mut self) -> Result<(), InstanceError> {
@@ -376,6 +375,9 @@ pub mod test_api {
 
     use super::{Instance, InstanceError};
     use crate::failpoint;
+    pub fn open_test_versions(root:&Path,latest:u32,fail:bool)->Result<Instance,InstanceError>{super::open_with_plan(root,crate::schema::test_plan(latest,fail)?)}
+    pub fn lint_migration(sql:&str,version:u32)->Result<(),String>{crate::schema::lint(sql,version)}
+    pub fn backup_warning_for_test(total:u64,threshold:u64)->bool{crate::snapshot::policy(total,threshold).warning}
 
     pub fn set_next_identity(bytes: [u8; 16]) -> Result<(), String> { failpoint::set_next_identity(bytes) }
     pub fn clear() {
@@ -399,6 +401,18 @@ pub mod test_api {
         instance.connection.as_ref().ok_or(InstanceError::CloseIncomplete)?
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .map_err(|e| InstanceError::Store(e.to_string()))
+    }
+    pub fn no_checkpoint_on_close(instance: &Instance) -> Result<(), InstanceError> {
+        instance.connection.as_ref().ok_or(InstanceError::CloseIncomplete)?
+            .set_db_config(rusqlite::config::DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE,true)
+            .map(|_|()).map_err(|e|InstanceError::Store(e.to_string()))
+    }
+    pub fn hardened_settings(instance: &Instance) -> Result<(i64,bool,i64,i64),InstanceError> {
+        let c=instance.connection.as_ref().ok_or(InstanceError::CloseIncomplete)?;
+        let read=||->rusqlite::Result<_>{Ok((c.query_row("PRAGMA trusted_schema",[],|r|r.get(0))?,
+            c.db_config(rusqlite::config::DbConfig::SQLITE_DBCONFIG_DEFENSIVE)?,
+            c.query_row("PRAGMA auto_vacuum",[],|r|r.get(0))?,c.query_row("PRAGMA wal_autocheckpoint",[],|r|r.get(0))?))};
+        read().map_err(|e|InstanceError::Store(e.to_string()))
     }
     pub fn schema_objects(instance: &Instance) -> Result<i64, InstanceError> {
         instance.connection.as_ref().ok_or(InstanceError::CloseIncomplete)?
