@@ -7,8 +7,8 @@ results. An unselected or platform-inapplicable check is not a pass.
 
 ## Inputs and recorded scope
 
-The 2026-10-17 native Windows/MSVC checkpoint through PR #23 passed these
-configured targets on fixed NTFS:
+The native Windows/MSVC suite includes the following configured targets.
+Recorded Windows runs use fixed NTFS:
 
 | Target | CHECK records | Additional inputs beyond the synthetic data directory |
 | --- | ---: | --- |
@@ -17,9 +17,9 @@ configured targets on fixed NTFS:
 | `instance_migrations` | 18 | `YOKAI_TEST_V0_FIXTURE`, `YOKAI_TEST_V0_BINARY` |
 | `sqlite_runtime` | 12 | None |
 | `store_runtime` | 31 | None |
-| `windows_validation` | 21 | `YOKAI_TEST_V0_FIXTURE`, `YOKAI_TEST_V2_FIXTURE`, `YOKAI_TEST_V2_BINARY`, `YOKAI_TEST_POWERSHELL` |
+| `windows_validation` | 22 | `YOKAI_TEST_V0_FIXTURE`, `YOKAI_TEST_V2_FIXTURE`, `YOKAI_TEST_V2_BINARY`, `YOKAI_TEST_POWERSHELL` |
 
-These 149 records include explicitly qualified platform branches; R12's
+These 150 records include explicitly qualified platform branches; R12's
 dangling-file-symlink subcheck remains Unix-only and reports `not_checked` on
 Windows. The Windows-only target reports `RESULT NOT_CHECKED` on other platforms.
 The checkpoint's WSL gate parsed saved Windows output; it ran no Linux candidate
@@ -402,3 +402,21 @@ recovery qualification.
 These selected PF4/PF5/PF18 observations do not prove transient-write absence,
 metadata/ADS/object identity, hostile-race safety, every side-file combination,
 Linux parity, full W2/workspace/security/release or power-loss durability.
+
+### Stale SHM without WAL
+
+`WV-STALE-SHM` uses ten independent closed owned V2 fixtures. Each has a
+validated main header at version0,1,2,3 or4294967295 and an empty or nonempty
+SHM, with WAL and journal absent. Exact `SideFileStateUnverified` with that
+unsigned header version must take precedence over newer-version and schema
+work, with one decoded-header observation, a drained second take, and no
+SQLite connection. The legacy header values are synthetic; they do not
+establish a legacy schema upgrade.
+
+Pristine, altered, parent-after and fresh-child-after copies retain150 ordinary
+files. Both processes enforce the same exact refusal, complete closed-root
+byte equality, fixed SQLite entry inventories and released data handles.
+Empty-present SHM is distinct from absence. These selected PF2b/PF10(a) checks
+do not establish supported-version side-file recovery, every layout, transient
+writes, metadata/ADS/object identity, hostile races, Linux parity, full W2,
+power-loss durability or product/security/release acceptance.
