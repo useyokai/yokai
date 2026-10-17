@@ -12,8 +12,12 @@ fn main() -> std::process::ExitCode {
 mod support;
 
 #[cfg(windows)]
+#[path = "support/windows_process.rs"]
+mod windows_process;
+
+#[cfg(windows)]
 mod native {
-    use super::support;
+    use super::{support,windows_process};
     use std::collections::BTreeMap;
     use std::fs::{self,File,OpenOptions};
     use std::io::{Read,Seek,SeekFrom,Write};
@@ -52,6 +56,7 @@ mod native {
             ("WV-PREFLIGHT-SEMANTIC",preflight_semantic),
             ("WV-PREFLIGHT-INTEGRITY",preflight_integrity),
             ("WV-LOCK-SOAK",lock_soak),
+            ("WV-RESOURCE-COUNTS",resource_counts),
         ];
         let selected:Vec<_>=match args.as_slice(){
             [_]=>checks.iter().collect(),
@@ -63,6 +68,50 @@ mod native {
         if failed==0 {println!("RESULT PASS {}/{}",selected.len(),selected.len());ExitCode::SUCCESS}
         else {println!("RESULT FAIL {failed}/{}",selected.len());ExitCode::FAILURE}
     }
+    fn resource_counts()->Result<String,String>{
+        use std::sync::mpsc;
+        struct Workers { releases:Vec<mpsc::Sender<()>>, joins:Vec<std::thread::JoinHandle<()>> }
+        impl Workers {
+            fn join(&mut self)->Result<(),String>{
+                self.releases.clear();
+                let failed=self.joins.drain(..).map(|j|j.join().is_err()).fold(false,|a,b|a|b);
+                if failed {Err("resource control worker panicked".into())} else {Ok(())}
+            }
+        }
+        impl Drop for Workers {fn drop(&mut self){let _=self.join();}}
+        let fixture=parent("resource-counts")?;
+        let sample=||windows_process::sample().map_err(|e|e.to_string());
+        let baseline=sample()?;
+        for _ in 0..32 {if sample()?!=baseline{return Err("repeated snapshots changed resource counts".into());}}
+        let errors=windows_process::invalid_handle_errors().map_err(|e|e.to_string())?;
+        if errors!=(6,6) || sample()?!=baseline {return Err(format!("invalid native query controls={errors:?}"));}
+        let mut files=Vec::new();
+        for n in 0..8 {files.push(File::create_new(fixture.join(format!("held-{n}.txt"))).map_err(|e|e.to_string())?);}
+        let held_files=sample()?;
+        if held_files!=(baseline.0+8,baseline.1){return Err(format!("file handle delta {baseline:?}->{held_files:?}"));}
+        let (ready_tx,ready_rx)=mpsc::channel();
+        let mut workers=Workers{releases:Vec::new(),joins:Vec::new()};
+        for n in 0..4 {
+            let (release_tx,release_rx)=mpsc::channel();let ready=ready_tx.clone();
+            let join=std::thread::Builder::new().name(format!("resource-control-{n}")).spawn(move||{
+                let _=ready.send(());let _=release_rx.recv();
+            }).map_err(|e|e.to_string())?;
+            workers.releases.push(release_tx);workers.joins.push(join);
+        }
+        drop(ready_tx);
+        for _ in 0..4 {ready_rx.recv_timeout(Duration::from_secs(10)).map_err(|e|e.to_string())?;}
+        let held_threads=sample()?;
+        if held_threads.1!=baseline.1+4 {return Err(format!("thread delta {baseline:?}->{held_threads:?}"));}
+        workers.join()?;
+        let joined=sample()?;
+        if joined!=held_files{return Err(format!("joined resources {held_files:?}->{joined:?}"));}
+        drop(files);
+        let final_counts=sample()?;
+        if final_counts!=baseline{return Err(format!("released resources {baseline:?}->{final_counts:?}"));}
+        println!("INFO WV resources pid={} baseline={baseline:?} held_files={held_files:?} held_threads={held_threads:?} joined={joined:?} final={final_counts:?} repeated_samples=32 invalid_errors={errors:?} fixture={}",std::process::id(),fixture.display());
+        Ok("positive native counters;32 closed snapshots; null queries error6;8 held files and4 ready threads detected; owned handles/threads return to baseline".into())
+    }
+
     fn deadline()->Instant{Instant::now()+Duration::from_secs(10)}
     fn parent(label:&str)->Result<PathBuf,String>{
         let base=PathBuf::from(std::env::var_os("YOKAI_TEST_DATA_DIR").ok_or("missing test data root")?);

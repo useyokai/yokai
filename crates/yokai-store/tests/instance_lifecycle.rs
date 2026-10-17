@@ -12,6 +12,10 @@ use std::process::{Child, Command, ExitCode, Stdio};
 use std::sync::{Arc, Barrier, atomic::{AtomicUsize, Ordering}};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+#[cfg(windows)]
+#[path = "support/windows_process.rs"]
+mod windows_process;
+
 use rusqlite::Connection;
 use yokai_store::{self as store, IncompleteReason, Instance, InstanceError};
 use yokai_types::InstanceId;
@@ -108,19 +112,7 @@ fn child_main(args: &[String]) -> Option<u8> {
         }
         "cycles" => {
             let root = PathBuf::from(args.get(3)?);
-            let stdin = std::io::stdin();
-            let stdout = std::io::stdout();
-            let mut out = stdout.lock();
-            for line in stdin.lock().lines() {
-                let Ok(line) = line else { return Some(7) };
-                if line == "stop" { break; }
-                if line != "cycle" { return Some(8); }
-                let Ok(instance) = store::open_instance(&root) else { return Some(9) };
-                if instance.close().is_err() || writeln!(out, "done").is_err() || out.flush().is_err() {
-                    return Some(10);
-                }
-            }
-            Some(0)
+            match child_cycles(&root) { Ok(()) => Some(0), Err(error) => { eprintln!("IL8_CHILD_FAIL {error}"); Some(15) } }
         }
         "wal-version" => {
             let path = PathBuf::from(args.get(3)?);
@@ -643,49 +635,103 @@ fn case_close_order(base: &Path) -> Result<String, String> {
 }
 
 #[cfg(unix)]
-fn resource_counts() -> (usize, usize) {
-    (fs::read_dir("/proc/self/fd").map(|it| it.count()).unwrap_or(0),
-     fs::read_dir("/proc/self/task").map(|it| it.count()).unwrap_or(0))
+fn resource_counts() -> Result<(usize, usize), String> {
+    fn count(path: &str) -> std::io::Result<usize> {
+        fs::read_dir(path)?.try_fold(0, |n, entry| entry.map(|_| n + 1))
+    }
+    let counts = (count("/proc/self/fd").map_err(|e| e.to_string())?,
+                  count("/proc/self/task").map_err(|e| e.to_string())?);
+    if counts.0 == 0 || counts.1 == 0 { return Err("resource counter returned zero".into()); }
+    Ok(counts)
 }
-#[cfg(not(unix))]
-fn resource_counts() -> (usize, usize) { (0, 0) }
+#[cfg(windows)]
+fn resource_counts() -> Result<(usize, usize), String> {
+    windows_process::sample().map_err(|e| format!("native resource count: {e}"))
+}
+#[cfg(not(any(unix, windows)))]
+fn resource_counts() -> Result<(usize, usize), String> { Err("resource counters unsupported".into()) }
+
+fn cycle_once(root: &Path) -> Result<(), String> {
+    store::open_instance(root).map_err(|e| e.to_string())?.close().map_err(|e| e.to_string())
+}
+fn child_cycles(root: &Path) -> Result<(), String> {
+    let stdin = std::io::stdin();
+    let stdout = std::io::stdout();
+    let mut input = stdin.lock().lines();
+    let mut out = stdout.lock();
+    cycle_once(root)?; // Explicit warmup excluded from the measured100 cycles.
+    let before = resource_counts()?;
+    writeln!(out, "RESOURCE baseline {} {} {}", std::process::id(), before.0, before.1).map_err(|e| e.to_string())?;
+    out.flush().map_err(|e| e.to_string())?;
+    for _ in 0..100 {
+        if input.next().transpose().map_err(|e| e.to_string())?.as_deref() != Some("cycle") {
+            return Err("missing child cycle command".into());
+        }
+        cycle_once(root)?;
+        writeln!(out, "done").map_err(|e| e.to_string())?;
+        out.flush().map_err(|e| e.to_string())?;
+    }
+    if input.next().transpose().map_err(|e| e.to_string())?.as_deref() != Some("finish") {
+        return Err("missing child finish command".into());
+    }
+    let after = resource_counts()?;
+    if before != after { return Err(format!("child resources={before:?}->{after:?}")); }
+    writeln!(out, "RESOURCE final {} {} {}", std::process::id(), after.0, after.1).map_err(|e| e.to_string())?;
+    out.flush().map_err(|e| e.to_string())
+}
+fn read_cycle_counts(input: &mut impl BufRead, phase: &str, pid: u32) -> Result<(usize, usize), String> {
+    let mut line = String::new();
+    input.read_line(&mut line).map_err(|e| e.to_string())?;
+    let fields: Vec<_> = line.split_whitespace().collect();
+    if fields.len() != 5 || fields[0] != "RESOURCE" || fields[1] != phase
+        || fields[2].parse::<u32>().ok() != Some(pid) { return Err(format!("invalid resource protocol: {line:?}")); }
+    let counts = (fields[3].parse::<usize>().map_err(|e| e.to_string())?, fields[4].parse::<usize>().map_err(|e| e.to_string())?);
+    if counts.0 == 0 || counts.1 == 0 { return Err("child resource counter returned zero".into()); }
+    Ok(counts)
+}
 
 fn case_repeated_open_close(base: &Path) -> Result<String, String> {
+    struct CycleChild(Child);
+    impl Drop for CycleChild {
+        fn drop(&mut self) {
+            if !matches!(self.0.try_wait(), Ok(Some(_))) { let _ = self.0.kill(); let _ = self.0.wait(); }
+        }
+    }
     let root = new_root(base, "il8")?;
-    let before = resource_counts();
+    cycle_once(&root)?;
+    let before = resource_counts()?;
     let mut command = child_command("cycles", &[&root])?;
-    command.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
-    let mut child = command.spawn().map_err(|e| e.to_string())?;
-    let mut input = child.stdin.take().ok_or("child stdin unavailable")?;
-    let output = child.stdout.take().ok_or("child stdout unavailable")?;
+    command.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::inherit());
+    let mut child = CycleChild(command.spawn().map_err(|e| e.to_string())?);
+    let pid = child.0.id();
+    let mut input = child.0.stdin.take().ok_or("child stdin unavailable")?;
+    let output = child.0.stdout.take().ok_or("child stdout unavailable")?;
     let mut lines = BufReader::new(output);
     let mut dumpable_line = String::new();
     lines.read_line(&mut dumpable_line).map_err(|e| e.to_string())?;
-    if !dumpable_line.starts_with("DUMPABLE") {
-        drop(input);
-        let _ = child.wait();
-        return Err(format!("child dumpability line={dumpable_line:?}"));
-    }
+    if !dumpable_line.starts_with("DUMPABLE") { return Err(format!("child dumpability line={dumpable_line:?}")); }
+    let child_before = read_cycle_counts(&mut lines, "baseline", pid)?;
     for _ in 0..100 {
-        store::open_instance(&root).map_err(|e| e.to_string())?.close().map_err(|e| e.to_string())?;
+        cycle_once(&root)?;
         input.write_all(b"cycle\n").map_err(|e| e.to_string())?;
         input.flush().map_err(|e| e.to_string())?;
         let mut response = String::new();
         lines.read_line(&mut response).map_err(|e| e.to_string())?;
-        if response.trim() != "done" {
-            drop(input);
-            let _ = child.wait();
-            return Err(format!("child cycle response={response:?}"));
-        }
+        if response.trim() != "done" { return Err(format!("child cycle response={response:?}")); }
     }
-    input.write_all(b"stop\n").map_err(|e| e.to_string())?;
+    input.write_all(b"finish\n").map_err(|e| e.to_string())?;
+    input.flush().map_err(|e| e.to_string())?;
+    let child_after = read_cycle_counts(&mut lines, "final", pid)?;
     drop(input);
-    let status = child.wait().map_err(|e| e.to_string())?;
+    let status = child.0.wait().map_err(|e| e.to_string())?;
     drop(lines);
     drop(child);
-    let after = resource_counts();
-    if status.success() && before == after { Ok("200 alternating open/close cycles; descriptor/thread counts stable".into()) }
-    else { Err(format!("child={status} resources={before:?}->{after:?}")) }
+    let after = resource_counts()?;
+    println!("INFO IL-8 resources actor=parent pid={} before_handles_or_fds={} before_threads={} after_handles_or_fds={} after_threads={} warmup=1 cycles=100", std::process::id(), before.0, before.1, after.0, after.1);
+    println!("INFO IL-8 resources actor=child pid={pid} before_handles_or_fds={} before_threads={} after_handles_or_fds={} after_threads={} warmup=1 cycles=100", child_before.0, child_before.1, child_after.0, child_after.1);
+    if status.success() && before == after && child_before == child_after {
+        Ok("200 alternating measured open/close cycles after warmup; both processes' native resource counts stable".into())
+    } else { Err(format!("child={status} parent={before:?}->{after:?} child_resources={child_before:?}->{child_after:?}")) }
 }
 
 #[cfg(unix)]
