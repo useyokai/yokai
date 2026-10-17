@@ -148,3 +148,38 @@ synthetic I/O/corruption/commit faults. Child-process reopen checks establish
 observed durable truth for those cases. Windows process termination is not
 Linux SIGKILL coverage. Simulated FULL does not establish physical ENOSPC;
 none of these tests establishes power-loss durability or product acceptance.
+
+## Native Windows qualification harness
+
+The `windows_validation` custom target requires `test-api`. It exercises failed
+replay settlement for Duplicate/Conflict, startup ownership after a real SQLite
+close error, removed/altered V2 triggers and index in WAL/no-WAL states, compatible
+V2 reopening, linked SQLite compile options, available path aliases, and a
+bounded lock/contention observation. Non-Windows builds emit `RESULT NOT_CHECKED`
+for this target; they do not claim Windows validation.
+
+The bounded runner supplies a fresh absolute `YOKAI_TEST_DATA_DIR`, the explicit
+Windows dumpability opt-in, and matching hash-verified V0/V1/V2 fixture and test
+binary pairs through `YOKAI_TEST_V{0,1,2}_FIXTURE` and
+`YOKAI_TEST_V{0,1,2}_BINARY`. Cross-version work uses copies. Original fixtures,
+executables and evidence are retained. Cargo actions are offline/locked/frozen;
+the test inputs must already exist locally.
+
+`fail_startup_close_once` is diagnostic-only. A dedicated owned child leaks a
+real prepared statement to make SQLite close return BUSY. The normal retention
+path must keep its connection and lock until that child exits; the parent kills
+and reaps only its child. Default builds expose no such hook. Replay rollback
+faults are synthetic; the real transaction/ownership paths are still exercised.
+
+Alias checks record available junction, symbolic-link and short-name cases.
+Unavailable privileges or short names remain explicit gaps. Only an owned,
+identity-verified link is unlinked after observation; its target and logs remain.
+UNC classification is tested without opening a share. No drive mapping, share,
+privilege, Defender or indexer configuration is changed. The short contention
+observation does not establish controlled antivirus/indexer interference or a
+performance guarantee.
+
+These checks are partial Windows qualification. Physical NTFS exhaustion,
+power loss/OS crash, directory-entry durability, Windows dumpability and the
+Unix dangling-file-symlink subcheck retain their separate limits. WSL processing
+of saved Windows output does not run these tests on Linux or change their scope.

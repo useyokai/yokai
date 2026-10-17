@@ -101,6 +101,20 @@ pub(crate) fn inspect(conn: &Connection, id: InstanceId, created: &str, plan:Pla
 
 /// Deliberately conservative SQL lexer: quoted identifiers are not needed by embedded SQL.
 /// Comments and string literals do not contribute statement keywords.
+fn sql_tokens(statement:&str)->Vec<&str>{
+    // lint has already reduced the text to ASCII outside string/comment placeholders.
+    // Keep punctuation as individual tokens: removing it loses operators and grouping.
+    let bytes=statement.as_bytes();let mut tokens=Vec::new();let mut i=0;
+    while i<bytes.len(){
+        if bytes[i].is_ascii_whitespace(){i+=1;continue;}
+        let start=i;i+=1;
+        if bytes[start].is_ascii_alphanumeric() || bytes[start]==b'_' {
+            while i<bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i]==b'_'){i+=1;}
+        }
+        tokens.push(&statement[start..i]);
+    }
+    tokens
+}
 pub(crate) fn lint(sql: &str, version: u32) -> Result<(), String> {
     let bytes=sql.as_bytes(); let mut i=0; let mut text=String::new();
     while i<bytes.len() {
@@ -126,7 +140,7 @@ pub(crate) fn lint(sql: &str, version: u32) -> Result<(), String> {
     }
     let mut trigger_end=false;
     for (index,statement) in statements.iter().enumerate() {
-        let tokens: Vec<&str> = statement.split(|c:char| !c.is_ascii_alphanumeric() && c!='_').filter(|s| !s.is_empty()).collect();
+        let tokens=sql_tokens(statement);
         if trigger_end {
             if tokens!=["end"] {return Err("immutable trigger must end immediately".into());}
             trigger_end=false;continue;
@@ -134,12 +148,12 @@ pub(crate) fn lint(sql: &str, version: u32) -> Result<(), String> {
         if tokens.starts_with(&["create","trigger"]) {
             // Only the reviewed command refusal triggers need BEGIN/END in a migration.
             // A trigger cannot smuggle a transaction/connection statement through lint.
-            let direct=tokens.len()==12 && ["commands_immutable","commands_append_only"].contains(&tokens[2])
-                && tokens[3]=="before" && ["update","delete"].contains(&tokens[4])
-                && tokens[5..]==["on","commands","begin","select","raise","abort","literal"];
+            let direct=tokens.len()==15 && matches!((tokens[2],tokens[4]),
+                ("commands_immutable","update") | ("commands_append_only","delete")) && tokens[3]=="before"
+                && tokens[5..]==["on","commands","begin","select","raise","(","abort",",","literal",")"];
             let replacement=tokens==["create","trigger","commands_no_replace","before","insert","on","commands",
-                "when","exists","select","1","from","commands","where","command_id","new","command_id",
-                "or","run_id","new","run_id","begin","select","raise","abort","literal"];
+                "when","exists","(","select","1","from","commands","where","command_id","=","new",".","command_id",
+                "or","run_id","=","new",".","run_id",")","begin","select","raise","(","abort",",","literal",")"];
             if !direct && !replacement {
                 return Err("only immutable command refusal triggers are allowed".into());
             }

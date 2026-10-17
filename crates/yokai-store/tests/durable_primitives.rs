@@ -117,12 +117,19 @@ fn constraints()->Result<String,String>{
         "INSERT INTO jobs(run_id,job_no,state,created_epoch) VALUES(1,1,'Pending',1)",
         "INSERT INTO jobs(run_id,job_no,state,claimed_by,created_epoch) VALUES(1,2,'Pending','x',1)",
         "INSERT INTO jobs(run_id,job_no,state,created_epoch) VALUES(1,2,'Claimed',1)",
-        "INSERT INTO commands VALUES('bad','test',1,x'',zeroblob(31),1,1)",
         "INSERT INTO events(run_id,kind,epoch) VALUES(1,'run.accepted',1)"];
     for sql in bad {let error=c.execute_batch(sql).err().ok_or_else(||format!("constraint accepted {sql}"))?;
         if store::ext_code(&error).map(|c|c&255)!=Some(19) || !c.is_autocommit(){return Err(format!("not a clean constraint refusal: {error}"));}}
+    // A valid unbound run isolates the digest CHECK from FK/unique/replacement guards.
+    c.execute_batch("BEGIN IMMEDIATE; INSERT INTO runs(admission,status,created_epoch) VALUES('Queued','Open',1)").map_err(|e|e.to_string())?;
+    let unbound=c.last_insert_rowid();
+    let digest_error=c.execute("INSERT INTO commands VALUES('bad','test',1,x'',zeroblob(31),?1,1)",[unbound]).err();
+    let active_after_error=!c.is_autocommit();
+    c.execute_batch("ROLLBACK").map_err(|e|e.to_string())?;
+    let digest_error=digest_error.ok_or("invalid digest accepted")?;
+    if store::ext_code(&digest_error)!=Some(275) || !active_after_error || !c.is_autocommit(){return Err(format!("digest CHECK not isolated/rolled back: {digest_error}"));}
     if counts(&root)?!=(1,1,1,1){return Err("refused mutation changed acceptance set".into());}
-    Ok("actual command UPDATE/DELETE/REPLACE refusal with recursive triggers OFF, run/job CHECKs, digest length, FK, job/event uniqueness preserve records".into())
+    Ok("actual command UPDATE/DELETE/REPLACE refusal with recursive triggers OFF, isolated digest CHECK275 and rollback, run/job CHECKs, FK, job/event uniqueness preserve records".into())
 }
 fn concurrent_duplicates()->Result<String,String>{
     let i=instance("concurrent")?;let root=i.root().to_owned();let pause=store::test_api::block_writer(&i).map_err(|e|e.to_string())?;

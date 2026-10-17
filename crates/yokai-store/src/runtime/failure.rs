@@ -33,7 +33,7 @@ pub(super) fn classify(conn: &Connection, shared: &Shared, request: &WriteReques
     } else if !auto {
         let fail_rollback = {
             #[cfg(feature = "test-api")]
-            { matches!(&request.work, WriteWork::Probe(probe) if matches!(probe.fault,
+            { matches!(request.work.fault(),Some(
                 crate::test_api::WriteFault::RollbackFailure(_) | crate::test_api::WriteFault::Refuse { rollback_fails: true })) }
             #[cfg(not(feature = "test-api"))]
             { false }

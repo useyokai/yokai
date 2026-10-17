@@ -203,7 +203,13 @@ fn check_lint()->Result<String,String>{
         if store::test_api::lint_migration(sql,1).is_ok(){return Err(format!("lint accepted {sql}"));}
     }
     store::test_api::lint_migration("-- VACUUM;\nCREATE TABLE x(v TEXT DEFAULT 'COMMIT;'); /* ATTACH */ PRAGMA user_version = 1;",1)?;
-    Ok("forbidden statements/transaction escape/wrong terminal version rejected; strings/comments parsed".into())
+    let guard="CREATE TRIGGER commands_no_replace BEFORE INSERT ON commands WHEN EXISTS (SELECT 1 FROM commands WHERE command_id = NEW.command_id OR run_id = NEW.run_id) BEGIN SELECT RAISE(ABORT,'immutable'); END; PRAGMA user_version = 2;";
+    store::test_api::lint_migration(guard,2)?;
+    for changed in [guard.replace(" = NEW."," != NEW."),guard.replace(" = NEW."," <> NEW."),guard.replace(" = NEW."," == NEW."),
+        guard.replace("WHERE command_id", "WHERE (command_id").replace("NEW.run_id)","NEW.run_id))")]{
+        if store::test_api::lint_migration(&changed,2).is_ok(){return Err(format!("lint accepted changed trigger predicate: {changed}"));}
+    }
+    Ok("forbidden statements, changed trigger operators/grouping and wrong terminal version rejected; valid strings/comments/guard parsed".into())
 }
 fn check_retention()->Result<String,String>{
     let root=legacy("retention")?;let mut previous=Vec::new();let mut gaps=Vec::new();
