@@ -59,6 +59,7 @@ mod native {
             ("WV-RESOURCE-COUNTS",resource_counts),
             ("WV-PREFLIGHT-CORRUPTION",preflight_corruption),
             ("WV-RAW-HEADER",raw_headers),
+            ("WV-JOURNAL-EMPTY",journal_empty),
         ];
         let selected:Vec<_>=match args.as_slice(){
             [_]=>checks.iter().collect(),
@@ -188,6 +189,12 @@ mod native {
                     let before=access_snapshot(root)?;let outcome=raw_header_refusal(root,case)?;let after=access_snapshot(root)?;
                     if before!=after{return Err("raw-header child changed complete closed bytes/names/types".into());}
                     println!("INFO WV raw_header_child case={case} outcome={outcome} sqlite_events=[] exact_refusal=true complete_closed_bytes_unchanged=true inventory_before={:?} inventory_after={:?}",stageb_inventory(&before)?,stageb_inventory(&after)?);
+                },
+                "__journal_empty_refusal"=>{
+                    let case=args.get(3).ok_or("missing journal/empty case")?;
+                    let before=access_snapshot(root)?;let outcome=journal_empty_refusal(root,case)?;let after=access_snapshot(root)?;
+                    if before!=after{return Err("journal/empty child changed complete closed root".into());}
+                    println!("INFO WV journal_empty_child case={case} outcome={outcome} sqlite_events=[] exact_refusal=true complete_closed_bytes_unchanged=true inventory_before={:?} inventory_after={:?}",stageb_inventory(&before)?,stageb_inventory(&after)?);
                 },
                 "__close_error"=>{
                     store::test_api::fail_startup_close_once();
@@ -1225,6 +1232,78 @@ mod native {
             println!("INFO WV raw_header fixture={} case={case} pristine={} baseline={} after={} child_after={} child_logs={} header_version={value} original_bytes={} altered_bytes={} outcome={outcome} sqlite_events=[] complete_closed_bytes_unchanged=true side_files_absent=true all_copies_verified=true exclusive_data_opens=allowed child_lock_reacquired=true inventory_before={:?} inventory_after={:?} inventory_child_after={:?}",root.display(),original.display(),baseline.display(),final_copy.display(),child_copy.display(),logs.display(),main.len(),before.get("instance.db").and_then(Option::as_ref).ok_or("missing raw-header main")?.len(),stageb_inventory(&before)?,stageb_inventory(&after)?,stageb_inventory(&repeated)?);
         }
         Ok("nine exact malformed raw-header fields with max-version precedence and six future big-endian versions refused before SQLite;180 retained files, complete closed inventories and fresh-child ownership verified;65535 is the actual malformed upper page encoding, not131072; accepted0/1/2 and exhaustive PF16/PF17/W2 remain separate".into())
+    }
+
+    fn journal_empty_refusal(root:&Path,case:&str)->Result<String,String>{
+        let expected=match case {
+            "rollback-header"=>Vec::new(),"journal-no-wal"=>vec![u32::MAX],"journal-with-wal"=>vec![2],
+            "zero-wal-empty"|"zero-wal-bytes"|"zero-shm-empty"|"zero-shm-bytes"|"zero-journal-empty"|"zero-journal-bytes"=>Vec::new(),
+            _=>return Err(format!("unknown journal/empty case {case}")),
+        };
+        store::test_api::clear();let result=store::open_instance(root);
+        let events=store::test_api::connection_events();
+        let outcome=match result {
+            Err(InstanceError::UnexpectedJournal) if case=="rollback-header" || case.starts_with("journal-") || case.starts_with("zero-journal-")=>"UnexpectedJournal".to_string(),
+            Err(InstanceError::SchemaInconsistent(reason)) if case.starts_with("zero-wal-") && reason=="zero-length database has a WAL side file"=>"SchemaInconsistentZeroMain".into(),
+            Err(InstanceError::SideFileStateUnverified{header_version:0}) if case.starts_with("zero-shm-")=>"SideFileStateUnverified(0)".into(),
+            Ok(i)=>{i.close().map_err(|e|e.to_string())?;return Err(format!("journal/empty {case} unexpectedly opened; events={events:?}"));},
+            Err(error)=>return Err(format!("journal/empty {case} wrong refusal {error:?}; events={events:?}")),
+        };
+        let decoded=store::test_api::header_versions()?;let second_take=store::test_api::header_versions()?;
+        if !events.is_empty() || decoded!=expected || !second_take.is_empty(){return Err(format!("journal/empty {case} decoded={decoded:?} expected={expected:?} second_take={second_take:?} events={events:?}"));}
+        println!("INFO WV journal_empty_trace case={case} outcome={outcome} decoded={decoded:?} second_take={second_take:?} sqlite_events={events:?}");
+        Ok(outcome)
+    }
+    fn journal_empty()->Result<String,String>{
+        for case in ["rollback-header","journal-no-wal","journal-with-wal","zero-wal-empty","zero-wal-bytes","zero-shm-empty","zero-shm-bytes","zero-journal-empty","zero-journal-bytes"] {
+            let root=if case=="journal-with-wal" {
+                let root=closed_sidefile_fixture("journal-empty-wal",4)?;
+                let mut main=fs::read(root.join("instance.db")).map_err(|e|e.to_string())?;
+                if main.get(60..64)!=Some(3u32.to_be_bytes().as_slice()){return Err("journal WAL control main is not3".into());}
+                main[60..64].copy_from_slice(&2u32.to_be_bytes());fs::write(root.join("instance.db"),main).map_err(|e|e.to_string())?;
+                future_wal_control(&root,4)?;root
+            }else{let i=instance("journal-empty")?;let root=i.root().to_owned();i.close().map_err(|e|e.to_string())?;root};
+            let pristine=access_snapshot(&root)?;
+            let expected_names:&[&str]=if case=="journal-with-wal" {&["instance.db","instance.db-shm","instance.db-wal","instance.id","instance.lock"]} else {&["instance.db","instance.id","instance.lock"]};
+            if pristine.keys().map(String::as_str).collect::<Vec<_>>()!=expected_names || pristine.get("instance.lock")!=Some(&Some(Vec::new())){return Err("journal/empty pristine names/lock differ".into());}
+            let main=pristine.get("instance.db").and_then(Option::as_ref).ok_or("journal/empty pristine main missing")?;
+            if main.len()<100 || main.len()%4096!=0 || &main[..16]!=b"SQLite format 3\0"
+                || main[16..24]!=[0x10,0,2,2,0,64,32,32] || main[60..64]!=2u32.to_be_bytes(){return Err("journal/empty pristine layout/version differs".into());}
+            let original=retain_damage_snapshot(&root,"retained-journal-pristine",&pristine)?;
+            let mut expected=pristine.clone();
+            if case=="rollback-header" || case=="journal-no-wal" {
+                let mut bytes=main.clone();bytes[60..64].copy_from_slice(&u32::MAX.to_be_bytes());
+                if case=="rollback-header" {bytes[18]=1;bytes[19]=1;}
+                fs::write(root.join("instance.db"),&bytes).map_err(|e|e.to_string())?;expected.insert("instance.db".into(),Some(bytes));
+            }
+            if case.starts_with("journal-") {
+                let bytes=b"owned journal presence witness".to_vec();
+                fs::write(root.join("instance.db-journal"),&bytes).map_err(|e|e.to_string())?;
+                expected.insert("instance.db-journal".into(),Some(bytes));
+            }
+            if let Some(part)=case.strip_prefix("zero-") {
+                let (suffix,kind)=part.rsplit_once('-').ok_or("zero case shape")?;
+                let bytes=match kind {"empty"=>Vec::new(),"bytes"=>b"owned side-file presence witness".to_vec(),_=>return Err("zero case kind".into())};
+                fs::write(root.join("instance.db"),[]).map_err(|e|e.to_string())?;
+                fs::write(root.join(format!("instance.db-{suffix}")),&bytes).map_err(|e|e.to_string())?;
+                expected.insert("instance.db".into(),Some(Vec::new()));expected.insert(format!("instance.db-{suffix}"),Some(bytes));
+            }
+            let before=access_snapshot(&root)?;if before!=expected{return Err("journal/empty setup changed unintended entries".into());}
+            let baseline=retain_damage_snapshot(&root,"retained-journal-before",&before)?;
+            let outcome=journal_empty_refusal(&root,case)?;let after=access_snapshot(&root)?;
+            if after!=before{return Err("journal/empty parent refusal changed complete closed root".into());}
+            let final_copy=retain_damage_snapshot(&root,"retained-journal-after",&after)?;stageb_released(&root)?;
+            let mut probe=command("__journal_empty_refusal",&root)?;probe.arg(case);
+            let (mut child,logs)=launch(probe,"journal-empty-probe")?;
+            if !wait(&mut child,Duration::from_secs(15))?.success(){return Err(format!("journal/empty child failed; logs={}",logs.display()));}
+            let repeated=access_snapshot(&root)?;if repeated!=after{return Err("journal/empty child refusal changed complete closed root".into());}
+            stageb_released(&root)?;let child_copy=retain_damage_snapshot(&root,"retained-journal-child-after",&repeated)?;
+            for (snapshot,path) in [(&pristine,&original),(&before,&baseline),(&after,&final_copy),(&repeated,&child_copy)] {
+                if access_snapshot(path)?!=*snapshot{return Err("journal/empty retained copy differs".into());}
+            }
+            println!("INFO WV journal_empty fixture={} case={case} pristine={} baseline={} after={} child_after={} child_logs={} outcome={outcome} sqlite_events=[] complete_closed_bytes_unchanged=true all_copies_verified=true exclusive_data_opens=allowed child_lock_reacquired=true inventory_before={:?} inventory_after={:?} inventory_child_after={:?}",root.display(),original.display(),baseline.display(),final_copy.display(),child_copy.display(),logs.display(),stageb_inventory(&before)?,stageb_inventory(&after)?,stageb_inventory(&repeated)?);
+        }
+        Ok("rollback header, journal presence with/without genuine WAL, and zero main with empty/nonempty WAL/SHM/journal refuse exactly before SQLite;140 retained files,18 parent/child traces, closed inventories and released handles verified; selected PF4/PF5/PF18 cases only, no transient-write/race/durability or fullW2 acceptance".into())
     }
 
     fn lock_soak()->Result<String,String>{
