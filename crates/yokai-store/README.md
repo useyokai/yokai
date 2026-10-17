@@ -378,3 +378,27 @@ every malformed page, all PF6/PF7/PF8/PF14/W2 requirements, absence of transient
 writes, nonempty StageB difference formatting, power-loss durability, broader
 security or product acceptance. An integrity-result row is not an extended
 SQLite error code. No Instance main/WAL/root is removed or repaired.
+
+### Measured Windows resource counters
+
+IL-8 now samples real native process handle counts and PID-filtered Toolhelp
+thread snapshots in both parent and child. Each process completes one explicit
+open/close warmup, then100 measured cycles, alternating between processes.
+Bookend counts must be positive and equal after confirmed close and owned
+process/pipe cleanup. Counter, enumeration, protocol and close errors fail.
+Unix `/proc` counter errors also fail; these edits have no new Linux runtime
+qualification.
+
+`WV-RESOURCE-COUNTS` checks32 repeated samples, null-query native error6,
+eight held ordinary file handles, four ready blocked threads, and return to
+baseline after join/close. Synthetic files are retained outside Instance roots.
+The test-only shared helper counts handles before opening its snapshot, closes
+that snapshot, initializes the28-byte native entry, checks its returned length,
+and accepts only ERROR_NO_MORE_FILES after Thread32Next as normal completion.
+No dependency, privilege or host setting is added.
+
+Older Windows IL-8 runs used placeholder zero counters: their200 completed
+cycles remain historical evidence, but their resource-stability text was
+unsupported. New counts are non-atomic samples on one host. They do not establish
+absence of transient leaks, all-time resource stability, other platform/host
+behavior, performance bounds, full IL-8/W2, or product/release acceptance.
