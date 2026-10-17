@@ -50,6 +50,16 @@ fn counts(root:&Path)->Result<(i64,i64,i64,i64),String>{
     let c=ro(root)?;let n=|table:&str|c.query_row(&format!("SELECT count(*) FROM {table}"),[],|r|r.get(0)).map_err(|e|e.to_string());
     Ok((n("runs")?,n("commands")?,n("jobs")?,n("events WHERE kind='run.accepted'")?))
 }
+type LogicalRows=Vec<Vec<Vec<rusqlite::types::Value>>>;
+fn logical_rows(c:&Connection)->Result<LogicalRows,String>{
+    ["SELECT * FROM runs ORDER BY run_id","SELECT * FROM commands ORDER BY command_id",
+        "SELECT * FROM jobs ORDER BY job_id","SELECT * FROM events ORDER BY seq"].iter().map(|sql|{
+        let mut statement=c.prepare(sql).map_err(|e|e.to_string())?;let columns=statement.column_count();
+        let rows=statement.query_map([],|row|(0..columns).map(|column|row.get::<_,rusqlite::types::Value>(column))
+            .collect::<rusqlite::Result<Vec<_>>>()).map_err(|e|e.to_string())?;
+        rows.collect::<rusqlite::Result<Vec<_>>>().map_err(|e|e.to_string())
+    }).collect()
+}
 fn protected(root:&Path)->Result<Vec<Option<Vec<u8>>>,String>{["instance.db","instance.db-wal"].iter().map(|p|match fs::read(root.join(p)){
     Ok(b)=>Ok(Some(b)),Err(e) if e.kind()==std::io::ErrorKind::NotFound=>Ok(None),Err(e)=>Err(e.to_string())}).collect()}
 fn hex(bytes:[u8;32])->String{bytes.iter().map(|b|format!("{b:02x}")).collect()}
@@ -107,6 +117,12 @@ fn constraints()->Result<String,String>{
     let i=instance("constraints")?;let root=i.root().to_owned();accept(&i.store(),"original",b"p")?;i.close().map_err(|e|e.to_string())?;
     let c=store::test_api::open_file(&root.join("instance.db")).map_err(|e|e.to_string())?;
     c.execute_batch("PRAGMA recursive_triggers=OFF").map_err(|e|e.to_string())?;
+    let before=logical_rows(&c)?;
+    // Prove that the oracle detects an actual same-cardinality row mutation.
+    c.execute_batch("BEGIN IMMEDIATE; UPDATE runs SET agent_revision='oracle-sentinel' WHERE run_id=(SELECT run_id FROM commands WHERE command_id='original')").map_err(|e|e.to_string())?;
+    let changed=logical_rows(&c)?;c.execute_batch("ROLLBACK").map_err(|e|e.to_string())?;
+    if changed==before || changed.iter().map(Vec::len).collect::<Vec<_>>()!=before.iter().map(Vec::len).collect::<Vec<_>>()
+        || logical_rows(&c)?!=before || !c.is_autocommit(){return Err("logical-row oracle missed same-cardinality change or rollback".into());}
     let bad=["UPDATE commands SET payload=x'00'","DELETE FROM commands",
         "INSERT OR REPLACE INTO commands VALUES('original','test',1,x'aa',zeroblob(32),1,1)",
         "INSERT OR REPLACE INTO commands VALUES('replacement','test',1,x'aa',zeroblob(32),1,1)",
@@ -119,7 +135,7 @@ fn constraints()->Result<String,String>{
         "INSERT INTO jobs(run_id,job_no,state,created_epoch) VALUES(1,2,'Claimed',1)",
         "INSERT INTO events(run_id,kind,epoch) VALUES(1,'run.accepted',1)"];
     for sql in bad {let error=c.execute_batch(sql).err().ok_or_else(||format!("constraint accepted {sql}"))?;
-        if store::ext_code(&error).map(|c|c&255)!=Some(19) || !c.is_autocommit(){return Err(format!("not a clean constraint refusal: {error}"));}}
+        if store::ext_code(&error).map(|c|c&255)!=Some(19) || !c.is_autocommit() || logical_rows(&c)?!=before{return Err(format!("not an unchanged clean constraint refusal: {error}"));}}
     // A valid unbound run isolates the digest CHECK from FK/unique/replacement guards.
     c.execute_batch("BEGIN IMMEDIATE; INSERT INTO runs(admission,status,created_epoch) VALUES('Queued','Open',1)").map_err(|e|e.to_string())?;
     let unbound=c.last_insert_rowid();
@@ -128,8 +144,9 @@ fn constraints()->Result<String,String>{
     c.execute_batch("ROLLBACK").map_err(|e|e.to_string())?;
     let digest_error=digest_error.ok_or("invalid digest accepted")?;
     if store::ext_code(&digest_error)!=Some(275) || !active_after_error || !c.is_autocommit(){return Err(format!("digest CHECK not isolated/rolled back: {digest_error}"));}
-    if counts(&root)?!=(1,1,1,1){return Err("refused mutation changed acceptance set".into());}
-    Ok("actual command UPDATE/DELETE/REPLACE refusal with recursive triggers OFF, isolated digest CHECK275 and rollback, run/job CHECKs, FK, job/event uniqueness preserve records".into())
+    let unbound_left:i64=c.query_row("SELECT count(*) FROM runs WHERE run_id=?1",[unbound],|r|r.get(0)).map_err(|e|e.to_string())?;
+    if counts(&root)?!=(1,1,1,1) || unbound_left!=0 || logical_rows(&c)?!=before{return Err("refused mutation changed complete prior rows or retained unbound run".into());}
+    Ok("actual command UPDATE/DELETE/REPLACE refusal, isolated CHECK275 and confirmed rollback preserve every ordered run/command/job/event value; oracle detects same-cardinality change; fresh unbound run absent".into())
 }
 fn concurrent_duplicates()->Result<String,String>{
     let i=instance("concurrent")?;let root=i.root().to_owned();let pause=store::test_api::block_writer(&i).map_err(|e|e.to_string())?;

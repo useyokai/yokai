@@ -209,7 +209,16 @@ fn check_lint()->Result<String,String>{
         guard.replace("WHERE command_id", "WHERE (command_id").replace("NEW.run_id)","NEW.run_id))")]{
         if store::test_api::lint_migration(&changed,2).is_ok(){return Err(format!("lint accepted changed trigger predicate: {changed}"));}
     }
-    Ok("forbidden statements, changed trigger operators/grouping and wrong terminal version rejected; valid strings/comments/guard parsed".into())
+    let immutable="CREATE TRIGGER commands_immutable BEFORE UPDATE ON commands BEGIN SELECT RAISE(ABORT,'immutable'); END; PRAGMA user_version = 2;";
+    let append_only=immutable.replace("commands_immutable BEFORE UPDATE","commands_append_only BEFORE DELETE");
+    for valid in [immutable.to_owned(),append_only.clone(),guard.replace("CREATE TRIGGER","CREATE /* complete tokens */ TRIGGER")
+        .replace("WHEN EXISTS","WHEN /* SELECT; BEGIN; */ EXISTS")]{store::test_api::lint_migration(&valid,2)?;}
+    for changed in [guard.replace("NEW.command_id","NEW.command_ id"),guard.replace("SELECT 1","SEL/**/ECT 1"),
+        guard.replace("CREATE TRIGGER","CREATE TRIG/**/GER"),guard.replace("CREATE TRIGGER","CRE/**/ATE TRIGGER"),
+        immutable.replace("BEFORE UPDATE","BEFORE DELETE"),append_only.replace("BEFORE DELETE","BEFORE UPDATE")]{
+        if store::test_api::lint_migration(&changed,2).is_ok(){return Err(format!("lint accepted split token or swapped trigger identity: {changed}"));}
+    }
+    Ok("forbidden statements, changed operators/grouping, split tokens, swapped trigger identity and wrong terminal version rejected; complete-token comments and valid guards parsed".into())
 }
 fn check_retention()->Result<String,String>{
     let root=legacy("retention")?;let mut previous=Vec::new();let mut gaps=Vec::new();

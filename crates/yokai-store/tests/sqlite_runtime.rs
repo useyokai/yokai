@@ -303,7 +303,36 @@ fn dangling_link_refused(dir: &Path) -> Result<(bool, String), String> {
     Ok((ok, format!("dangling_link={:?} target_created={target_created}", result.err())))
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn dangling_link_refused(dir: &Path) -> Result<(bool, String), String> {
+    use std::os::windows::fs::MetadataExt;
+    let link=dir.join("dangling.db");let target=dir.join("dangling-target.db");
+    if !dir.is_absolute() || std::fs::symlink_metadata(&link).is_ok() || std::fs::symlink_metadata(&target).is_ok(){return Err("dangling fixture paths are not fresh/absolute".into());}
+    match std::os::windows::fs::symlink_file(&target,&link){
+        Ok(())=>{},
+        Err(e) if e.raw_os_error()==Some(1314) || e.kind()==std::io::ErrorKind::PermissionDenied=>return Ok((true,format!("dangling_link=not_checked capability unavailable: {e}"))),
+        Err(e)=>return Err(format!("Windows file symlink: {e}")),
+    }
+    let before=std::fs::read_link(&link).map_err(|e|e.to_string())?;
+    let result=store::test_api::create_file(&link);let result_error=result.err();
+    let target_created=std::fs::symlink_metadata(&target).is_ok();
+    let after=std::fs::read_link(&link).map_err(|e|e.to_string())?;
+    let metadata=std::fs::symlink_metadata(&link).map_err(|e|e.to_string())?;
+    let side_files=["dangling.db-wal","dangling.db-shm","dangling.db-journal","dangling-target.db-wal","dangling-target.db-shm","dangling-target.db-journal"]
+        .into_iter().filter(|name|std::fs::symlink_metadata(dir.join(name)).is_ok()).collect::<Vec<_>>();
+    let conventional=|p:&Path|{let text=p.to_string_lossy();text.strip_prefix("\\\\?\\").unwrap_or(&text).to_owned()};
+    let unchanged=conventional(&before)==conventional(&target) && after==before && metadata.file_type().is_symlink() && metadata.file_attributes()&0x400!=0;
+    println!("INFO R12 Windows dangling_link={} target={} before_target={} after_target={} reparse={} target_created={target_created} side_files={side_files:?}",
+        link.display(),target.display(),before.display(),after.display(),metadata.file_attributes()&0x400!=0);
+    // Remove only our verified link; its target stays absent and the inventory is retained above.
+    if !unchanged || link.parent()!=Some(dir) || !link.is_absolute(){return Err("owned Windows dangling-link identity changed; no unlink attempted".into());}
+    std::fs::remove_file(&link).map_err(|e|format!("unlink owned dangling symlink: {e}"))?;
+    let target_after_unlink=std::fs::symlink_metadata(&target).is_ok();
+    let ok=matches!(result_error,Some(store::StoreError::AlreadyExists(_))) && !target_created && !target_after_unlink && side_files.is_empty();
+    Ok((ok,format!("dangling_link=checked_windows result={result_error:?} unchanged={unchanged} target_created={target_created} target_after_unlink={target_after_unlink}; owned link unlinked after inventory")))
+}
+
+#[cfg(not(any(unix,windows)))]
 fn dangling_link_refused(_dir: &Path) -> Result<(bool, String), String> {
     Ok((true, "dangling_link=not_checked".into()))
 }
