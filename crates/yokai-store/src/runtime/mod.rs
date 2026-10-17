@@ -73,15 +73,21 @@ struct WriteRequest {
 }
 enum WriteWork {
     Health,
+    Accept{command:crate::CommandRequest,#[cfg(feature="test-api")] fault:crate::test_api::WriteFault},
     #[cfg(feature = "test-api")]
     HealthPaused { ready: mpsc::SyncSender<()>, released: Arc<AtomicBool> },
     #[cfg(feature = "test-api")]
     Probe(crate::test_api::WriteProbe),
 }
 impl WriteWork {
+    #[cfg(feature="test-api")]
+    fn fault(&self)->Option<&crate::test_api::WriteFault>{match self{
+        Self::Probe(probe)=>Some(&probe.fault),Self::Accept{fault,..}=>Some(fault),_=>None,
+    }}
     fn is_health(&self) -> bool {
         match self {
             Self::Health => true,
+            Self::Accept{..} => false,
             #[cfg(feature = "test-api")]
             Self::HealthPaused { .. } => true,
             #[cfg(feature = "test-api")]
@@ -137,6 +143,13 @@ fn write_refusal(status: StoreState) -> Option<WriteReason> {
     }
 }
 impl StoreHandle {
+    pub fn accept_command(&self,request:crate::CommandRequest,deadline:Instant)->Result<crate::PendingCommand,WriteFailure>{
+        self.submit_write(deadline,WriteWork::Accept{command:request,#[cfg(feature="test-api")] fault:crate::test_api::WriteFault::None}).map(|inner|crate::PendingCommand{inner})
+    }
+    #[cfg(feature="test-api")]
+    pub(crate) fn command_fault(&self,command:crate::CommandRequest,deadline:Instant,fault:crate::test_api::WriteFault)->Result<crate::PendingCommand,WriteFailure>{
+        self.submit_write(deadline,WriteWork::Accept{command,fault}).map(|inner|crate::PendingCommand{inner})
+    }
     pub fn state(&self) -> StoreState { self.shared.status() }
     pub fn metrics(&self) -> StoreMetrics { lock(&self.shared.state).metrics }
     /// Recent true outcomes, bounded to256. Not a durable operation ledger.

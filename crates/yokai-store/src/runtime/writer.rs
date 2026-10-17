@@ -54,14 +54,26 @@ fn health(conn: &Connection, shared: &Shared, request: &WriteRequest) -> WriteRe
         if Instant::now() >= request.deadline { return Err(WriteFailure::queued(Some(request.id), WriteReason::Expired)); }
         state.degradation_generation
     };
-    let execute = || -> Result<(), OperationError> {
+    let execute = || -> Result<Option<crate::AcceptOutcome>, OperationError> {
         #[cfg(feature = "test-api")]
-        if let WriteWork::Probe(probe) = &request.work {
-            match probe.fault { WriteFault::PanicQueued => panic!("test-api panic before BEGIN"),
-                WriteFault::Begin(code) => return Err(injected(code).into()), _ => {} }
+        if let Some(fault) = request.work.fault() {
+            match fault { WriteFault::PanicQueued => panic!("test-api panic before BEGIN"),
+                WriteFault::Begin(code) => return Err(injected(*code).into()), _ => {} }
         }
+        if matches!(&request.work,WriteWork::Accept{..}){crate::durable::point("accept-before-begin")?;}
         conn.execute_batch("BEGIN IMMEDIATE")?;
         lock(&request.progress).phase = Phase::Begun;
+        #[cfg(feature="test-api")]
+        if matches!(request.work.fault(),Some(WriteFault::PanicBegun)){panic!("test-api panic after BEGIN");}
+        let command=if let WriteWork::Accept{command,..}=&request.work {
+            let (outcome,commit)=crate::durable::accept(conn,command)?;
+            if !commit {
+                conn.execute_batch("ROLLBACK")?;
+                if !conn.is_autocommit(){return Err(rusqlite::Error::InvalidQuery.into());}
+                return Ok(Some(outcome));
+            }
+            Some(outcome)
+        } else {None};
         if request.work.is_health() {
                 let stamp = crate::instance::utc_timestamp().map_err(|_| rusqlite::Error::InvalidQuery)?;
                 if conn.execute("UPDATE instance_meta SET last_health_check=?1 WHERE id=1", [stamp])? != 1 {
@@ -70,9 +82,11 @@ fn health(conn: &Connection, shared: &Shared, request: &WriteRequest) -> WriteRe
         }
         #[cfg(feature = "test-api")]
         if let WriteWork::Probe(probe) = &request.work {
-                if matches!(probe.fault, WriteFault::PanicBegun) { panic!("test-api panic after BEGIN"); }
                 conn.execute_batch(&probe.sql)?;
-                match &probe.fault {
+        }
+        #[cfg(feature="test-api")]
+        if let Some(fault)=request.work.fault(){
+                match fault {
                     WriteFault::Refuse { .. } => return Err(OperationError::Refused),
                     WriteFault::Statement(code) | WriteFault::RollbackFailure(code) => return Err(injected(*code).into()),
                     WriteFault::DelayBeforeCommit(delay) => thread::sleep(*delay),
@@ -85,26 +99,23 @@ fn health(conn: &Connection, shared: &Shared, request: &WriteRequest) -> WriteRe
         }
         lock(&request.progress).phase = Phase::CommitIssued;
         #[cfg(feature = "test-api")]
-        if let WriteWork::Probe(probe) = &request.work {
-            if let WriteFault::Commit { code, actually_commit } = probe.fault {
-                if actually_commit { conn.execute_batch("COMMIT")?; }
-                return Err(injected(code).into());
-            }
+        if let Some(WriteFault::Commit { code, actually_commit }) = request.work.fault() {
+                if *actually_commit { conn.execute_batch("COMMIT")?; }
+                return Err(injected(*code).into());
         }
         conn.execute_batch("COMMIT")?;
+        if matches!(&request.work,WriteWork::Accept{..}){crate::durable::point("accept-after-commit")?;}
         #[cfg(feature = "test-api")]
         if let WriteWork::HealthPaused { ready, released } = &request.work {
             let _ = ready.send(());
             while !released.load(Ordering::Acquire) { thread::sleep(Duration::from_millis(1)); }
         }
         #[cfg(feature = "test-api")]
-        if let WriteWork::Probe(probe) = &request.work {
-            if matches!(probe.fault, WriteFault::PanicAfterCommit) { panic!("test-api panic after acknowledged COMMIT before reply"); }
-        }
-        Ok(())
+        if matches!(request.work.fault(),Some(WriteFault::PanicAfterCommit)){panic!("test-api panic after acknowledged COMMIT before reply");}
+        Ok(command)
     };
     match execute() {
-        Ok(()) => {
+        Ok(command) => {
             if request.work.is_health() {
                 // This commit can recover only the generation it checked. A reader fault
                 // during or after the transaction requires a subsequent health commit.
@@ -113,7 +124,7 @@ fn health(conn: &Connection, shared: &Shared, request: &WriteRequest) -> WriteRe
                     state.status = StoreState::Running;
                 }
             }
-            Ok(WriteSuccess { operation_id: request.id }) }
+            Ok(WriteSuccess { operation_id: request.id, command }) }
         Err(error) => Err(failure::classify(conn, shared, request, &error)),
     }
 }
