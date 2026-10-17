@@ -60,6 +60,7 @@ mod native {
             ("WV-PREFLIGHT-CORRUPTION",preflight_corruption),
             ("WV-RAW-HEADER",raw_headers),
             ("WV-JOURNAL-EMPTY",journal_empty),
+            ("WV-STALE-SHM",stale_shm),
         ];
         let selected:Vec<_>=match args.as_slice(){
             [_]=>checks.iter().collect(),
@@ -195,6 +196,12 @@ mod native {
                     let before=access_snapshot(root)?;let outcome=journal_empty_refusal(root,case)?;let after=access_snapshot(root)?;
                     if before!=after{return Err("journal/empty child changed complete closed root".into());}
                     println!("INFO WV journal_empty_child case={case} outcome={outcome} sqlite_events=[] exact_refusal=true complete_closed_bytes_unchanged=true inventory_before={:?} inventory_after={:?}",stageb_inventory(&before)?,stageb_inventory(&after)?);
+                },
+                "__stale_shm_refusal"=>{
+                    let case=args.get(3).ok_or("missing stale-SHM case")?;
+                    let before=access_snapshot(root)?;let outcome=stale_shm_refusal(root,case)?;let after=access_snapshot(root)?;
+                    if before!=after{return Err("stale-SHM child changed complete closed root".into());}
+                    println!("INFO WV stale_shm_child case={case} outcome={outcome} sqlite_events=[] exact_refusal=true complete_closed_bytes_unchanged=true inventory_before={:?} inventory_after={:?}",stageb_inventory(&before)?,stageb_inventory(&after)?);
                 },
                 "__close_error"=>{
                     store::test_api::fail_startup_close_once();
@@ -1304,6 +1311,61 @@ mod native {
             println!("INFO WV journal_empty fixture={} case={case} pristine={} baseline={} after={} child_after={} child_logs={} outcome={outcome} sqlite_events=[] complete_closed_bytes_unchanged=true all_copies_verified=true exclusive_data_opens=allowed child_lock_reacquired=true inventory_before={:?} inventory_after={:?} inventory_child_after={:?}",root.display(),original.display(),baseline.display(),final_copy.display(),child_copy.display(),logs.display(),stageb_inventory(&before)?,stageb_inventory(&after)?,stageb_inventory(&repeated)?);
         }
         Ok("rollback header, journal presence with/without genuine WAL, and zero main with empty/nonempty WAL/SHM/journal refuse exactly before SQLite;140 retained files,18 parent/child traces, closed inventories and released handles verified; selected PF4/PF5/PF18 cases only, no transient-write/race/durability or fullW2 acceptance".into())
+    }
+
+    const STALE_SHM_CASES:[(&str,u32,bool);10]=[
+        ("future-max-empty",u32::MAX,true),("future-max-bytes",u32::MAX,false),
+        ("legacy0-empty",0,true),("legacy0-bytes",0,false),
+        ("legacy1-empty",1,true),("legacy1-bytes",1,false),
+        ("current2-empty",2,true),("current2-bytes",2,false),
+        ("future3-empty",3,true),("future3-bytes",3,false),
+    ];
+    fn stale_shm_refusal(root:&Path,case:&str)->Result<String,String>{
+        let version=STALE_SHM_CASES.iter().find(|(name,_,_)|*name==case).map(|(_,v,_)|*v).ok_or("unknown stale-SHM case")?;
+        store::test_api::clear();let result=store::open_instance(root);
+        let events=store::test_api::connection_events();
+        match result {
+            Err(InstanceError::SideFileStateUnverified{header_version}) if header_version==version=>{},
+            Ok(i)=>{i.close().map_err(|e|e.to_string())?;return Err(format!("stale-SHM {case} unexpectedly opened; events={events:?}"));},
+            Err(error)=>return Err(format!("stale-SHM {case} wrong refusal {error:?}; events={events:?}")),
+        }
+        let decoded=store::test_api::header_versions()?;let second_take=store::test_api::header_versions()?;
+        if !events.is_empty() || decoded!=[version] || !second_take.is_empty(){return Err(format!("stale-SHM {case} decoded={decoded:?} expected=[{version}] second_take={second_take:?} events={events:?}"));}
+        let outcome=format!("SideFileStateUnverified({version})");
+        println!("INFO WV stale_shm_trace case={case} outcome={outcome} decoded={decoded:?} second_take={second_take:?} sqlite_events={events:?}");
+        Ok(outcome)
+    }
+    fn stale_shm()->Result<String,String>{
+        for &(case,version,empty) in &STALE_SHM_CASES {
+            let i=instance("stale-shm")?;let root=i.root().to_owned();i.close().map_err(|e|e.to_string())?;
+            let pristine=access_snapshot(&root)?;
+            if pristine.keys().map(String::as_str).collect::<Vec<_>>()!=["instance.db","instance.id","instance.lock"]
+                || pristine.get("instance.lock")!=Some(&Some(Vec::new())){return Err("stale-SHM pristine names/lock differ".into());}
+            let main=pristine.get("instance.db").and_then(Option::as_ref).ok_or("stale-SHM pristine main missing")?;
+            if main.len()<100 || main.len()%4096!=0 || &main[..16]!=b"SQLite format 3\0"
+                || main[16..24]!=[0x10,0,2,2,0,64,32,32] || main[60..64]!=2u32.to_be_bytes(){return Err("stale-SHM pristine layout/version differs".into());}
+            let original=retain_damage_snapshot(&root,"retained-shm-pristine",&pristine)?;
+            let mut expected=pristine.clone();let mut header=main.clone();header[60..64].copy_from_slice(&version.to_be_bytes());
+            let shm=if empty {Vec::new()} else {b"owned stale SHM presence witness".to_vec()};
+            fs::write(root.join("instance.db"),&header).map_err(|e|e.to_string())?;
+            fs::write(root.join("instance.db-shm"),&shm).map_err(|e|e.to_string())?;
+            expected.insert("instance.db".into(),Some(header));expected.insert("instance.db-shm".into(),Some(shm));
+            let before=access_snapshot(&root)?;if before!=expected{return Err("stale-SHM setup changed unintended entries".into());}
+            let baseline=retain_damage_snapshot(&root,"retained-shm-before",&before)?;
+            let outcome=stale_shm_refusal(&root,case)?;let after=access_snapshot(&root)?;
+            if after!=before{return Err("stale-SHM parent refusal changed complete closed root".into());}
+            let final_copy=retain_damage_snapshot(&root,"retained-shm-after",&after)?;stageb_released(&root)?;
+            let mut probe=command("__stale_shm_refusal",&root)?;probe.arg(case);
+            let (mut child,logs)=launch(probe,"stale-shm-probe")?;
+            if !wait(&mut child,Duration::from_secs(15))?.success(){return Err(format!("stale-SHM child failed; logs={}",logs.display()));}
+            let repeated=access_snapshot(&root)?;if repeated!=after{return Err("stale-SHM child refusal changed complete closed root".into());}
+            stageb_released(&root)?;let child_copy=retain_damage_snapshot(&root,"retained-shm-child-after",&repeated)?;
+            for (snapshot,path) in [(&pristine,&original),(&before,&baseline),(&after,&final_copy),(&repeated,&child_copy)] {
+                if access_snapshot(path)?!=*snapshot{return Err("stale-SHM retained copy differs".into());}
+            }
+            println!("INFO WV stale_shm fixture={} case={case} pristine={} baseline={} after={} child_after={} child_logs={} outcome={outcome} sqlite_events=[] complete_closed_bytes_unchanged=true all_copies_verified=true exclusive_data_opens=allowed child_lock_reacquired=true inventory_before={:?} inventory_after={:?} inventory_child_after={:?}",root.display(),original.display(),baseline.display(),final_copy.display(),child_copy.display(),logs.display(),stageb_inventory(&before)?,stageb_inventory(&after)?,stageb_inventory(&repeated)?);
+        }
+        Ok("empty/nonempty stale SHM without WAL at header0/1/2/3/max refuses exact version before SQLite;150 retained files,20 parent/child traces and complete fixed inventories; selected PF2b/PF10(a) only, no transient-write/metadata/identity/race/durability or fullW2 acceptance".into())
     }
 
     fn lock_soak()->Result<String,String>{
