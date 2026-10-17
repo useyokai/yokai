@@ -249,7 +249,8 @@ mod windows_api {
 
     pub fn validate_regular_single_link(path: &Path) -> io::Result<()> {
         let mut options = OpenOptions::new();
-        options.read(true);
+        // Query metadata without requesting data access to a share-zero owned lock.
+        options.access_mode(0);
         options.share_mode(FILE_SHARE_READ_WRITE);
         options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
         let file = options.open(path)?;

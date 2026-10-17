@@ -186,14 +186,19 @@ of saved Windows output does not run these tests on Linux or change their scope.
 
 ### Lock sharing and open-file observations
 
-On Windows the persistent Instance lock handle requests `FILE_SHARE_READ |
-FILE_SHARE_WRITE` (mask3), omits `FILE_SHARE_DELETE`, and takes an exclusive
-`File::try_lock`. Compatible raw handles can open the path; they do not become a
-second owner. This is distinct from share mode zero. Held-lock rename/delete
-refusal and separate synthetic share-zero/share-delete file observations are
-covered by `WV-OPEN-FILES`. These experiments preserve original synthetic bytes,
-measure byte-range-lock read refusal separately from compatible handle opens,
-and never delete an Instance database or root.
+On Windows the persistent Instance lock handle requests share mode zero and
+takes an exclusive `File::try_lock`. Raw read/write data handles are refused
+while ownership is held. A second Instance open is classified as `Busy` on
+the sharing violation. Internal entry validation requests metadata-only access
+and still checks reparse attributes and the hard-link count.
+`WV-OPEN-FILES` checks data-handle refusal on create and reopen and rename/delete
+refusal while the reopened owner holds the lock, alongside separate synthetic
+share-zero/share-delete file observations. These
+experiments preserve original synthetic bytes and never delete an Instance
+database or root. The earlier share-read/write implementation and its recorded
+observations are superseded by this contract correction; they are not evidence
+that the older code used share mode zero. Controlled Defender/indexer
+interference remains untested.
 Persistent lock bytes are compared before ownership and after confirmed close,
 when an ordinary read is permitted. The observations inform future filesystem
 work; they do not implement a discard operation or prove every SQLite/open-file
@@ -205,3 +210,6 @@ target or altering the link. The harness records the link inventory, then
 unlinks only that verified owned link to leave regular sealed evidence. Missing
 capability is reported as `not_checked`; no privileges or host settings change.
 This new observation does not change the scope of earlier Unix-only R12 runs.
+The runtime harnesses treat only `NotFound` metadata errors as absence;
+invalid paths and other I/O errors fail the observation. A dangling link itself
+is present, even when its target is absent.
