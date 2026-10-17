@@ -95,6 +95,8 @@ pub fn clear() {
     yokai_platform::location::clear_directory_flush_observations();
 }
 pub fn connection_events() -> Vec<&'static str> { failpoint::take_connection_events() }
+/// Take and clear versions decoded from validated nonempty raw headers.
+pub fn header_versions() -> Result<Vec<u32>,String> { failpoint::take_header_versions() }
 pub fn directory_flush_observations() -> Vec<(PathBuf, bool)> {
     yokai_platform::location::take_directory_flush_observations()
 }

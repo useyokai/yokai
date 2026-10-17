@@ -8,6 +8,7 @@ use yokai_types::InstanceId;
 static NEXT_ID: OnceLock<Mutex<Option<InstanceId>>> = OnceLock::new();
 static CONNECTION_EVENTS: OnceLock<Mutex<Vec<&'static str>>> = OnceLock::new();
 static MUTATE_STAGE_A: OnceLock<Mutex<bool>> = OnceLock::new();
+static HEADER_VERSIONS: OnceLock<Mutex<Vec<u32>>> = OnceLock::new();
 
 pub fn set_next_identity(id: [u8; 16]) -> Result<(), String> {
     let mut value = NEXT_ID.get_or_init(|| Mutex::new(None)).lock()
@@ -27,6 +28,17 @@ pub fn record_connection(kind: &'static str) {
 pub fn take_connection_events() -> Vec<&'static str> {
     CONNECTION_EVENTS.get_or_init(|| Mutex::new(Vec::new())).lock()
         .map(|mut events| std::mem::take(&mut *events)).unwrap_or_default()
+}
+pub fn record_header_version(version: u32) -> Result<(), String> {
+    let mut values = HEADER_VERSIONS.get_or_init(|| Mutex::new(Vec::new())).lock()
+        .map_err(|_| "header-version observation poisoned".to_string())?;
+    values.push(version);
+    Ok(())
+}
+pub fn take_header_versions() -> Result<Vec<u32>, String> {
+    HEADER_VERSIONS.get_or_init(|| Mutex::new(Vec::new())).lock()
+        .map(|mut values| std::mem::take(&mut *values))
+        .map_err(|_| "header-version observation poisoned".to_string())
 }
 pub fn arm_stage_a_mutation() -> Result<(), String> {
     let mut armed = MUTATE_STAGE_A.get_or_init(|| Mutex::new(false)).lock()
@@ -52,6 +64,7 @@ pub fn clear() {
         if let Ok(mut guard) = value.lock() { *guard = false; }
     }
     let _ = take_connection_events();
+    let _ = take_header_versions();
 }
 pub fn hit(boundary: &str) -> Result<(), String> {
     let Ok(value) = std::env::var("YOKAI_TEST_FAILPOINT") else { return Ok(()) };

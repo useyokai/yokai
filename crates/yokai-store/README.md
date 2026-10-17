@@ -452,3 +452,34 @@ released handles. No main/WAL/root is deleted or repaired. These selected
 encodings do not establish exhaustive valid headers, file identity/metadata,
 absence of transient writes, hostile-race safety, full PF16/PF17/W2, Linux
 parity, power-loss durability or broader product/security/release acceptance.
+
+### Validated raw-header decoding observations
+
+The explicit `test-api` feature now records the unsigned version immediately
+after all existing raw-header guards and the big-endian decode. Its fallible
+`header_versions` endpoint takes and clears the recorded values; `clear` resets
+them. The process-wide buffer is intended for serialized owned probes.
+A poisoned observation buffer reports an error, rather than a successful
+empty observation. Recording failure becomes diagnostic `PreflightUnavailable`.
+Default builds contain neither the observer nor its public diagnostic endpoint;
+the default header acceptance rules and schema remain unchanged. The empty-file
+shortcut is not a decoded-header event.
+
+PF17 retains 54 ordinary main/identity/lock input and output files for versions
+0/1/2/3/255/256/65536/16777216/4294967295. Every input is a nonempty header, and
+exactly one matching observation is required, followed by an empty second take.
+Accepted 0/1/2 opens reach Stage B and finish at V2 after migration/startup and
+explicit close. Those opens intentionally change the main database. Future
+versions refuse before SQLite and preserve the complete closed root. Fixed-name
+SQLite inventories and unchanged identity/empty-lock bytes are checked separately;
+the accepted roots' backup contents are not requalified by these copies.
+
+`WV-RAW-HEADER` requires no observation for each of its nine malformed headers,
+and one exact observation for each of its six future versions, in both parent
+and fresh child. The unwired observer failed this predicate before recording
+was implemented; that diagnostic failure is retained separately from acceptance.
+These are source-bound hook observations, not independent instruction/syscall
+traces or proof of every internal operation. Literal 131072 page-size clarification,
+exhaustive headers, other platforms, concurrency/poisoning failure experiments,
+transient writes, metadata/object identity, full catalogue/workspace/security,
+power-loss durability and release acceptance remain separate work.

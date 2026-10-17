@@ -1172,6 +1172,11 @@ mod native {
             (_,Err(error))=>return Err(format!("raw-header {case} wrong refusal {error:?}; events={events:?}")),
         };
         if !events.is_empty(){return Err(format!("raw-header {case} opened a connection: {events:?}"));}
+        let decoded=store::test_api::header_versions()?;
+        let expected=if field.is_some(){Vec::new()}else{vec![value]};
+        let second_take=store::test_api::header_versions()?;
+        if decoded!=expected || !second_take.is_empty(){return Err(format!("raw-header {case} decoded={decoded:?} expected={expected:?} second_take={second_take:?}"));}
+        println!("INFO WV header_decode case={case} decoded={decoded:?} second_take={second_take:?}");
         Ok(outcome)
     }
     fn raw_headers()->Result<String,String>{
