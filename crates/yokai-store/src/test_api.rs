@@ -5,6 +5,17 @@ use std::path::{Path, PathBuf};
 use crate::{Instance, InstanceError};
 use crate::failpoint;
 static SPAWN_FAILURE: std::sync::Mutex<Option<usize>> = std::sync::Mutex::new(None);
+static STARTUP_CLOSE_BUSY: std::sync::atomic::AtomicBool=std::sync::atomic::AtomicBool::new(false);
+/// Use only in an owned child: the next startup-error close deliberately retains
+/// a real unfinalized statement, and the child must be terminated after inspection.
+pub fn fail_startup_close_once(){STARTUP_CLOSE_BUSY.store(true,std::sync::atomic::Ordering::Release);}
+pub(crate) fn poison_startup_close_if_requested(connection:&rusqlite::Connection){
+    if STARTUP_CLOSE_BUSY.swap(false,std::sync::atomic::Ordering::AcqRel){
+        // sqlite3_close (not close_v2) returns BUSY for this leaked real statement.
+        // The existing error path must retain both connection and Instance lock.
+        if let Ok(statement)=connection.prepare("SELECT 1"){std::mem::forget(statement);}
+    }
+}
 pub fn fail_worker_spawn_after(successful_spawns: usize) {
     *crate::runtime::lock(&SPAWN_FAILURE) = Some(successful_spawns);
 }

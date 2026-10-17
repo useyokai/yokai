@@ -56,3 +56,9 @@ name = "durable_primitives"
 path = "tests/durable_primitives.rs"
 harness = false
 required-features = ["test-api"]
+
+[[test]]
+name = "windows_validation"
+path = "tests/windows_validation.rs"
+harness = false
+required-features = ["test-api"]

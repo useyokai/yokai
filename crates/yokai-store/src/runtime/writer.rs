@@ -68,6 +68,8 @@ fn health(conn: &Connection, shared: &Shared, request: &WriteRequest) -> WriteRe
         let command=if let WriteWork::Accept{command,..}=&request.work {
             let (outcome,commit)=crate::durable::accept(conn,command)?;
             if !commit {
+                #[cfg(feature="test-api")]
+                if let Some(WriteFault::RollbackFailure(code))=request.work.fault(){return Err(injected(*code).into());}
                 conn.execute_batch("ROLLBACK")?;
                 if !conn.is_autocommit(){return Err(rusqlite::Error::InvalidQuery.into());}
                 return Ok(Some(outcome));

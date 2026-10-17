@@ -221,6 +221,8 @@ fn open_with_options_plan(root: &Path, plan: crate::schema::Plan, options: crate
                 match crate::startup::recover(&mut connection){
                     Ok(report)=>Some(report),
                     Err(error)=>{
+                        #[cfg(feature="test-api")]
+                        crate::test_api::poison_startup_close_if_requested(&connection);
                         match connection.close(){
                             Ok(())=>drop(lock),
                             Err((connection,close_error))=>{
