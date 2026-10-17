@@ -49,6 +49,8 @@ mod native {
             ("WV-PREFLIGHT-ACL",preflight_acl),
             ("WV-STAGEB-REFUSALS",stageb_refusals),
             ("WV-STAGEB-LEGACY",stageb_legacy),
+            ("WV-PREFLIGHT-SEMANTIC",preflight_semantic),
+            ("WV-PREFLIGHT-INTEGRITY",preflight_integrity),
             ("WV-LOCK-SOAK",lock_soak),
         ];
         let selected:Vec<_>=match args.as_slice(){
@@ -116,6 +118,12 @@ mod native {
                     let before=access_snapshot(root)?;let (cause,effects)=stageb_refusal(root)?;
                     if &cause!=expected || access_snapshot(root)?!=before || effects!="no inventory changes"{return Err(format!("child Stage-B cause={cause:?} effects={effects:?}"));}
                     println!("INFO WV stageb_child cause={cause:?} effects={effects:?} exact_refusal=true lock_reacquired=true complete_bytes_unchanged=true");
+                },
+                "__semantic_refusal"=>{
+                    let case=args.get(3).ok_or("missing semantic case")?;let expected=args.get(4).ok_or("missing semantic detail")?;
+                    let before=access_snapshot(root)?;let outcome=semantic_refusal(root,case,expected)?;let after=access_snapshot(root)?;
+                    semantic_preserved(&before,&after,true)?;
+                    println!("INFO WV semantic_child case={case} outcome={outcome} exact_refusal=true lock_reacquired=true protected_bytes_unchanged=true inventory_before={:?} inventory_after={:?}",stageb_inventory(&before)?,stageb_inventory(&after)?);
                 },
                 "__close_error"=>{
                     store::test_api::fail_startup_close_once();
@@ -884,6 +892,110 @@ mod native {
         stageb_released(&root)?;
         println!("INFO WV stageb_legacy source={} fixture={} baseline={} active={} after={} version=0 objects=0 startup_report=none open_events={open_events:?} close_events={close_events:?} complete_closed_bytes_unchanged=true source_unchanged=true retained_copies_verified=true exclusive_data_opens=allowed active_lock_read=not_checked active_lock_raw_error=32 active_root_names_types=verified inventory_before={:?} inventory_active={:?} inventory_after={:?}",source.display(),root.display(),retained.display(),active_copy.display(),after_copy.display(),stageb_inventory(&before)?,stageb_inventory(&active)?,stageb_inventory(&after)?);
         Ok("copied accepted V0 fixture opens through current shared code with test-only empty migration plan; version0/zero objects/no startup report, explicit close and exact closed bytes/source preserved; active versus closed side files retained, not a historical binary rerun or non-mutating V2 startup claim".into())
+    }
+    fn semantic_preserved(before:&BTreeMap<String,Option<Vec<u8>>>,after:&BTreeMap<String,Option<Vec<u8>>>,allow_shm:bool)->Result<(),String>{
+        for name in before.keys().chain(after.keys()) {
+            if (!allow_shm || name!="instance.db-shm") && before.get(name)!=after.get(name){return Err(format!("semantic refusal changed protected entry {name}"));}
+        }
+        stageb_inventory(before)?;stageb_inventory(after)?;Ok(())
+    }
+    fn semantic_refusal(root:&Path,case:&str,expected:&str)->Result<String,String>{
+        store::test_api::clear();let result=store::open_instance(root);let events=store::test_api::connection_events();
+        let (kind,detail)=match (case,result) {
+            ("foreign-key",Err(InstanceError::ForeignKeyViolations(rows)))=>("ForeignKeyViolations",format!("{rows:?}")),
+            ("identity",Err(InstanceError::IdentityMismatch))=>("IdentityMismatch",String::new()),
+            ("objects-v0",Err(InstanceError::SchemaInconsistent(detail)))=>("SchemaInconsistent",detail),
+            ("integrity",Err(InstanceError::Integrity(detail)))=>("Integrity",detail),
+            (_,Ok(i))=>{i.close().map_err(|e|e.to_string())?;return Err(format!("{case} semantic fixture unexpectedly opened; events={events:?}"));},
+            (_,Err(e))=>return Err(format!("{case} wrong semantic refusal {e:?}; events={events:?}")),
+        };
+        if detail!=expected || events!=["stage-a-read-only"]{return Err(format!("{case} semantic detail={detail:?} expected={expected:?} events={events:?}"));}
+        Ok(format!("{kind}({detail:?})"))
+    }
+    fn semantic_repeat(root:&Path,case:&str,expected:&str)->Result<PathBuf,String>{
+        let mut cmd=command("__semantic_refusal",root)?;cmd.arg(case).arg(expected);let (mut child,logs)=launch(cmd,"semantic-probe")?;
+        if !wait(&mut child,Duration::from_secs(15))?.success(){return Err(format!("semantic repeat failed; logs={}",logs.display()));}Ok(logs)
+    }
+    fn preflight_semantic()->Result<String,String>{
+        for case in ["foreign-key","identity","objects-v0"] {
+            let i=instance("semantic-wal")?;let root=i.root().to_owned();i.close().map_err(|e|e.to_string())?;
+            let pristine=access_snapshot(&root)?;let original=retain_damage_snapshot(&root,"retained-semantic-pristine",&pristine)?;
+            if pristine.keys().map(String::as_str).collect::<Vec<_>>()!=["instance.db","instance.id","instance.lock"]{return Err("semantic pristine fixture has side files/extras".into());}
+            let c=Connection::open_with_flags(root.join("instance.db"),OpenFlags::SQLITE_OPEN_READ_WRITE|OpenFlags::SQLITE_OPEN_NO_MUTEX).map_err(|e|e.to_string())?;
+            c.set_db_config(DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE,true).map_err(|e|e.to_string())?;
+            c.execute_batch("PRAGMA wal_autocheckpoint=0;").map_err(|e|e.to_string())?;
+            let version:i64=c.query_row("PRAGMA user_version",[],|r|r.get(0)).map_err(|e|e.to_string())?;
+            let integrity:String=c.query_row("PRAGMA integrity_check",[],|r|r.get(0)).map_err(|e|e.to_string())?;
+            if version!=2 || integrity!="ok" || !store::test_api::foreign_key_violations(&c).map_err(|e|e.to_string())?.is_empty(){return Err("semantic pristine control is not valid V2".into());}
+            let expected=match case {
+                "foreign-key"=>{
+                    c.execute_batch("PRAGMA foreign_keys=OFF; BEGIN; INSERT INTO events(seq,run_id,kind,detail,epoch) VALUES(900002,987654322,'preflight.orphan','owned WAL fixture',1); COMMIT;").map_err(|e|e.to_string())?;
+                    "[\"events rowid=Some(900002) parent=runs fkid=0\"]"
+                },
+                "identity"=>{c.execute_batch("BEGIN; UPDATE instance_meta SET instance_id=zeroblob(16) WHERE id=1; COMMIT;").map_err(|e|e.to_string())?;""},
+                "objects-v0"=>{
+                    c.execute_batch("BEGIN; DROP TABLE events; DROP TABLE jobs; DROP TABLE commands; DROP TABLE runs; DROP TABLE runtime_epoch; DROP TABLE instance_meta; DROP TABLE yokai_schema_history; CREATE TABLE planted(id INTEGER); PRAGMA user_version=0; COMMIT;").map_err(|e|e.to_string())?;
+                    "1 schema objects at version 0"
+                },_=>unreachable!(),
+            };
+            c.close().map_err(|(_,e)|e.to_string())?;let before=access_snapshot(&root)?;
+            if before.keys().map(String::as_str).collect::<Vec<_>>()!=["instance.db","instance.db-shm","instance.db-wal","instance.id","instance.lock"]
+                || before.get("instance.db")!=pristine.get("instance.db"){return Err("semantic WAL fixture changed main or has wrong side files".into());}
+            let wal=before.get("instance.db-wal").and_then(Option::as_ref).ok_or("missing semantic WAL")?;
+            if wal.len()<=32{return Err("semantic defect has no nonempty WAL frames".into());}
+            let baseline=retain_damage_snapshot(&root,"retained-semantic-before",&before)?;
+            let outcome=semantic_refusal(&root,case,expected)?;let after=access_snapshot(&root)?;
+            semantic_preserved(&before,&after,true)?;let final_copy=retain_damage_snapshot(&root,"retained-semantic-after",&after)?;
+            stageb_released(&root)?;let logs=semantic_repeat(&root,case,expected)?;let child_after=access_snapshot(&root)?;
+            semantic_preserved(&after,&child_after,true)?;stageb_released(&root)?;
+            let child_copy=retain_damage_snapshot(&root,"retained-semantic-child-after",&child_after)?;
+            for (snapshot,path) in [(&pristine,&original),(&before,&baseline),(&after,&final_copy),(&child_after,&child_copy)] {
+                if access_snapshot(path)?!=*snapshot{return Err("semantic retained copy differs".into());}
+            }
+            println!("INFO WV preflight_semantic fixture={} case={case} pristine={} baseline={} after={} child_after={} child_logs={} outcome={outcome} expected_detail={expected:?} main_pristine_unchanged=true wal_bytes={} sqlite_events=[stage-a-read-only] protected_entries_bytes_unchanged=true retained_copies_verified=true exclusive_data_opens=allowed child_lock_reacquired=true shm_changed={} child_shm_changed={} inventory_before={:?} inventory_after={:?} inventory_child_after={:?}",root.display(),original.display(),baseline.display(),final_copy.display(),child_copy.display(),logs.display(),wal.len(),before.get("instance.db-shm")!=after.get("instance.db-shm"),after.get("instance.db-shm")!=child_after.get("instance.db-shm"),stageb_inventory(&before)?,stageb_inventory(&after)?,stageb_inventory(&child_after)?);
+        }
+        Ok("three owned genuine committed-WAL semantic refusals: exact FK orphan/identity/version0-objects errors in Stage-A read-only only; pristine main, all protected entries, retained inventories/copies and handle/child lock release verified; SHM effects recorded, no full PF6/PF7/PF8/W2 acceptance".into())
+    }
+    fn preflight_integrity()->Result<String,String>{
+        for wal_present in [false,true] {
+            let i=instance("integrity-row")?;let root=i.root().to_owned();i.close().map_err(|e|e.to_string())?;
+            let pristine=access_snapshot(&root)?;let original=retain_damage_snapshot(&root,"retained-integrity-pristine",&pristine)?;
+            if pristine.keys().map(String::as_str).collect::<Vec<_>>()!=["instance.db","instance.id","instance.lock"]{return Err("integrity pristine has side files/extras".into());}
+            let c=Connection::open_with_flags(root.join("instance.db"),OpenFlags::SQLITE_OPEN_READ_WRITE|OpenFlags::SQLITE_OPEN_NO_MUTEX).map_err(|e|e.to_string())?;
+            let page:i64=c.query_row("SELECT rootpage FROM sqlite_schema WHERE name='runs'",[],|r|r.get(0)).map_err(|e|e.to_string())?;
+            let rows:i64=c.query_row("SELECT count(*) FROM runs",[],|r|r.get(0)).map_err(|e|e.to_string())?;
+            let integrity:String=c.query_row("PRAGMA integrity_check",[],|r|r.get(0)).map_err(|e|e.to_string())?;
+            c.close().map_err(|(_,e)|e.to_string())?;
+            if page<=1 || rows!=0 || integrity!="ok" || access_snapshot(&root)?!=pristine{return Err("integrity control is not unchanged empty runs table".into());}
+            let path=root.join("instance.db");let mut bytes=fs::read(&path).map_err(|e|e.to_string())?;
+            let raw=u16::from_be_bytes(bytes.get(16..18).ok_or("short integrity header")?.try_into().map_err(|_|"integrity page size")?);
+            let size=if raw==1{65536}else{raw as usize};let offset=(page as usize-1).checked_mul(size).ok_or("integrity offset overflow")?;
+            let empty=[13,0,0,0,0,(size>>8) as u8,size as u8,0];
+            if bytes.get(offset..offset+8)!=Some(empty.as_slice()){return Err("integrity target is not an empty leaf with zero fragments".into());}
+            bytes[offset+7]=1;fs::write(path,bytes).map_err(|e|e.to_string())?;
+            if wal_present {File::create_new(root.join("instance.db-wal")).and_then(|f|f.sync_all()).map_err(|e|e.to_string())?;}
+            let before=access_snapshot(&root)?;let baseline=retain_damage_snapshot(&root,"retained-integrity-before",&before)?;
+            let detail=format!("{:?}",vec![format!("*** in database main ***\nTree {page} page {page}: free space corruption")]);
+            let expected_cause=format!("integrity check failed: {detail}");
+            let outcome=if wal_present {semantic_refusal(&root,"integrity",&detail)?}else{
+                let (cause,effects)=stageb_refusal(&root)?;
+                if cause!=expected_cause || effects!="no inventory changes"{return Err(format!("raw integrity cause={cause:?} expected={expected_cause:?} effects={effects:?}"));}
+                format!("StageB({cause:?})")
+            };
+            let after=access_snapshot(&root)?;semantic_preserved(&before,&after,wal_present)?;
+            let final_copy=retain_damage_snapshot(&root,"retained-integrity-after",&after)?;stageb_released(&root)?;
+            let logs=if wal_present {semantic_repeat(&root,"integrity",&detail)?}else{
+                let mut cmd=command("__stageb_refusal",&root)?;cmd.arg(&expected_cause);let (mut child,logs)=launch(cmd,"integrity-probe")?;
+                if !wait(&mut child,Duration::from_secs(15))?.success(){return Err(format!("raw integrity repeat failed; logs={}",logs.display()));}logs
+            };
+            let child_after=access_snapshot(&root)?;semantic_preserved(&after,&child_after,wal_present)?;stageb_released(&root)?;
+            let child_copy=retain_damage_snapshot(&root,"retained-integrity-child-after",&child_after)?;
+            for (snapshot,path) in [(&pristine,&original),(&before,&baseline),(&after,&final_copy),(&child_after,&child_copy)] {
+                if access_snapshot(path)?!=*snapshot{return Err("integrity retained copy differs".into());}
+            }
+            println!("INFO WV preflight_integrity fixture={} wal_present={wal_present} runs_page={page} changed_offset={} pristine={} baseline={} after={} child_after={} child_logs={} outcome={outcome} expected_detail={detail:?} fragment_before=0 fragment_after=1 protected_entries_bytes_unchanged=true retained_copies_verified=true exclusive_data_opens=allowed child_lock_reacquired=true shm_changed={} child_shm_changed={} inventory_before={:?} inventory_after={:?} inventory_child_after={:?}",root.display(),offset+7,original.display(),baseline.display(),final_copy.display(),child_copy.display(),logs.display(),before.get("instance.db-shm")!=after.get("instance.db-shm"),after.get("instance.db-shm")!=child_after.get("instance.db-shm"),stageb_inventory(&before)?,stageb_inventory(&after)?,stageb_inventory(&child_after)?);
+        }
+        Ok("one-byte empty runs-leaf fragmentation defect returns exact Integrity result row: StageB with no WAL and typed Stage-A read-only with empty WAL; complete retained inventories/protected bytes and handles/fresh-child ownership verified; not every corruption mode or a retained extended SQLite error code".into())
     }
     fn lock_soak()->Result<String,String>{
         let start=Instant::now();let i=instance("lock-soak")?;let root=i.root().to_owned();let until=Instant::now()+Duration::from_secs(20);let mut rounds=0;

@@ -354,3 +354,27 @@ control is not a historical-binary rerun and does not claim that normal V2
 startup is non-mutating: V2 startup commits an epoch and event. Other malformed
 layouts, close/crash windows, metadata/ADS/identity guarantees and complete
 PF-14/PF-15/W2 or product acceptance remain separate qualification work.
+
+### Windows Stage-A semantic and integrity refusals
+
+`WV-PREFLIGHT-SEMANTIC` commits an FK orphan, metadata identity mismatch or
+version0 planted object into a genuine WAL over an unchanged pristine V2 main
+file. Each fresh owned fixture must return its exact existing typed refusal
+through Stage-A read-only only. Pristine, baseline, post-refusal and child-repeat
+files and inventories are retained. All non-SHM entries and bytes must remain
+unchanged; SHM existence/content effects are recorded separately. Exclusive
+data opens and a fresh child repeating the refusal check handle and lock release.
+
+`WV-PREFLIGHT-INTEGRITY` changes only the fragmented-free-byte count of an
+empty non-header runs-table leaf from0 to1. The exact integrity-result row must
+be returned through the existing StageB envelope with no WAL, and as typed
+`Integrity` through Stage-A read-only with an empty WAL. Both paths retain
+complete copies/inventories and verify released handles and child ownership.
+The raw-header path requires complete closed-byte equality and measured effects;
+the read-only path permits only the recorded SHM differences.
+
+These are current-code synthetic Windows observations. They do not establish
+every malformed page, all PF6/PF7/PF8/PF14/W2 requirements, absence of transient
+writes, nonempty StageB difference formatting, power-loss durability, broader
+security or product acceptance. An integrity-result row is not an extended
+SQLite error code. No Instance main/WAL/root is removed or repaired.
