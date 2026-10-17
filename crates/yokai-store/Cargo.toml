@@ -16,6 +16,7 @@ test = false
 doctest = false
 
 [dependencies]
+sha2.workspace = true
 rusqlite.workspace = true
 yokai-platform.workspace = true
 yokai-types.workspace = true
