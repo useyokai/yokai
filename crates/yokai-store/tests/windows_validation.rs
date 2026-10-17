@@ -45,6 +45,7 @@ mod native {
             ("WV-SQLITE-FILES",sqlite_files),
             ("WV-PREFLIGHT-ACCESS",preflight_access),
             ("WV-PREFLIGHT-DAMAGE",preflight_damage),
+            ("WV-PREFLIGHT-CONSISTENCY",preflight_consistency),
             ("WV-LOCK-SOAK",lock_soak),
         ];
         let selected:Vec<_>=match args.as_slice(){
@@ -587,6 +588,85 @@ mod native {
                 after.contains_key("instance.db-shm"),before.get("instance.db-shm")!=after.get("instance.db-shm"));
         }
         Ok("incomplete frame and bad stored frame checksum recover main3; damaged SHM recovers valid WAL4; exact future-version Stage-A-only refusals, main/WAL/non-SHM bytes preserved, pristine+damaged copies retained and handles released; synthetic future versions only, no supported-version startup or full PF11/W2 acceptance".into())
+    }
+    fn closed_sidefile_fixture(label:&str,version:u32)->Result<PathBuf,String>{
+        let i=instance(label)?;let root=i.root().to_owned();i.close().map_err(|e|e.to_string())?;
+        let db=root.join("instance.db");
+        let c=Connection::open_with_flags(&db,OpenFlags::SQLITE_OPEN_READ_WRITE|OpenFlags::SQLITE_OPEN_NO_MUTEX).map_err(|e|e.to_string())?;
+        c.set_db_config(DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE,true).map_err(|e|e.to_string())?;
+        c.execute_batch(&format!("PRAGMA wal_autocheckpoint=0; PRAGMA user_version={version};")).map_err(|e|e.to_string())?;
+        c.close().map_err(|(_,e)|e.to_string())?;
+        let mut main=fs::read(&db).map_err(|e|e.to_string())?;
+        if main.get(60..64)!=Some(2u32.to_be_bytes().as_slice()){return Err("side-file fixture did not start with main2".into());}
+        main[60..64].copy_from_slice(&3u32.to_be_bytes());fs::write(&db,&main).map_err(|e|e.to_string())?;
+        future_wal_control(&root,version)?;
+        let snapshot=access_snapshot(&root)?;
+        let wal=snapshot.get("instance.db-wal").and_then(Option::as_ref).ok_or("missing side-file WAL")?;
+        let shm=snapshot.get("instance.db-shm").and_then(Option::as_ref).ok_or("missing side-file SHM")?;
+        if wal.len()<120 || shm.len()<128 || snapshot.contains_key("instance.db-journal"){return Err("incomplete side-file fixture".into());}
+        let page=u32::from_be_bytes(wal[8..12].try_into().map_err(|_|"WAL page field")?) as usize;
+        if !(512..=65_536).contains(&page) || !page.is_power_of_two() || wal.len()!=32+24+page
+            || wal[32..36]!=1u32.to_be_bytes() || wal[36..40]==0u32.to_be_bytes() || wal[116..120]!=version.to_be_bytes() {
+            return Err("side-file fixture is not one committed page1 frame".into());
+        }
+        for name in ["instance.db","instance.db-wal","instance.db-shm"] {
+            drop(OpenOptions::new().read(true).write(true).share_mode(0).open(root.join(name)).map_err(|e|format!("side-file fixture handle not closed: {e}"))?);
+        }
+        Ok(root)
+    }
+    fn preflight_consistency()->Result<String,String>{
+        for case in ["foreign-wal","foreign-shm","zero-main"] {
+            let root=closed_sidefile_fixture("sidefile-target",4)?;
+            let pristine=access_snapshot(&root)?;
+            let original=retain_damage_snapshot(&root,"retained-target-pristine",&pristine)?;
+            let donor=if case=="zero-main" {None}else{
+                let path=closed_sidefile_fixture("sidefile-donor",5)?;let snapshot=access_snapshot(&path)?;
+                let retained=retain_damage_snapshot(&path,"retained-donor-pristine",&snapshot)?;
+                if path==root || pristine.get("instance.id")==snapshot.get("instance.id") {return Err("side-file donor identity is not independent".into());}
+                let wal=|s:&BTreeMap<String,Option<Vec<u8>>>|s.get("instance.db-wal").and_then(Option::as_ref).cloned().ok_or("missing donor/target WAL");
+                let own=wal(&pristine)?;let other=wal(&snapshot)?;
+                if own[8..12]!=other[8..12] || own[16..24]==other[16..24] {return Err("side-file donor page size differs or salts are not distinct".into());}
+                println!("INFO WV preflight_consistency donor={} case={case} donor_version=5 retained={}",path.display(),retained.display());
+                Some((path,snapshot,retained))
+            };
+            if let Some((_,snapshot,_))=&donor {
+                let name=if case=="foreign-wal" {"instance.db-wal"}else{"instance.db-shm"};
+                let bytes=snapshot.get(name).and_then(Option::as_ref).ok_or("missing donor side file")?;
+                if case=="foreign-wal" {
+                    // Closed owned fixture only; retain original SHM before forcing WAL-index recovery.
+                    fs::remove_file(root.join("instance.db-shm")).map_err(|e|e.to_string())?;
+                    if support::entry_exists(&root.join("instance.db-shm"))?{return Err("target SHM still exists".into());}
+                }
+                fs::write(root.join(name),bytes).map_err(|e|e.to_string())?;
+            }else{OpenOptions::new().write(true).open(root.join("instance.db")).and_then(|f|f.set_len(0)).map_err(|e|e.to_string())?;}
+            let before=access_snapshot(&root)?;
+            let altered=retain_damage_snapshot(&root,"retained-target-altered",&before)?;
+            println!("INFO WV preflight_consistency fixture={} case={case} main_before=3 own_wal_version=4 original={} altered={} shm_before={}",root.display(),original.display(),altered.display(),before.contains_key("instance.db-shm"));
+            store::test_api::clear();let result=store::open_instance(&root);let events=store::test_api::connection_events();
+            let outcome=match result {
+                Err(InstanceError::SchemaTooNew{found,maximum:2}) if case!="zero-main" && found==if case=="foreign-wal"{5}else{4} && events==["stage-a-read-only"]=>format!("SchemaTooNew{found}"),
+                Err(InstanceError::SchemaInconsistent(reason)) if case=="zero-main" && reason=="zero-length database has a WAL side file" && events.is_empty()=>"SchemaInconsistentZeroMain".into(),
+                Ok(i)=>{i.close().map_err(|e|e.to_string())?;return Err(format!("{case} unexpectedly admitted an Instance; events={events:?}"));},
+                Err(e)=>return Err(format!("{case} wrong refusal: {e:?}; events={events:?}")),
+            };
+            let after=access_snapshot(&root)?;
+            for name in before.keys().chain(after.keys()) {
+                if (case=="zero-main" || name!="instance.db-shm") && before.get(name)!=after.get(name){return Err(format!("{case} refusal changed protected entry {name}"));}
+            }
+            let mut copies=vec![(&pristine,&original),(&before,&altered)];
+            if let Some((path,snapshot,retained))=&donor {
+                if access_snapshot(path)?!=*snapshot{return Err("target probe changed donor root".into());}
+                copies.push((snapshot,retained));
+            }
+            for (snapshot,retained) in copies {
+                if access_snapshot(retained)?!=*snapshot{return Err("side-file retained copy changed".into());}
+            }
+            for (name,bytes) in &after {
+                if bytes.is_some(){drop(OpenOptions::new().read(true).write(true).share_mode(0).open(root.join(name)).map_err(|e|format!("side-file probe left open handle: {e}"))?);}
+            }
+            println!("INFO WV preflight_consistency case={case} refusal={outcome} sqlite_events={events:?} protected_entries_bytes_unchanged=true retained_copies_verified=true donor_unchanged={} released_exclusive_opens=allowed shm_after={} shm_changed={} no_repair=true",if donor.is_some(){"true"}else{"not_applicable"},after.contains_key("instance.db-shm"),before.get("instance.db-shm")!=after.get("instance.db-shm"));
+        }
+        Ok("independent genuine foreign WAL5/foreign SHM over own WAL4/main3 refuse exact future versions5/4 in Stage-A only; zero main with WAL refuses before SQLite; protected bytes, retained target/donor copies and donor roots unchanged, handles released; synthetic future versions only, no supported-version foreign-file safety or full PF12/W2 acceptance".into())
     }
     fn lock_soak()->Result<String,String>{
         let start=Instant::now();let i=instance("lock-soak")?;let root=i.root().to_owned();let until=Instant::now()+Duration::from_secs(20);let mut rounds=0;
