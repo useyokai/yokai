@@ -483,3 +483,29 @@ traces or proof of every internal operation. Literal 131072 page-size clarificat
 exhaustive headers, other platforms, concurrency/poisoning failure experiments,
 transient writes, metadata/object identity, full catalogue/workspace/security,
 power-loss durability and release acceptance remain separate work.
+
+### Windows journal and zero-length database refusal witnesses
+
+`WV-JOURNAL-EMPTY` retains nine owned fixtures: rollback format bytes1/1;
+journal presence with no WAL and with a genuine committed WAL; and zero-length
+main with empty or nonempty WAL, SHM or journal. Refusals must match the exact
+existing typed errors before any SQLite connection. Valid main headers are
+decoded before journal presence is checked: max unsigned version without WAL,
+and main2 with committed WAL4. Rollback headers and empty-main shortcuts produce
+no decoded-header observation. Every observation drains on read.
+
+Pristine, altered, post-refusal and fresh-child files retain140 ordinary files,
+including empty side files as present entries. Parent and child repeat the same
+strict oracle, compare complete closed roots and all four fixed SQLite inventory
+entries, and verify released data handles. This distinguishes empty side files
+from absent ones without repairing or deleting any Instance main, WAL or root.
+Journal payloads are synthetic presence witnesses, not crash-produced hot-journal
+recovery qualification.
+
+A separately pinned negative control omits the journal-presence guard and must
+fail the unchanged oracle at the no-WAL future-header case. That failed source
+is preserved separately; final production source restores the guard exactly.
+This demonstrates oracle sensitivity, not a newly discovered production defect.
+These selected PF4/PF5/PF18 observations do not prove transient-write absence,
+metadata/ADS/object identity, hostile-race safety, every side-file combination,
+Linux parity, full W2/workspace/security/release or power-loss durability.
