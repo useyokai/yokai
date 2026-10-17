@@ -227,7 +227,7 @@ fn read_only_sqlite_check(path: &Path, id: yokai_types::InstanceId, created: &st
         .map_err(|e| InstanceError::PreflightUnavailable(e.to_string()))?;
     // Pin all compatibility queries to one consistent SQLite read snapshot.
     let tx=opened.transaction().map_err(|e|InstanceError::PreflightUnavailable(e.to_string()))?;
-    let result = crate::schema::inspect(&tx,id,created,plan).map(|_| ());
+    let result = crate::schema::inspect_read_only(&tx,id,created,plan).map(|_| ());
     tx.rollback().map_err(|e|InstanceError::PreflightUnavailable(e.to_string()))?;
     drop(opened);
     result

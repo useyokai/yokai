@@ -46,6 +46,7 @@ mod native {
             ("WV-PREFLIGHT-ACCESS",preflight_access),
             ("WV-PREFLIGHT-DAMAGE",preflight_damage),
             ("WV-PREFLIGHT-CONSISTENCY",preflight_consistency),
+            ("WV-PREFLIGHT-ACL",preflight_acl),
             ("WV-LOCK-SOAK",lock_soak),
         ];
         let selected:Vec<_>=match args.as_slice(){
@@ -667,6 +668,90 @@ mod native {
             println!("INFO WV preflight_consistency case={case} refusal={outcome} sqlite_events={events:?} protected_entries_bytes_unchanged=true retained_copies_verified=true donor_unchanged={} released_exclusive_opens=allowed shm_after={} shm_changed={} no_repair=true",if donor.is_some(){"true"}else{"not_applicable"},after.contains_key("instance.db-shm"),before.get("instance.db-shm")!=after.get("instance.db-shm"));
         }
         Ok("independent genuine foreign WAL5/foreign SHM over own WAL4/main3 refuse exact future versions5/4 in Stage-A only; zero main with WAL refuses before SQLite; protected bytes, retained target/donor copies and donor roots unchanged, handles released; synthetic future versions only, no supported-version foreign-file safety or full PF12/W2 acceptance".into())
+    }
+    fn acl_command(root:&Path,journal:&Path,case:&str,operation:&str,label:&str)->Result<(),String>{
+        let exe=PathBuf::from(std::env::var_os("YOKAI_TEST_POWERSHELL").ok_or("missing pinned Windows PowerShell")?);
+        if !exe.is_absolute(){return Err("PowerShell path is not absolute".into());}
+        let mut command=Command::new(exe);
+        command.args(["-NoLogo","-NoProfile","-NonInteractive","-Command","-"]).creation_flags(0x08000000)
+            .env("YOKAI_TEST_ACL_ROOT",root).env("YOKAI_TEST_ACL_JOURNAL",journal)
+            .env("YOKAI_TEST_ACL_CASE",case).env("YOKAI_TEST_ACL_OPERATION",operation).env("YOKAI_TEST_ACL_LABEL",label)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::from(File::create_new(journal.join(format!("{label}.out"))).map_err(|e|e.to_string())?))
+            .stderr(Stdio::from(File::create_new(journal.join(format!("{label}.err"))).map_err(|e|e.to_string())?));
+        let mut child=OwnedChild{child:command.spawn().map_err(|e|e.to_string())?};
+        let mut input=child.child.stdin.take().ok_or("ACL helper stdin missing")?;
+        input.write_all(include_str!("support/windows_acl.ps1").as_bytes()).map_err(|e|e.to_string())?;
+        input.write_all(b"\n").map_err(|e|e.to_string())?;drop(input); // WinPS stdin needs a terminating blank line for a compound block.
+        let status=wait(&mut child,Duration::from_secs(30))?;
+        let out=fs::read_to_string(journal.join(format!("{label}.out"))).map_err(|e|e.to_string())?;
+        let err=fs::read_to_string(journal.join(format!("{label}.err"))).map_err(|e|e.to_string())?;
+        if !status.success() || out.lines().collect::<Vec<_>>()!=[format!("ACL_OPERATION {operation} PASS")] || !err.is_empty(){return Err(format!("ACL helper {label}: status={status} out={out:?} err={err:?}"));}
+        Ok(())
+    }
+    struct AclGuard{root:PathBuf,journal:PathBuf,case:&'static str,restored:bool}
+    impl AclGuard{
+        fn deny(root:&Path,case:&'static str)->Result<Self,String>{
+            let journal=root.parent().ok_or("ACL parent missing")?.join("acl-journal");
+            fs::create_dir(&journal).map_err(|e|e.to_string())?;
+            let guard=Self{root:root.to_owned(),journal,case,restored:false};
+            acl_command(&guard.root,&guard.journal,case,"deny","deny")?;Ok(guard)
+        }
+        fn restore(mut self)->Result<(),String>{
+            acl_command(&self.root,&self.journal,self.case,"restore","restore")?;self.restored=true;Ok(())
+        }
+    }
+    impl Drop for AclGuard{fn drop(&mut self){
+        if !self.restored && !matches!(support::entry_exists(&self.journal.join("original.json")),Ok(false)) {
+            if let Err(e)=acl_command(&self.root,&self.journal,self.case,"restore","emergency-restore") {eprintln!("INFO WV ACL emergency restoration unconfirmed: {e}; wrapper must restore before sealing");}
+        }
+    }}
+    fn access_denied(result:std::io::Result<()>,label:&str)->Result<(),String>{
+        match result{Err(e) if e.raw_os_error()==Some(5)=>Ok(()),Err(e)=>Err(format!("{label}: expected access-denied5, got {e}")),Ok(())=>Err(format!("{label}: access unexpectedly permitted"))}
+    }
+    fn preflight_acl()->Result<String,String>{
+        for case in ["db-read","shm-read","directory-create"] {
+            let root=closed_sidefile_fixture("preflight-acl",4)?;
+            let pristine=access_snapshot(&root)?;
+            let original=retain_damage_snapshot(&root,"retained-acl-pristine",&pristine)?;
+            if case=="directory-create" {
+                drop(OpenOptions::new().read(true).write(true).share_mode(0).open(root.join("instance.db-shm")).map_err(|e|e.to_string())?);
+                fs::remove_file(root.join("instance.db-shm")).map_err(|e|e.to_string())?;
+                if support::entry_exists(&root.join("instance.db-shm"))?{return Err("ACL construction SHM still exists".into());}
+            }
+            let before=access_snapshot(&root)?;
+            let retained=retain_damage_snapshot(&root,"retained-before-acl",&before)?;
+            let guard=AclGuard::deny(&root,case)?;let journal=guard.journal.clone();
+            if case=="directory-create" {
+                let probe=root.join("acl-create-probe");
+                if support::entry_exists(&probe)?{return Err("ACL create probe already exists".into());}
+                access_denied(File::create_new(&probe).map(drop),case)?;
+                if support::entry_exists(&probe)?{return Err("denied ACL create left an entry".into());}
+            }else{access_denied(fs::read(root.join(if case=="db-read"{"instance.db"}else{"instance.db-shm"})).map(drop),case)?;}
+            store::test_api::clear();let result=store::open_instance(&root);let events=store::test_api::connection_events();
+            let reason=match result {
+                Err(InstanceError::PreflightUnavailable(reason))=>reason,
+                Ok(i)=>{i.close().map_err(|e|e.to_string())?;return Err(format!("{case} ACL-denied fixture admitted an Instance"));},
+                Err(e)=>return Err(format!("{case} wrong ACL refusal: {e:?}; events={events:?}")),
+            };
+            let expected:Vec<&str>=if case=="directory-create"{vec!["stage-a-read-only"]}else{vec![]};
+            if events!=expected{return Err(format!("{case} ACL refusal reached wrong SQLite path: {events:?}"));}
+            if case=="directory-create" && access_snapshot(&root)?!=before{return Err("directory ACL refusal changed bytes while denied".into());}
+            guard.restore()?;
+            if access_snapshot(&root)?!=before{return Err("ACL refusal changed complete root entries/bytes".into());}
+            for (snapshot,path) in [(&pristine,&original),(&before,&retained)] {
+                if access_snapshot(path)?!=*snapshot{return Err("retained ACL baseline changed".into());}
+            }
+            for (name,bytes) in &before {
+                if bytes.is_some(){drop(OpenOptions::new().read(true).write(true).share_mode(0).open(root.join(name)).map_err(|e|format!("ACL refusal left data handle: {e}"))?);}
+            }
+            future_wal_control(&root,4)?;let after=access_snapshot(&root)?;
+            for name in before.keys().chain(after.keys()) {
+                if name!="instance.db-shm" && before.get(name)!=after.get(name){return Err("post-ACL control changed non-SHM entry/byte".into());}
+            }
+            println!("INFO WV preflight_acl fixture={} case={case} pristine={} baseline={} journal={} raw_access_error=5 refusal=PreflightUnavailable sqlite_events={events:?} complete_refusal_entries_bytes_unchanged=true retained_copies_verified=true original_scoped_acl_rules_restored=true acl_control_effects_recorded=true released_exclusive_opens=allowed control_before=SchemaTooNew4 control_after=SchemaTooNew4 control_sqlite_events=[stage-a-read-only] control_shm_created={} reason={reason:?}",root.display(),original.display(),retained.display(),journal.display(),!before.contains_key("instance.db-shm") && after.contains_key("instance.db-shm"));
+        }
+        Ok("current-SID non-inheriting ReadData deny on main/SHM and directory CreateFiles/CreateDirectories deny with SHM absent: raw access-denied5 and exact PreflightUnavailable/no writable fallback; complete refusal bytes/copies and original permission ACEs/protection restored, auto-inheritance initialization recorded, released handles and read-only WAL4 controls verified; owned Windows fixtures only, not full descriptor restoration, Unix mode000 or full PF13/W2 acceptance".into())
     }
     fn lock_soak()->Result<String,String>{
         let start=Instant::now();let i=instance("lock-soak")?;let root=i.root().to_owned();let until=Instant::now()+Duration::from_secs(20);let mut rounds=0;
