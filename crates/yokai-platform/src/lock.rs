@@ -3,11 +3,6 @@ use std::fs::{File, OpenOptions};
 use std::io;
 use std::path::Path;
 
-#[cfg(windows)]
-const FILE_SHARE_READ: u32 = 0x0000_0001;
-#[cfg(windows)]
-const FILE_SHARE_WRITE: u32 = 0x0000_0002;
-
 #[derive(Debug)]
 pub struct InstanceLock { lock_handle: File }
 
@@ -39,9 +34,9 @@ fn base_options() -> OpenOptions {
     options.read(true).write(true);
     #[cfg(windows)]
     {
-        // Permit contenders to open the persistent lock before try_lock reports Busy.
-        // Omitting FILE_SHARE_DELETE also keeps the lock path present while this handle lives.
-        std::os::windows::fs::OpenOptionsExt::share_mode(&mut options, FILE_SHARE_READ | FILE_SHARE_WRITE);
+        // Refuse other data handles and path replacement while ownership is held.
+        // Contenders receive a sharing violation, classified as Busy by the store.
+        std::os::windows::fs::OpenOptionsExt::share_mode(&mut options, 0);
     }
     options
 }

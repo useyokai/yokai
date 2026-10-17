@@ -5,6 +5,9 @@
 //! Without the required status or opt-in, no check runs and the exit status is 2. Output is one
 //! CHECK line per check followed by a RESULT line.
 
+#[path = "support/mod.rs"]
+mod support;
+
 use std::fmt::Display;
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -238,6 +241,8 @@ fn run(c: &mut Checks) -> Result<(), String> {
         format!("rounds={RACE_ROUNDS} creators={RACE_CREATORS} bad_rounds={bad_rounds:?}"),
     );
 
+    support::verify_absence_oracle(&dir)?;
+
     // R12: an existing database, created outside the store with the default rollback journal,
     // is refused and left byte-for-byte unchanged, without WAL or shared-memory files. On Unix,
     // a dangling symbolic link is refused and its target is not created.
@@ -250,10 +255,10 @@ fn run(c: &mut Checks) -> Result<(), String> {
     let before = std::fs::read(&existing_path).map_err(|e| format!("read existing: {e}"))?;
     let refused = store::test_api::create_file(&existing_path);
     let after = std::fs::read(&existing_path).map_err(|e| format!("read existing: {e}"))?;
-    let side_files = ["existing.db-wal", "existing.db-shm", "existing.db-journal"]
-        .into_iter()
-        .filter(|name| std::fs::symlink_metadata(dir.join(name)).is_ok())
-        .collect::<Vec<_>>();
+    let mut side_files = Vec::new();
+    for name in ["existing.db-wal", "existing.db-shm", "existing.db-journal"] {
+        if support::entry_exists(&dir.join(name))? { side_files.push(name); }
+    }
     let (link_refused, link_detail) = dangling_link_refused(&dir)?;
     c.record(
         "R12_existing_untouched",
@@ -298,7 +303,7 @@ fn dangling_link_refused(dir: &Path) -> Result<(bool, String), String> {
     let target = dir.join("dangling-target.db");
     std::os::unix::fs::symlink(&target, &link).map_err(|e| format!("symlink: {e}"))?;
     let result = store::test_api::create_file(&link);
-    let target_created = std::fs::symlink_metadata(&target).is_ok();
+    let target_created = support::entry_exists(&target)?;
     let ok = matches!(result, Err(store::StoreError::AlreadyExists(_))) && !target_created;
     Ok((ok, format!("dangling_link={:?} target_created={target_created}", result.err())))
 }
@@ -307,7 +312,7 @@ fn dangling_link_refused(dir: &Path) -> Result<(bool, String), String> {
 fn dangling_link_refused(dir: &Path) -> Result<(bool, String), String> {
     use std::os::windows::fs::MetadataExt;
     let link=dir.join("dangling.db");let target=dir.join("dangling-target.db");
-    if !dir.is_absolute() || std::fs::symlink_metadata(&link).is_ok() || std::fs::symlink_metadata(&target).is_ok(){return Err("dangling fixture paths are not fresh/absolute".into());}
+    if !dir.is_absolute() || support::entry_exists(&link)? || support::entry_exists(&target)?{return Err("dangling fixture paths are not fresh/absolute".into());}
     match std::os::windows::fs::symlink_file(&target,&link){
         Ok(())=>{},
         Err(e) if e.raw_os_error()==Some(1314) || e.kind()==std::io::ErrorKind::PermissionDenied=>return Ok((true,format!("dangling_link=not_checked capability unavailable: {e}"))),
@@ -315,11 +320,13 @@ fn dangling_link_refused(dir: &Path) -> Result<(bool, String), String> {
     }
     let before=std::fs::read_link(&link).map_err(|e|e.to_string())?;
     let result=store::test_api::create_file(&link);let result_error=result.err();
-    let target_created=std::fs::symlink_metadata(&target).is_ok();
+    let target_created=support::entry_exists(&target)?;
     let after=std::fs::read_link(&link).map_err(|e|e.to_string())?;
     let metadata=std::fs::symlink_metadata(&link).map_err(|e|e.to_string())?;
-    let side_files=["dangling.db-wal","dangling.db-shm","dangling.db-journal","dangling-target.db-wal","dangling-target.db-shm","dangling-target.db-journal"]
-        .into_iter().filter(|name|std::fs::symlink_metadata(dir.join(name)).is_ok()).collect::<Vec<_>>();
+    let mut side_files=Vec::new();
+    for name in ["dangling.db-wal","dangling.db-shm","dangling.db-journal","dangling-target.db-wal","dangling-target.db-shm","dangling-target.db-journal"] {
+        if support::entry_exists(&dir.join(name))? { side_files.push(name); }
+    }
     let conventional=|p:&Path|{let text=p.to_string_lossy();text.strip_prefix("\\\\?\\").unwrap_or(&text).to_owned()};
     let unchanged=conventional(&before)==conventional(&target) && after==before && metadata.file_type().is_symlink() && metadata.file_attributes()&0x400!=0;
     println!("INFO R12 Windows dangling_link={} target={} before_target={} after_target={} reparse={} target_created={target_created} side_files={side_files:?}",
@@ -327,7 +334,7 @@ fn dangling_link_refused(dir: &Path) -> Result<(bool, String), String> {
     // Remove only our verified link; its target stays absent and the inventory is retained above.
     if !unchanged || link.parent()!=Some(dir) || !link.is_absolute(){return Err("owned Windows dangling-link identity changed; no unlink attempted".into());}
     std::fs::remove_file(&link).map_err(|e|format!("unlink owned dangling symlink: {e}"))?;
-    let target_after_unlink=std::fs::symlink_metadata(&target).is_ok();
+    let target_after_unlink=support::entry_exists(&target)?;
     let ok=matches!(result_error,Some(store::StoreError::AlreadyExists(_))) && !target_created && !target_after_unlink && side_files.is_empty();
     Ok((ok,format!("dangling_link=checked_windows result={result_error:?} unchanged={unchanged} target_created={target_created} target_after_unlink={target_after_unlink}; owned link unlinked after inventory")))
 }

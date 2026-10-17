@@ -8,7 +8,12 @@ fn main() -> std::process::ExitCode {
 }
 
 #[cfg(windows)]
+#[path = "support/mod.rs"]
+mod support;
+
+#[cfg(windows)]
 mod native {
+    use super::support;
     use std::fs::{self,File,OpenOptions};
     use std::io::{Read,Seek,SeekFrom,Write};
     use std::os::windows::fs::OpenOptionsExt;
@@ -272,25 +277,37 @@ mod native {
         }
         Ok(())
     }
+    fn data_opens_refused(lock:&Path)->Result<(),String>{
+        for (label,read,write) in [("read",true,false),("write",false,true),("read-write",true,true)] {
+            let opened=OpenOptions::new().read(read).write(write).share_mode(7).open(lock);
+            sharing_violation(opened.map(drop),label)?;
+        }
+        Ok(())
+    }
     fn open_files()->Result<String,String>{
-        let created=instance("open-files")?;let root=created.root().to_owned();created.close().map_err(|e|e.to_string())?;
+        let created=instance("open-files")?;let root=created.root().to_owned();
+        support::verify_absence_oracle(&root)?;
+        data_opens_refused(&root.join("instance.lock"))?;
+        created.close().map_err(|e|e.to_string())?;
         let lock=root.join("instance.lock");let destination=root.join("lock-rename-probe");owned_file_paths(&root,&lock,&destination)?;
-        // Capture bytes while unowned: the product's byte-range lock refuses raw reads.
+        // Capture bytes while unowned: share-zero ownership refuses raw data handles.
         let lock_bytes=fs::read(&lock).map_err(|e|format!("unowned lock baseline: {e}"))?;
         let i=store::open_instance(&root).map_err(|e|e.to_string())?;let pause=store::test_api::block_writer(&i).map_err(|e|e.to_string())?;
         let before=protected(&root)?;
+        data_opens_refused(&lock)?;
         let locked_read=fs::read(&lock);
-        if !matches!(&locked_read,Err(e) if e.raw_os_error()==Some(33)){return Err(format!("raw lock read did not encounter byte-range lock33: {locked_read:?}"));}
-        // The product lock permits compatible READ|WRITE sharing, but not a second exclusive lock.
-        let compatible=OpenOptions::new().read(true).write(true).open(&lock).map_err(|e|format!("compatible product lock handle: {e}"))?;
-        let attempt=compatible.try_lock().map_err(std::io::Error::from);
-        if !matches!(&attempt,Err(e) if e.kind()==std::io::ErrorKind::WouldBlock){return Err(format!("compatible handle acquired ownership or wrong refusal: {attempt:?}"));}
+        if !matches!(&locked_read,Err(e) if e.raw_os_error()==Some(32)){return Err(format!("raw lock read did not encounter sharing violation32: {locked_read:?}"));}
+        match store::open_instance(&root) {
+            Err(InstanceError::Busy(_))=>{},
+            Ok(second)=>{second.close().map_err(|e|e.to_string())?;return Err("second owner opened while share0 held".into());},
+            Err(e)=>return Err(format!("second opener not Busy: {e}")),
+        }
         sharing_violation(fs::rename(&lock,&destination),"product-lock-rename")?;
         sharing_violation(fs::remove_file(&lock),"product-lock-delete")?;
         if protected(&root)?!=before
-            || fs::symlink_metadata(&destination).is_ok(){return Err("product lock refusal changed protected files or lock identity path".into());}
-        println!("INFO WV product_lock compatible_rw_open=allowed exclusive_lock=WouldBlock raw_read=byte_range_violation33 rename=sharing_violation delete=sharing_violation source_requested_share_mask=3 delete_share=false");
-        drop(compatible);drop(pause);i.close().map_err(|e|e.to_string())?;
+            || support::entry_exists(&destination)?{return Err("product lock refusal changed protected files or lock identity path".into());}
+        println!("INFO WV product_lock create_and_reopen_data_handles=refused32 second_instance=Busy raw_read=sharing_violation32 rename=sharing_violation delete=sharing_violation source_requested_share_mask=0 metadata_validation=retained");
+        drop(pause);i.close().map_err(|e|e.to_string())?;
         if fs::read(&lock).map_err(|e|format!("released lock comparison: {e}"))?!=lock_bytes{return Err("released persistent lock bytes differ from unowned baseline".into());}
 
         let bytes=b"owned Windows file probe";
@@ -301,7 +318,7 @@ mod native {
         if !matches!(&second,Err(e) if e.raw_os_error()==Some(32)){return Err(format!("share0 fixture admitted compatible handle or wrong refusal: {second:?}"));}
         sharing_violation(fs::rename(&source,&destination),"synthetic-share0-rename")?;
         sharing_violation(fs::remove_file(&source),"synthetic-share0-delete")?;drop(handle);
-        if fs::read(&source).map_err(|e|e.to_string())?!=bytes || fs::symlink_metadata(&destination).is_ok(){return Err("share0 fixture bytes/path changed".into());}
+        if fs::read(&source).map_err(|e|e.to_string())?!=bytes || support::entry_exists(&destination)?{return Err("share0 fixture bytes/path changed".into());}
         println!("INFO WV synthetic_share0 second_open=sharing_violation rename=sharing_violation delete=sharing_violation original_retained={}",source.display());
 
         let shared=parent("share-delete")?;let source=shared.join("probe.bin");let destination=shared.join("renamed.bin");owned_file_paths(&shared,&source,&destination)?;
@@ -310,7 +327,7 @@ mod native {
         let mut handle=OpenOptions::new().create_new(true).read(true).write(true).share_mode(7).open(&source).map_err(|e|e.to_string())?;
         handle.write_all(bytes).map_err(|e|e.to_string())?;handle.flush().map_err(|e|e.to_string())?;
         fs::rename(&source,&destination).map_err(|e|format!("shared-delete fixture rename: {e}"))?;
-        if fs::symlink_metadata(&source).is_ok() || fs::read(&destination).map_err(|e|e.to_string())?!=bytes{return Err("shared-delete rename lost bytes or left old name".into());}
+        if support::entry_exists(&source)? || fs::read(&destination).map_err(|e|e.to_string())?!=bytes{return Err("shared-delete rename lost bytes or left old name".into());}
         fs::remove_file(&destination).map_err(|e|format!("shared-delete fixture unlink: {e}"))?;
         let pending=match fs::symlink_metadata(&destination){Ok(m)=>format!("present len={}",m.len()),Err(e)=>format!("error_os={:?} kind={:?}",e.raw_os_error(),e.kind())};
         handle.seek(SeekFrom::Start(0)).map_err(|e|e.to_string())?;let mut observed=Vec::new();handle.read_to_end(&mut observed).map_err(|e|e.to_string())?;drop(handle);
@@ -318,7 +335,7 @@ mod native {
         if observed!=bytes || !closed.is_some_and(|e|e.kind()==std::io::ErrorKind::NotFound)
             || fs::read(&retained).map_err(|e|e.to_string())?!=bytes{return Err("shared-delete handle/content or final unlink state mismatch".into());}
         println!("INFO WV synthetic_share7 rename=allowed unlink=allowed metadata_while_open={pending} original_handle_bytes={observed:?} destination_absent_after_owned_close=true original_retained={}",retained.display());
-        Ok("product share-read/write3 allows compatible handles but exclusive lock remains Busy; held lock rename/delete refuse32 unchanged; separate share0/share7 owned probes record rename/delete/handle semantics with original bytes retained; no database/root deletion or discard design".into())
+        Ok("product share0 refuses raw data handles on create/reopen and second Instance is Busy; held lock rename/delete refuse32 unchanged; separate share0/share7 owned probes record rename/delete/handle semantics with original bytes retained; no database/root deletion or discard design".into())
     }
     fn lock_soak()->Result<String,String>{
         let start=Instant::now();let i=instance("lock-soak")?;let root=i.root().to_owned();let until=Instant::now()+Duration::from_secs(20);let mut rounds=0;
