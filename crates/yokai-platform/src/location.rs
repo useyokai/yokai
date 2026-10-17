@@ -4,6 +4,9 @@ use std::fs::{self, Metadata};
 use std::fs::File;
 use std::io;
 use std::path::{Path, PathBuf};
+#[cfg(all(target_os="linux",target_env="gnu",target_arch="x86_64"))]
+#[allow(unsafe_code)]
+mod linux_space;
 #[cfg(feature = "test-api")]
 use std::sync::{Mutex, OnceLock};
 
@@ -36,6 +39,15 @@ pub fn validate_parent(path: &Path) -> io::Result<PathBuf> {
 }
 pub fn validate_root(path: &Path) -> io::Result<PathBuf> {
     validate_existing_directory(path, "root")
+}
+/// Available bytes for this process on the volume. A sample, not a reservation.
+pub fn available_bytes(path: &Path) -> io::Result<u64> {
+    #[cfg(windows)]
+    { windows_api::available_bytes(path) }
+    #[cfg(all(target_os="linux",target_env="gnu",target_arch="x86_64"))]
+    { linux_space::available_bytes(path) }
+    #[cfg(not(any(windows,all(target_os="linux",target_env="gnu",target_arch="x86_64"))))]
+    { let _=path; Err(unsupported("no verified free-space ABI for this target")) }
 }
 fn validate_existing_directory(path: &Path, label: &str) -> io::Result<PathBuf> {
     if !path.is_absolute() { return Err(invalid(format!("{label} path must be absolute"))); }
@@ -199,6 +211,16 @@ mod windows_api {
         fn get_drive_type_w(root_path_name: *const u16) -> u32;
         #[link_name = "GetFileInformationByHandle"]
         fn get_file_information_by_handle(handle: *mut c_void, information: *mut ByHandleFileInformation) -> i32;
+        #[link_name = "GetDiskFreeSpaceExW"]
+        fn get_disk_free_space_ex_w(directory:*const u16,available:*mut u64,total:*mut u64,free:*mut u64)->i32;
+    }
+
+    pub fn available_bytes(path:&Path)->io::Result<u64>{
+        let mut wide:Vec<u16>=path.as_os_str().encode_wide().collect();wide.push(0);
+        let(mut available,mut total,mut free)=(0,0,0);
+        // SAFETY: nul-terminated live UTF-16 path and three initialized ULARGE_INTEGER buffers.
+        if unsafe{get_disk_free_space_ex_w(wide.as_ptr(),&mut available,&mut total,&mut free)}==0{return Err(io::Error::last_os_error());}
+        Ok(available)
     }
 
     pub fn require_fixed_local_volume(path: &Path) -> io::Result<()> {

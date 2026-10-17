@@ -60,6 +60,13 @@ pub fn hit(boundary: &str) -> Result<(), String> {
     match mode {
         "error" => Err(format!("test failpoint at {boundary}")),
         "exit" => std::process::exit(86),
+        "wait" => {
+            let path=std::env::var_os("YOKAI_TEST_READY_FILE").ok_or("readiness marker missing")?;
+            let mut file=OpenOptions::new().write(true).create_new(true).open(path).map_err(|e|e.to_string())?;
+            file.write_all(boundary.as_bytes()).map_err(|e|e.to_string())?;
+            file.sync_all().map_err(|e|e.to_string())?;
+            loop {std::thread::park_timeout(std::time::Duration::from_secs(1));}
+        }
         _ => Ok(()),
     }
 }

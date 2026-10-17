@@ -126,7 +126,7 @@ fn child_main(args: &[String]) -> Option<u8> {
             let path = PathBuf::from(args.get(3)?);
             let Ok(connection) = Connection::open(path) else { return Some(11) };
             if connection.execute_batch(
-                "PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0; PRAGMA user_version=1;"
+                "PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0; PRAGMA user_version=2;"
             ).is_err() { return Some(12); }
             // Leave the committed WAL files for the parent to inspect.
             std::process::exit(0);
@@ -347,7 +347,7 @@ fn case_create_shape(base: &Path) -> Result<String, String> {
         && actual == expected
         && identity.lines().count() == 3
         && identity.starts_with("yokai-instance format 1\nid ")
-        && version == 0 && objects == 0 && private_root && instance.is_locked();
+        && version == 1 && objects == 2 && private_root && instance.is_locked();
     instance.close().map_err(|e| e.to_string())?;
     if good { Ok(format!("root={} entries={actual:?} version={version} objects={objects}", root.display())) }
     else { Err(format!("root={} entries={actual:?} expected={expected:?} version={version} objects={objects} private={private_root}", root.display())) }
@@ -462,7 +462,7 @@ fn case_same_identity_creators(base: &Path) -> Result<String, String> {
 }
 
 fn case_creation_process_exits(base: &Path) -> Result<String, String> {
-    for boundary in ["after-root", "after-lock", "after-db", "during-identity"] {
+    for boundary in ["after-root", "after-lock", "after-db", "after-migration", "during-identity"] {
         for round in 0..3 {
             let parent = fresh_dir(base, "ic6")?;
             let before_dirs = child_dirs(&parent)?;
@@ -487,7 +487,7 @@ fn case_creation_process_exits(base: &Path) -> Result<String, String> {
             }
         }
     }
-    Ok("process exited at four creation boundaries, three rounds each".into())
+    Ok("process exited at five creation boundaries, including committed V1 before identity, three rounds each".into())
 }
 
 fn case_directory_flushes(base: &Path) -> Result<String, String> {
@@ -530,7 +530,7 @@ fn case_fixture_instance(base: &Path) -> Result<String, String> {
     let db = fs::read(db_path(&root)).map_err(|e| e.to_string())?;
     let hash = store::test_api::sha256_chunks_for_test(&[&db]);
     println!("INFO IC-F fixture={} instance.db_sha256={hash}", root.display());
-    Ok(format!("version-0 fixture preserved for later read-only migration evidence; sha256={hash}"))
+    Ok(format!("current version-1 fixture preserved; historical accepted version-0 fixture remains separate; sha256={hash}"))
 }
 
 fn case_same_process_busy(base: &Path) -> Result<String, String> {
@@ -878,7 +878,7 @@ fn case_tmpfs_test_override(base: &Path) -> Result<String, String> {
 fn case_pf1(base: &Path) -> Result<String, String> {
     let root = new_root(base, "pf1")?;
     if side_path(&root, "wal").exists() || side_path(&root, "shm").exists() || side_path(&root, "journal").exists() {
-        return Err("new version-0 fixture unexpectedly retained side files".into());
+        return Err("new version-1 fixture unexpectedly retained side files".into());
     }
     store::test_api::clear();
     let instance = store::open_instance(&root).map_err(|e| e.to_string())?;
@@ -886,19 +886,19 @@ fn case_pf1(base: &Path) -> Result<String, String> {
     let version = store::test_api::user_version(&instance).map_err(|e| e.to_string())?;
     let objects = store::test_api::schema_objects(&instance).map_err(|e| e.to_string())?;
     instance.close().map_err(|e| e.to_string())?;
-    if events == ["stage-b-read-write"] && version == 0 && objects == 0 {
-        Ok("raw-header Stage A opened no SQLite connection; Stage B accepted empty version 0".into())
+    if events == ["stage-b-read-write"] && version == 1 && objects == 2 {
+        Ok("raw-header Stage A opened no SQLite connection; Stage B accepted current version 1".into())
     } else { Err(format!("events={events:?} version={version} objects={objects}")) }
 }
 
 fn case_pf2a(base: &Path) -> Result<String, String> {
     let root = new_root(base, "pf2a")?;
-    set_header_u32(&root, 60, 1)?;
+    set_header_u32(&root, 60, 2)?;
     let before = root_snapshot(&root)?;
     store::test_api::clear();
     let result = store::open_instance(&root);
     let events = store::test_api::connection_events();
-    if matches!(&result, Err(InstanceError::SchemaTooNew { found: 1, maximum: 0 }))
+    if matches!(&result, Err(InstanceError::SchemaTooNew { found: 2, maximum: 1 }))
         && events.is_empty() && before == root_snapshot(&root)? {
         Ok("future raw-header version refused without SQLite or inventory changes".into())
     } else { Err(format!("result={} events={events:?}", describe_instance_result(&result))) }
@@ -906,19 +906,19 @@ fn case_pf2a(base: &Path) -> Result<String, String> {
 
 fn case_pf2b(base: &Path) -> Result<String, String> {
     let root = new_root(base, "pf2b")?;
-    set_header_u32(&root, 60, 1)?;
+    set_header_u32(&root, 60, 2)?;
     fs::write(side_path(&root, "shm"), b"stale").map_err(|e| e.to_string())?;
     let before = root_snapshot(&root)?;
     store::test_api::clear();
     let result = store::open_instance(&root);
     let events = store::test_api::connection_events();
-    if matches!(&result, Err(InstanceError::SideFileStateUnverified { header_version: 1 }))
+    if matches!(&result, Err(InstanceError::SideFileStateUnverified { header_version: 2 }))
         && events.is_empty() && before == root_snapshot(&root)? {
         Ok("stale SHM without WAL refused before SQLite; inventory unchanged".into())
     } else { Err(format!("result={} events={events:?}", describe_instance_result(&result))) }
 }
 
-fn make_wal_version_one(root: &Path) -> Result<(), String> {
+fn make_wal_future(root: &Path) -> Result<(), String> {
     let mut command = child_command("wal-version", &[&db_path(root)])?;
     let status = command.status().map_err(|e| e.to_string())?;
     if status.success() && side_path(root, "wal").exists() { Ok(()) }
@@ -927,7 +927,7 @@ fn make_wal_version_one(root: &Path) -> Result<(), String> {
 
 fn case_pf3(base: &Path, keep_shm: bool) -> Result<String, String> {
     let root = new_root(base, if keep_shm { "pf3b" } else { "pf3a" })?;
-    make_wal_version_one(&root)?;
+    make_wal_future(&root)?;
     if !keep_shm && side_path(&root, "shm").exists() {
         fs::remove_file(side_path(&root, "shm")).map_err(|e| e.to_string())?;
     }
@@ -939,7 +939,7 @@ fn case_pf3(base: &Path, keep_shm: bool) -> Result<String, String> {
     let db_same = fs::read(db_path(&root)).map_err(|e| e.to_string())? == db_before;
     let wal_same = fs::read(side_path(&root, "wal")).map_err(|e| e.to_string())? == wal_before;
     match result {
-        Err(InstanceError::SchemaTooNew { found: 1, maximum: 0 }) if db_same && wal_same
+        Err(InstanceError::SchemaTooNew { found: 2, maximum: 1 }) if db_same && wal_same
             && events.iter().any(|event| *event == "stage-a-read-only") =>
             Ok(format!("WAL-only version was read; main and WAL preserved; shm_present={}", side_path(&root, "shm").exists())),
         other => Err(format!("result={} db_same={db_same} wal_same={wal_same} events={events:?}", describe_instance_result(&other))),
@@ -961,7 +961,7 @@ fn case_pf4(base: &Path) -> Result<String, String> {
 fn case_pf5(base: &Path) -> Result<String, String> {
     for wal in [false, true] {
         let root = new_root(base, "pf5")?;
-        if wal { make_wal_version_one(&root)?; }
+        if wal { make_wal_future(&root)?; }
         fs::write(root.join("instance.db-journal"), b"journal").map_err(|e| e.to_string())?;
         store::test_api::clear();
         let result = store::open_instance(&root);
@@ -1002,10 +1002,16 @@ fn case_pf6(base: &Path) -> Result<String, String> {
     Ok("header, page, and truncation corruption refused or classified; DB/WAL bytes retained".into())
 }
 
+fn legacy_root(base:&Path,label:&str)->Result<PathBuf,String>{
+    let root=new_root(base,label)?;
+    let c=Connection::open(db_path(&root)).map_err(|e|e.to_string())?;
+    c.execute_batch("DROP TABLE instance_meta; DROP TABLE yokai_schema_history; PRAGMA user_version=0;").map_err(|e|e.to_string())?;
+    drop(c);Ok(root)
+}
 fn case_pf8(base: &Path) -> Result<String, String> {
     // Only the literal sqlite_ prefix is reserved; sqliteevil is a legal user table.
     for table in ["planted", "sqliteevil", "SQLITEevil"] {
-        let root = new_root(base, "pf8")?;
+        let root = legacy_root(base, "pf8")?;
         let connection = Connection::open(db_path(&root)).map_err(|e| e.to_string())?;
         connection.execute_batch(&format!("CREATE TABLE {table}(id INTEGER);")).map_err(|e| e.to_string())?;
         drop(connection);
@@ -1042,12 +1048,12 @@ fn case_pf10(base: &Path) -> Result<String, String> {
     let result_b = store::open_instance(&root_b);
     let wal_still_empty = fs::metadata(side_path(&root_b, "wal")).map_err(|e| e.to_string())?.len() == 0;
     let root_c = new_root(base, "pf10c")?;
-    set_header_u32(&root_c, 60, 1)?;
+    set_header_u32(&root_c, 60, 2)?;
     let result_c = store::open_instance(&root_c);
     if wal_still_empty && result_b.is_ok()
-        && matches!(&result_c, Err(InstanceError::SchemaTooNew { found: 1, .. })) {
+        && matches!(&result_c, Err(InstanceError::SchemaTooNew { found: 2, .. })) {
         if let Ok(instance) = result_b { instance.close().map_err(|e| e.to_string())?; }
-        Ok("SHM-only refused; empty WAL retained; raw-header versions 0/1 followed policy".into())
+        Ok("SHM-only refused; empty WAL retained; current1/future2 followed policy".into())
     } else { Err(format!("empty_wal={} future={} retained={wal_still_empty}", describe_instance_result(&result_b), describe_instance_result(&result_c))) }
 }
 
@@ -1115,7 +1121,7 @@ fn case_pf13(_base: &Path) -> Result<String, String> {
 fn case_pf14(base: &Path) -> Result<String, String> {
     let mut effects = Vec::new();
     for table in ["planted", "sqliteevil", "SQLITEevil"] {
-        let root = new_root(base, "pf14")?;
+        let root = legacy_root(base, "pf14")?;
         let connection = Connection::open(db_path(&root)).map_err(|e| e.to_string())?;
         connection.execute_batch(&format!("CREATE TABLE {table}(id INTEGER);")).map_err(|e| e.to_string())?;
         drop(connection);
@@ -1139,7 +1145,7 @@ fn case_pf15(base: &Path) -> Result<String, String> {
     let after = root_snapshot(&root)?;
     if before.get("instance.db") == after.get("instance.db") {
         Ok(format!("normal Stage-B open/close measured {} before entries and {} after", before.len(), after.len()))
-    } else { Err("main database changed during version-0 Stage-B open/close".into()) }
+    } else { Err("main database changed during current-version Stage-B open/close".into()) }
 }
 
 fn case_pf16(base: &Path) -> Result<String, String> {
@@ -1168,18 +1174,18 @@ fn case_pf16(base: &Path) -> Result<String, String> {
 }
 
 fn case_pf17(base: &Path) -> Result<String, String> {
-    for value in [0, 1, 255, 256, 65_536, 16_777_216, u32::MAX] {
-        let root = new_root(base, "pf17")?;
+    for value in [0, 1, 2, 255, 256, 65_536, 16_777_216, u32::MAX] {
+        let root = if value==0 {legacy_root(base,"pf17")?}else{new_root(base,"pf17")?};
         set_header_u32(&root, 60, value)?;
         let result = store::open_instance(&root);
-        if value == 0 {
+        if value <= 1 {
             let instance = result.map_err(|e| e.to_string())?;
             instance.close().map_err(|e| e.to_string())?;
-        } else if !matches!(&result, Err(InstanceError::SchemaTooNew { found, maximum: 0 }) if *found == value) {
+        } else if !matches!(&result, Err(InstanceError::SchemaTooNew { found, maximum: 1 }) if *found == value) {
             return Err(format!("value {value} decoded incorrectly: {}", describe_instance_result(&result)));
         }
     }
-    Ok("big-endian user_version values 0, 1, 255, 256, 65536, 16777216, and u32::MAX decoded".into())
+    Ok("big-endian user_version values 0, 1, 2, 255, 256, 65536, 16777216, and u32::MAX decoded; valid V0 migrated and V1 accepted".into())
 }
 
 fn case_pf18(base: &Path) -> Result<String, String> {

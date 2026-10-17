@@ -78,7 +78,7 @@ pub fn capture_inventory(root: &Path) -> io::Result<FileInventory> {
     Ok(FileInventory { entries })
 }
 
-pub(crate) fn stage_a(root: &Path) -> Result<AcceptedPreflight, InstanceError> {
+pub(crate) fn stage_a(root: &Path, id: yokai_types::InstanceId, created: &str,plan:crate::schema::Plan) -> Result<AcceptedPreflight, InstanceError> {
     let before = capture_inventory(root)
         .map_err(|e| {
             if e.kind() == io::ErrorKind::NotFound { InstanceError::Incomplete(IncompleteReason::NoDatabase) }
@@ -101,9 +101,9 @@ pub(crate) fn stage_a(root: &Path) -> Result<AcceptedPreflight, InstanceError> {
         }
         if wal_present {
             validate_wal_header(&root.join("instance.db-wal"), page_size)?;
-            read_only_sqlite_check(&root.join("instance.db"))
-        } else if header_version > 0 {
-            Err(InstanceError::SchemaTooNew { found: header_version, maximum: 0 })
+            read_only_sqlite_check(&root.join("instance.db"), id, created,plan)
+        } else if header_version > plan.latest() {
+            Err(InstanceError::SchemaTooNew { found: header_version, maximum: plan.latest() })
         } else {
             Ok(())
         }
@@ -213,11 +213,11 @@ fn wal_checksum(bytes: &[u8], big_endian: bool) -> Option<(u32, u32)> {
     Some((s0, s1))
 }
 
-fn read_only_sqlite_check(path: &Path) -> Result<(), InstanceError> {
+fn read_only_sqlite_check(path: &Path, id: yokai_types::InstanceId, created: &str,plan:crate::schema::Plan) -> Result<(), InstanceError> {
     #[cfg(feature = "test-api")]
     crate::failpoint::record_connection("stage-a-read-only");
     let flags = OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NOFOLLOW | OpenFlags::SQLITE_OPEN_NO_MUTEX;
-    let opened = Connection::open_with_flags(path, flags)
+    let mut opened = Connection::open_with_flags(path, flags)
         .map_err(|e| InstanceError::PreflightUnavailable(e.to_string()))?;
     opened.set_db_config(DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE, true)
         .map_err(|e| InstanceError::PreflightUnavailable(e.to_string()))?;
@@ -225,33 +225,16 @@ fn read_only_sqlite_check(path: &Path) -> Result<(), InstanceError> {
         .map_err(|e| InstanceError::PreflightUnavailable(e.to_string()))?;
     opened.execute_batch("PRAGMA query_only = ON; PRAGMA trusted_schema = OFF;")
         .map_err(|e| InstanceError::PreflightUnavailable(e.to_string()))?;
-    let result = inspect_read_only(&opened);
+    // Pin all compatibility queries to one consistent SQLite read snapshot.
+    let tx=opened.transaction().map_err(|e|InstanceError::PreflightUnavailable(e.to_string()))?;
+    let result = crate::schema::inspect(&tx,id,created,plan).map(|_| ());
+    tx.rollback().map_err(|e|InstanceError::PreflightUnavailable(e.to_string()))?;
     drop(opened);
     result
 }
 
-fn inspect_read_only(conn: &Connection) -> Result<(), InstanceError> {
-    let version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))
-        .map_err(|e| InstanceError::PreflightUnavailable(e.to_string()))?;
-    if version < 0 { return Err(InstanceError::SchemaInconsistent(format!("negative user_version {version}"))); }
-    if version > 0 { return Err(InstanceError::SchemaTooNew { found: version as u32, maximum: 0 }); }
-    let objects: i64 = conn.query_row("SELECT count(*) FROM sqlite_schema WHERE lower(substr(name, 1, 7)) <> 'sqlite_'", [], |row| row.get(0))
-        .map_err(|e| InstanceError::PreflightUnavailable(e.to_string()))?;
-    if objects != 0 { return Err(InstanceError::SchemaInconsistent(format!("{objects} schema objects at version 0"))); }
-    // Schema version 0 has no refinery history or instance_meta table; those checks begin in 1.2.
-    let mut statement = conn.prepare("PRAGMA integrity_check")
-        .map_err(|e| InstanceError::PreflightUnavailable(e.to_string()))?;
-    let rows = statement.query_map([], |row| row.get::<_, String>(0))
-        .map_err(|e| InstanceError::PreflightUnavailable(e.to_string()))?;
-    let results: Result<Vec<String>, _> = rows.collect();
-    let results = results.map_err(|e| InstanceError::PreflightUnavailable(e.to_string()))?;
-    if results.len() != 1 || results[0] != "ok" {
-        return Err(InstanceError::Integrity(format!("{results:?}")));
-    }
-    let violations = crate::foreign_key_violations(conn)
-        .map_err(|e| InstanceError::PreflightUnavailable(e.to_string()))?;
-    if !violations.is_empty() { return Err(InstanceError::ForeignKeyViolations(violations)); }
-    Ok(())
+pub(crate) fn sha256_bytes(bytes: &[u8]) -> String {
+    let mut hash = Sha256::new(); hash.update(bytes); hash.finish()
 }
 
 #[cfg(feature = "test-api")]
@@ -273,7 +256,7 @@ fn hash_file(path: &Path) -> io::Result<String> {
     Ok(hash.finish())
 }
 
-/// Small streaming SHA-256 implementation used only for read-only inventory evidence.
+/// Small streaming SHA-256 implementation for inventories and migration drift detection.
 struct Sha256 {
     state: [u32; 8],
     buffer: [u8; 64],
