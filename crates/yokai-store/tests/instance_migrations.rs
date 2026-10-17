@@ -269,7 +269,7 @@ fn check_interruption_v2()->Result<String,String>{interruptions(2)}
 
 fn check_transaction_fk()->Result<String,String>{
     let dir=parent("transaction-fk")?;
-    let mut c=store::create_file(&dir.join("fk.db")).map_err(|e|e.to_string())?;
+    let mut c=store::test_api::create_file(&dir.join("fk.db")).map_err(|e|e.to_string())?;
     c.execute_batch("CREATE TABLE p(id INTEGER PRIMARY KEY) STRICT; CREATE TABLE immediate_child(id INTEGER PRIMARY KEY, p INTEGER REFERENCES p(id)) STRICT; CREATE TABLE deferred_child(id INTEGER PRIMARY KEY, p INTEGER REFERENCES p(id) DEFERRABLE INITIALLY DEFERRED) STRICT;").map_err(|e|e.to_string())?;
     let immediate=c.execute("INSERT INTO immediate_child VALUES(1,99)",[]).err().ok_or("immediate FK insert accepted")?;
     if store::ext_code(&immediate)!=Some(787){return Err(format!("wrong immediate FK error: {immediate}"));}

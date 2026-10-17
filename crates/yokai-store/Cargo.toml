@@ -30,10 +30,17 @@ test-api = ["yokai-platform/test-api"]
 name = "sqlite_runtime"
 path = "tests/sqlite_runtime.rs"
 harness = false
+required-features = ["test-api"]
 
 [[test]]
 name = "instance_lifecycle"
 path = "tests/instance_lifecycle.rs"
+harness = false
+required-features = ["test-api"]
+
+[[test]]
+name = "store_runtime"
+path = "tests/store_runtime.rs"
 harness = false
 required-features = ["test-api"]
 
