@@ -58,6 +58,7 @@ mod native {
             ("WV-LOCK-SOAK",lock_soak),
             ("WV-RESOURCE-COUNTS",resource_counts),
             ("WV-PREFLIGHT-CORRUPTION",preflight_corruption),
+            ("WV-RAW-HEADER",raw_headers),
         ];
         let selected:Vec<_>=match args.as_slice(){
             [_]=>checks.iter().collect(),
@@ -181,6 +182,12 @@ mod native {
                     let before=access_snapshot(root)?;let outcome=corruption_refusal(root,case,page)?;let after=access_snapshot(root)?;
                     semantic_preserved(&before,&after,case=="leaf")?;
                     println!("INFO WV corruption_child case={case} outcome={outcome} exact_refusal=true protected_bytes_unchanged=true inventory_before={:?} inventory_after={:?}",stageb_inventory(&before)?,stageb_inventory(&after)?);
+                },
+                "__raw_header_refusal"=>{
+                    let case=args.get(3).ok_or("missing raw-header case")?;
+                    let before=access_snapshot(root)?;let outcome=raw_header_refusal(root,case)?;let after=access_snapshot(root)?;
+                    if before!=after{return Err("raw-header child changed complete closed bytes/names/types".into());}
+                    println!("INFO WV raw_header_child case={case} outcome={outcome} sqlite_events=[] exact_refusal=true complete_closed_bytes_unchanged=true inventory_before={:?} inventory_after={:?}",stageb_inventory(&before)?,stageb_inventory(&after)?);
                 },
                 "__close_error"=>{
                     store::test_api::fail_startup_close_once();
@@ -1141,6 +1148,78 @@ mod native {
             println!("INFO WV preflight_corruption fixture={} case={case} pristine={} healthy={} baseline={} after={} child_after={} child_logs={} runs_page={page} meta_page={meta_page} frame_pages={frame_pages:?} commit_pages=13 marker={MARKER} original_bytes={} damaged_bytes={} fault_offset={} outcome={outcome} allow_shm={allow_shm} healthy_control_version=2 healthy_control_integrity=ok main_WAL_protected=true all_copies_verified=true exclusive_data_opens=allowed child_lock_reacquired=true shm_changed={} child_shm_changed={} inventory_before={:?} inventory_after={:?} inventory_child_after={:?}",root.display(),original.display(),healthy_copy.display(),baseline.display(),final_copy.display(),child_copy.display(),logs.display(),main.len(),before.get("instance.db").and_then(Option::as_ref).ok_or("missing damaged main")?.len(),if case=="leaf"{offset+7}else{0},before.get("instance.db-shm")!=after.get("instance.db-shm"),after.get("instance.db-shm")!=child_after.get("instance.db-shm"),stageb_inventory(&before)?,stageb_inventory(&after)?,stageb_inventory(&child_after)?);
         }
         Ok("three genuine committed-WAL main faults: exact header-magic and half-length refusals before SQLite, one-byte non-header leaf Integrity via Stage-A read-only; healthy marker control, all retained/protected bytes, inventories and fresh-child ownership verified; no full corruption/PF6/W2 acceptance".into())
+    }
+
+    fn raw_header_case(case:&str)->Result<(Option<&'static str>,u32),String>{
+        let field=match case {
+            "magic"=>Some("magic"),"page-1000"|"page-65535"=>Some("page size"),
+            "format"=>Some("read/write format versions"),"reserved"=>Some("reserved bytes"),
+            "fractions"=>Some("payload fractions"),"schema"=>Some("schema format"),
+            "encoding"=>Some("text encoding"),"length"=>Some("database length"),
+            "version-3"|"version-255"|"version-256"|"version-65536"|"version-16777216"|"version-4294967295"=>None,
+            _=>return Err(format!("unknown raw-header case {case}")),
+        };
+        let value=if field.is_some(){u32::MAX}else{case.strip_prefix("version-").ok_or("missing version label")?.parse::<u32>().map_err(|e|e.to_string())?};
+        Ok((field,value))
+    }
+    fn raw_header_refusal(root:&Path,case:&str)->Result<String,String>{
+        let (field,value)=raw_header_case(case)?;
+        store::test_api::clear();let result=store::open_instance(root);let events=store::test_api::connection_events();
+        let outcome=match (field,result) {
+            (Some(expected),Err(InstanceError::HeaderInvalid(actual))) if actual==expected=>format!("HeaderInvalid({actual})"),
+            (None,Err(InstanceError::SchemaTooNew{found,maximum:2})) if found==value=>format!("SchemaTooNew({found},2)"),
+            (_,Ok(i))=>{i.close().map_err(|e|e.to_string())?;return Err(format!("raw-header {case} unexpectedly opened; events={events:?}"));},
+            (_,Err(error))=>return Err(format!("raw-header {case} wrong refusal {error:?}; events={events:?}")),
+        };
+        if !events.is_empty(){return Err(format!("raw-header {case} opened a connection: {events:?}"));}
+        Ok(outcome)
+    }
+    fn raw_headers()->Result<String,String>{
+        for case in ["magic","page-1000","page-65535","format","reserved","fractions","schema","encoding","length",
+            "version-3","version-255","version-256","version-65536","version-16777216","version-4294967295"] {
+            let (field,value)=raw_header_case(case)?;
+            let i=instance("raw-header")?;let root=i.root().to_owned();
+            if store::test_api::user_version(&i).map_err(|e|e.to_string())?!=2{return Err("raw-header pristine control is not V2".into());}
+            i.close().map_err(|e|e.to_string())?;
+            let pristine=access_snapshot(&root)?;
+            if pristine.keys().map(String::as_str).collect::<Vec<_>>()!=["instance.db","instance.id","instance.lock"]
+                || pristine.get("instance.lock")!=Some(&Some(Vec::new())){return Err("raw-header pristine has extras/side files/nonempty lock".into());}
+            let main=pristine.get("instance.db").and_then(Option::as_ref).ok_or("raw-header pristine main missing")?;
+            if main.len()<100 || main.len()%4096!=0 || &main[..16]!=b"SQLite format 3\0"
+                || main[16..24]!=[0x10,0,2,2,0,64,32,32] || main[44..48]!=4u32.to_be_bytes()
+                || main[56..60]!=1u32.to_be_bytes() || main[60..64]!=2u32.to_be_bytes(){return Err("raw-header pristine encoding/layout differs".into());}
+            let original=retain_damage_snapshot(&root,"retained-header-pristine",&pristine)?;
+            let mut edited=main.clone();edited[60..64].copy_from_slice(&value.to_be_bytes());
+            match case {
+                "magic"=>edited[0]^=1,
+                "page-1000"=>edited[16..18].copy_from_slice(&1000u16.to_be_bytes()),
+                "page-65535"=>edited[16..18].copy_from_slice(&u16::MAX.to_be_bytes()),
+                "format"=>{edited[18]=3;edited[19]=3;},"reserved"=>edited[20]=8,
+                "fractions"=>edited[21]=65,"schema"=>edited[44..48].copy_from_slice(&5u32.to_be_bytes()),
+                "encoding"=>edited[56..60].copy_from_slice(&2u32.to_be_bytes()),
+                "length"=>{edited.pop().ok_or("raw-header main empty")?;},
+                _ if field.is_none()=>{},_=>return Err("raw-header mutation case differs".into()),
+            }
+            fs::write(root.join("instance.db"),&edited).map_err(|e|e.to_string())?;
+            let before=access_snapshot(&root)?;let mut expected=pristine.clone();expected.insert("instance.db".into(),Some(edited));
+            if before!=expected{return Err("raw-header setup changed another entry".into());}
+            let baseline=retain_damage_snapshot(&root,"retained-header-before",&before)?;
+            let outcome=raw_header_refusal(&root,case)?;let after=access_snapshot(&root)?;
+            if before!=after{return Err("raw-header parent refusal changed closed bytes/names/types".into());}
+            let final_copy=retain_damage_snapshot(&root,"retained-header-after",&after)?;stageb_released(&root)?;
+            let mut probe=command("__raw_header_refusal",&root)?;probe.arg(case);
+            let (mut child,logs)=launch(probe,"raw-header-probe")?;
+            if !wait(&mut child,Duration::from_secs(15))?.success(){return Err(format!("raw-header child failed; logs={}",logs.display()));}
+            let repeated=access_snapshot(&root)?;
+            if after!=repeated{return Err("raw-header child refusal changed closed bytes/names/types".into());}
+            stageb_released(&root)?;
+            let child_copy=retain_damage_snapshot(&root,"retained-header-child-after",&repeated)?;
+            for (snapshot,path) in [(&pristine,&original),(&before,&baseline),(&after,&final_copy),(&repeated,&child_copy)] {
+                if access_snapshot(path)?!=*snapshot{return Err("raw-header retained copy differs".into());}
+            }
+            println!("INFO WV raw_header fixture={} case={case} pristine={} baseline={} after={} child_after={} child_logs={} header_version={value} original_bytes={} altered_bytes={} outcome={outcome} sqlite_events=[] complete_closed_bytes_unchanged=true side_files_absent=true all_copies_verified=true exclusive_data_opens=allowed child_lock_reacquired=true inventory_before={:?} inventory_after={:?} inventory_child_after={:?}",root.display(),original.display(),baseline.display(),final_copy.display(),child_copy.display(),logs.display(),main.len(),before.get("instance.db").and_then(Option::as_ref).ok_or("missing raw-header main")?.len(),stageb_inventory(&before)?,stageb_inventory(&after)?,stageb_inventory(&repeated)?);
+        }
+        Ok("nine exact malformed raw-header fields with max-version precedence and six future big-endian versions refused before SQLite;180 retained files, complete closed inventories and fresh-child ownership verified;65535 is the actual malformed upper page encoding, not131072; accepted0/1/2 and exhaustive PF16/PF17/W2 remain separate".into())
     }
 
     fn lock_soak()->Result<String,String>{
