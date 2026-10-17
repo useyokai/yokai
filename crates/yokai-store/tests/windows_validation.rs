@@ -47,6 +47,8 @@ mod native {
             ("WV-PREFLIGHT-DAMAGE",preflight_damage),
             ("WV-PREFLIGHT-CONSISTENCY",preflight_consistency),
             ("WV-PREFLIGHT-ACL",preflight_acl),
+            ("WV-STAGEB-REFUSALS",stageb_refusals),
+            ("WV-STAGEB-LEGACY",stageb_legacy),
             ("WV-LOCK-SOAK",lock_soak),
         ];
         let selected:Vec<_>=match args.as_slice(){
@@ -108,6 +110,12 @@ mod native {
                         let count:i64=c.query_row(&format!("SELECT count(*) FROM {table}"),[],|r|r.get(0)).map_err(|e|e.to_string())?;
                         if count!=1{return Err(format!("truth {table}={count}"));}
                     }
+                },
+                "__stageb_refusal"=>{
+                    let expected=args.get(3).ok_or("missing Stage-B expected cause")?;
+                    let before=access_snapshot(root)?;let (cause,effects)=stageb_refusal(root)?;
+                    if &cause!=expected || access_snapshot(root)?!=before || effects!="no inventory changes"{return Err(format!("child Stage-B cause={cause:?} effects={effects:?}"));}
+                    println!("INFO WV stageb_child cause={cause:?} effects={effects:?} exact_refusal=true lock_reacquired=true complete_bytes_unchanged=true");
                 },
                 "__close_error"=>{
                     store::test_api::fail_startup_close_once();
@@ -752,6 +760,130 @@ mod native {
             println!("INFO WV preflight_acl fixture={} case={case} pristine={} baseline={} journal={} raw_access_error=5 refusal=PreflightUnavailable sqlite_events={events:?} complete_refusal_entries_bytes_unchanged=true retained_copies_verified=true original_scoped_acl_rules_restored=true acl_control_effects_recorded=true released_exclusive_opens=allowed control_before=SchemaTooNew4 control_after=SchemaTooNew4 control_sqlite_events=[stage-a-read-only] control_shm_created={} reason={reason:?}",root.display(),original.display(),retained.display(),journal.display(),!before.contains_key("instance.db-shm") && after.contains_key("instance.db-shm"));
         }
         Ok("current-SID non-inheriting ReadData deny on main/SHM and directory CreateFiles/CreateDirectories deny with SHM absent: raw access-denied5 and exact PreflightUnavailable/no writable fallback; complete refusal bytes/copies and original permission ACEs/protection restored, auto-inheritance initialization recorded, released handles and read-only WAL4 controls verified; owned Windows fixtures only, not full descriptor restoration, Unix mode000 or full PF13/W2 acceptance".into())
+    }
+    fn stageb_inventory(snapshot:&BTreeMap<String,Option<Vec<u8>>>)->Result<store::FileInventory,String>{
+        let mut entries=Vec::new();
+        for name in ["instance.db","instance.db-wal","instance.db-shm","instance.db-journal"] {
+            let bytes=match snapshot.get(name){Some(Some(bytes))=>Some(bytes),None=>None,_=>return Err("Stage-B inventory entry is not a regular file".into())};
+            entries.push(store::InventoryEntry{name:name.into(),exists:bytes.is_some(),entry_type:bytes.map(|_|"regular".into()),
+                size:bytes.map_or(0,|b|b.len() as u64),sha256:bytes.map(|b|store::test_api::sha256_chunks_for_test(&[b.as_slice()]))});
+        }
+        Ok(store::FileInventory{entries})
+    }
+    fn stageb_refusal(root:&Path)->Result<(String,String),String>{
+        let before=access_snapshot(root)?;let inventory=stageb_inventory(&before)?;
+        store::test_api::clear();let result=store::open_instance(root);let events=store::test_api::connection_events();
+        let (cause,effects)=match result {
+            Err(InstanceError::StageB{cause,observed_effects})=>(cause,observed_effects),
+            Ok(i)=>{i.close().map_err(|e|e.to_string())?;return Err(format!("Stage-B fixture unexpectedly opened: {events:?}"));},
+            Err(e)=>return Err(format!("wrong Stage-B envelope: {e:?}; events={events:?}")),
+        };
+        if events!=["stage-b-read-write"]{return Err(format!("Stage-B used wrong connection path: {events:?}"));}
+        let after=access_snapshot(root)?;let measured=inventory.describe_difference(&stageb_inventory(&after)?);
+        if effects!=measured{return Err(format!("Stage-B observed_effects={effects:?} measured={measured:?}"));}
+        Ok((cause,effects))
+    }
+    fn stageb_released(root:&Path)->Result<(),String>{
+        for (name,bytes) in access_snapshot(root)? {
+            if bytes.is_some(){drop(OpenOptions::new().read(true).write(true).share_mode(0).open(root.join(name)).map_err(|e|format!("Stage-B retained data handle: {e}"))?);}
+        }
+        Ok(())
+    }
+    fn stageb_refusals()->Result<String,String>{
+        for case in ["foreign-key","identity","objects-v0","corrupt-page"] {
+            let i=instance("stageb-refusal")?;let root=i.root().to_owned();i.close().map_err(|e|e.to_string())?;
+            let pristine=access_snapshot(&root)?;let original=retain_damage_snapshot(&root,"retained-stageb-pristine",&pristine)?;
+            if pristine.keys().map(String::as_str).collect::<Vec<_>>()!=["instance.db","instance.id","instance.lock"]{return Err("Stage-B pristine fixture has side files or extras".into());}
+            let c=Connection::open_with_flags(root.join("instance.db"),OpenFlags::SQLITE_OPEN_READ_WRITE|OpenFlags::SQLITE_OPEN_NO_MUTEX).map_err(|e|e.to_string())?;
+            let mut corrupt_page=0i64;
+            let expected=match case {
+                "foreign-key"=>{
+                    c.execute_batch("PRAGMA foreign_keys=OFF; INSERT INTO events(seq,run_id,kind,detail,epoch) VALUES(900001,987654321,'stageb.orphan','owned fixture',1);").map_err(|e|e.to_string())?;
+                    let violations=store::test_api::foreign_key_violations(&c).map_err(|e|e.to_string())?;
+                    let exact=vec!["events rowid=Some(900001) parent=runs fkid=0".to_owned()];
+                    if violations!=exact{return Err(format!("Stage-B FK fixture differs: {violations:?}"));}
+                    format!("foreign-key violations: {exact:?}")
+                },
+                "identity"=>{
+                    c.execute_batch("UPDATE instance_meta SET instance_id=zeroblob(16) WHERE id=1;").map_err(|e|e.to_string())?;
+                    "Instance identity does not match its directory".into()
+                },
+                "objects-v0"=>{
+                    c.execute_batch("DROP TABLE events; DROP TABLE jobs; DROP TABLE commands; DROP TABLE runs; DROP TABLE runtime_epoch; DROP TABLE instance_meta; DROP TABLE yokai_schema_history; CREATE TABLE planted(id INTEGER); PRAGMA user_version=0;").map_err(|e|e.to_string())?;
+                    "inconsistent schema: 1 schema objects at version 0".into()
+                },
+                "corrupt-page"=>{
+                    corrupt_page=c.query_row("SELECT rootpage FROM sqlite_schema WHERE name='runs'",[],|r|r.get(0)).map_err(|e|e.to_string())?;
+                    if corrupt_page<=1{return Err("corruption target is not a non-header runs rootpage".into());}
+                    "inconsistent schema: database disk image is malformed".into()
+                },_=>unreachable!(),
+            };
+            c.close().map_err(|(_,e)|e.to_string())?;
+            if corrupt_page>0 {
+                let path=root.join("instance.db");let mut bytes=fs::read(&path).map_err(|e|e.to_string())?;
+                let page_size=match bytes.get(16..18){Some(b)=>u16::from_be_bytes([b[0],b[1]]) as usize,None=>return Err("short Stage-B database".into())};
+                let page_size=if page_size==1{65536}else{page_size};let offset=(corrupt_page as usize-1).checked_mul(page_size).ok_or("corrupt offset overflow")?;
+                if bytes.get(offset)!=Some(&13){return Err("Stage-B corruption target is not a table-leaf page".into());}
+                bytes[offset]=0;fs::write(path,bytes).map_err(|e|e.to_string())?;
+            }
+            let before=access_snapshot(&root)?;
+            if before.keys().map(String::as_str).collect::<Vec<_>>()!=["instance.db","instance.id","instance.lock"]{return Err("Stage-B baseline has side files or extras".into());}
+            let retained=retain_damage_snapshot(&root,"retained-stageb-before",&before)?;
+            let (cause,effects)=stageb_refusal(&root)?;let after=access_snapshot(&root)?;
+            if cause!=expected{return Err(format!("{case} Stage-B cause={cause:?}; expected={expected:?}; effects={effects:?}"));}
+            if before!=after{return Err(format!("{case} Stage-B refusal changed complete entries/bytes: {effects}"));}
+            let final_copy=retain_damage_snapshot(&root,"retained-stageb-after",&after)?;
+            for (snapshot,path) in [(&pristine,&original),(&before,&retained),(&after,&final_copy)] {
+                if access_snapshot(path)?!=*snapshot{return Err("Stage-B retained copy differs".into());}
+            }
+            stageb_released(&root)?;
+            let mut cmd=command("__stageb_refusal",&root)?;cmd.arg(&expected);let (mut child,logs)=launch(cmd,"stageb-probe")?;
+            if !wait(&mut child,Duration::from_secs(15))?.success(){return Err(format!("Stage-B repeat opener failed; logs={}",logs.display()));}
+            if access_snapshot(&root)?!=after{return Err("Stage-B child repeat changed root bytes".into());}
+            println!("INFO WV stageb_refusal fixture={} case={case} pristine={} baseline={} after={} corrupt_page={corrupt_page} cause={cause:?} observed_effects={effects:?} sqlite_events=[stage-b-read-write] complete_entries_bytes_unchanged=true retained_copies_verified=true exclusive_data_opens=allowed child_lock_reacquired=true child_logs={} inventory_before={:?} inventory_after={:?}",root.display(),original.display(),retained.display(),final_copy.display(),logs.display(),stageb_inventory(&before)?,stageb_inventory(&after)?);
+        }
+        Ok("four owned Windows raw-header-accepted Stage-B refusals: exact FK/identity/version0-objects/corrupt-page causes and measured effects, all pristine/before/after bytes retained, data handles and fresh-child lock reacquisition checked; no full PF14/W2 acceptance".into())
+    }
+    fn stageb_active_snapshot(root:&Path)->Result<BTreeMap<String,Option<Vec<u8>>>,String>{
+        let mut snapshot=BTreeMap::new();let mut lock_denied=false;
+        for item in fs::read_dir(root).map_err(|e|e.to_string())? {
+            let item=item.map_err(|e|e.to_string())?;let path=item.path();
+            let name=item.file_name().into_string().map_err(|_|"non-UTF8 active legacy entry")?;
+            let meta=fs::symlink_metadata(&path).map_err(|e|format!("active legacy {name} metadata: {e}"))?;
+            yokai_platform::location::validate_regular_single_link(&path,&meta).map_err(|e|e.to_string())?;
+            if name=="instance.lock" {
+                match fs::read(&path){Err(e) if e.raw_os_error()==Some(32)=>lock_denied=true,Err(e)=>return Err(format!("active legacy lock wrong denial: {e}")),Ok(_)=>return Err("active legacy lock unexpectedly readable".into())}
+            }else{snapshot.insert(name.clone(),Some(fs::read(path).map_err(|e|format!("active legacy {name} read: {e}"))?));}
+        }
+        if !lock_denied || snapshot.keys().map(String::as_str).collect::<Vec<_>>()!=["instance.db","instance.db-shm","instance.db-wal","instance.id"]{return Err("active legacy expected exact data files and sharing-denied32 lock".into());}
+        Ok(snapshot)
+    }
+    fn stageb_legacy()->Result<String,String>{
+        let source=PathBuf::from(std::env::var_os("YOKAI_TEST_V0_FIXTURE").ok_or("missing pinned V0 fixture")?);
+        let original=access_snapshot(&source)?;
+        if original.keys().map(String::as_str).collect::<Vec<_>>()!=["instance.db","instance.id","instance.lock"]{return Err("legacy source fixture has unexpected entries".into());}
+        let name=source.file_name().and_then(|s|s.to_str()).ok_or("legacy fixture name invalid")?;
+        if name.len()!=32 || !name.bytes().all(|b|b.is_ascii_digit() || (b'a'..=b'f').contains(&b)){return Err("legacy fixture identity directory invalid".into());}
+        let root=parent("stageb-legacy")?.join(name);fs::create_dir(&root).map_err(|e|e.to_string())?;
+        for (name,bytes) in &original {
+            let mut copy=File::create_new(root.join(name)).map_err(|e|e.to_string())?;
+            copy.write_all(bytes.as_ref().ok_or("legacy source contains a directory")?).map_err(|e|e.to_string())?;copy.sync_all().map_err(|e|e.to_string())?;
+        }
+        let before=access_snapshot(&root)?;if before!=original{return Err("legacy copied bytes differ".into());}
+        let retained=retain_damage_snapshot(&root,"retained-legacy-before",&before)?;
+        store::test_api::clear();let i=store::test_api::open_test_versions(&root,0,false).map_err(|e|e.to_string())?;
+        if store::test_api::user_version(&i).map_err(|e|e.to_string())?!=0 || store::test_api::schema_objects(&i).map_err(|e|e.to_string())?!=0 || i.startup_report().is_some(){return Err("legacy control upgraded or has startup/schema state".into());}
+        let open_events=store::test_api::connection_events();if open_events!=["stage-b-read-write"]{return Err(format!("legacy open events differ: {open_events:?}"));}
+        let active=stageb_active_snapshot(&root)?;let active_copy=retain_damage_snapshot(&root,"retained-legacy-active",&active)?;
+        for (name,bytes) in &before{if name!="instance.lock" && active.get(name)!=Some(bytes){return Err("legacy active control changed original bytes".into());}}
+        i.close().map_err(|e|e.to_string())?;
+        let close_events=store::test_api::connection_events();if close_events!=["connection-closed","lock-released"]{return Err(format!("legacy close events differ: {close_events:?}"));}
+        let after=access_snapshot(&root)?;let after_copy=retain_damage_snapshot(&root,"retained-legacy-after",&after)?;
+        if before!=after || access_snapshot(&source)?!=original{return Err("legacy close or original fixture bytes changed".into());}
+        for (snapshot,path) in [(&before,&retained),(&active,&active_copy),(&after,&after_copy)]{if access_snapshot(path)?!=*snapshot{return Err("legacy retained snapshot differs".into());}}
+        stageb_released(&root)?;
+        println!("INFO WV stageb_legacy source={} fixture={} baseline={} active={} after={} version=0 objects=0 startup_report=none open_events={open_events:?} close_events={close_events:?} complete_closed_bytes_unchanged=true source_unchanged=true retained_copies_verified=true exclusive_data_opens=allowed active_lock_read=not_checked active_lock_raw_error=32 active_root_names_types=verified inventory_before={:?} inventory_active={:?} inventory_after={:?}",source.display(),root.display(),retained.display(),active_copy.display(),after_copy.display(),stageb_inventory(&before)?,stageb_inventory(&active)?,stageb_inventory(&after)?);
+        Ok("copied accepted V0 fixture opens through current shared code with test-only empty migration plan; version0/zero objects/no startup report, explicit close and exact closed bytes/source preserved; active versus closed side files retained, not a historical binary rerun or non-mutating V2 startup claim".into())
     }
     fn lock_soak()->Result<String,String>{
         let start=Instant::now();let i=instance("lock-soak")?;let root=i.root().to_owned();let until=Instant::now()+Duration::from_secs(20);let mut rounds=0;

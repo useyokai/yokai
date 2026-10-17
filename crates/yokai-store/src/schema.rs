@@ -30,7 +30,7 @@ pub(crate) fn test_plan(latest:u32,fail:bool)->Result<Plan,InstanceError>{
     const PROBE:Migration=Migration{version:3,name:"migration_probe",sql:"CREATE TABLE migration_probe (id INTEGER PRIMARY KEY, value TEXT NOT NULL) STRICT; PRAGMA user_version = 3;"};
     const FAIL:Migration=Migration{version:3,name:"migration_probe",sql:"CREATE TABLE migration_probe (id INTEGER PRIMARY KEY, value TEXT NOT NULL) STRICT; INSERT INTO missing_table VALUES(1); PRAGMA user_version = 3;"};
     const DATA:Migration=Migration{version:4,name:"probe_data",sql:"INSERT INTO migration_probe VALUES(1,'retained'); PRAGMA user_version = 4;"};
-    match (latest,fail){(1,false)=>Ok(Plan(&[FIRST])),(2,false)=>Ok(production()),(3,false)=>Ok(Plan(&[FIRST,SECOND,PROBE])),(3,true)=>Ok(Plan(&[FIRST,SECOND,FAIL])),(4,false)=>Ok(Plan(&[FIRST,SECOND,PROBE,DATA])),_=>Err(migration("invalid test-only plan"))}
+    match (latest,fail){(0,false)=>Ok(Plan(&[])),(1,false)=>Ok(Plan(&[FIRST])),(2,false)=>Ok(production()),(3,false)=>Ok(Plan(&[FIRST,SECOND,PROBE])),(3,true)=>Ok(Plan(&[FIRST,SECOND,FAIL])),(4,false)=>Ok(Plan(&[FIRST,SECOND,PROBE,DATA])),_=>Err(migration("invalid test-only plan"))}
 }
 
 fn inconsistent(e: impl ToString) -> InstanceError { InstanceError::SchemaInconsistent(e.to_string()) }

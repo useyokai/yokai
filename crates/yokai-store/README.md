@@ -324,3 +324,33 @@ Stage-A read-only inspection classifies SQLite CANTOPEN and READONLY errors as
 `PreflightUnavailable`, preserving their diagnostic codes. These access failures
 do not establish schema inconsistency. Other inspection callers and semantic
 schema/identity/integrity refusals retain their existing classifications.
+
+### Windows Stage-B inventories and legacy control
+
+`WV-STAGEB-REFUSALS` constructs four independent closed owned fixtures with
+valid supported raw headers and no side files: a V2 foreign-key orphan, V2
+metadata identity mismatch, version0 with a planted schema object, and a damaged
+non-header table page. Each must reach exactly Stage-B read/write and return
+the existing `StageB` envelope with its expected cause. Its `observed_effects`
+must equal the measured before/after inventory. Complete pristine, altered and
+post-refusal files are retained; main/identity/lock bytes, side-file existence,
+exclusive data opens and a fresh child repeating the refusal are checked.
+The recorded closed snapshots establish only the effects they show; they do
+not prove that SQLite made no transient filesystem writes while opening.
+
+`WV-STAGEB-LEGACY` copies the pinned accepted version0 fixture into a fresh
+owned root. The existing diagnostic `open_test_versions` interface now accepts
+an empty version0 plan only under `test-api`; production still selects V2.
+This control requires version0, zero schema objects and no startup report,
+then explicitly checks close success. Before/open/after files and inventories
+are retained, including any active WAL/SHM and their later removal. Complete
+closed bytes and the original source fixture must remain unchanged. Active
+root names/types are checked, but the owned lock must deny reads with Windows32;
+its content is compared only in the complete closed snapshots. Active retained
+files exclude that unreadable lock rather than substituting its earlier bytes.
+
+These are current shared-code observations on one Windows host. The legacy
+control is not a historical-binary rerun and does not claim that normal V2
+startup is non-mutating: V2 startup commits an epoch and event. Other malformed
+layouts, close/crash windows, metadata/ADS/identity guarantees and complete
+PF-14/PF-15/W2 or product acceptance remain separate qualification work.
