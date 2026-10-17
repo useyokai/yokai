@@ -213,3 +213,21 @@ This new observation does not change the scope of earlier Unix-only R12 runs.
 The runtime harnesses treat only `NotFound` metadata errors as absence;
 invalid paths and other I/O errors fail the observation. A dangling link itself
 is present, even when its target is absent.
+
+### SQLite open-file observations
+
+`WV-SQLITE-FILES` uses fresh synthetic SQLite files outside Instance roots.
+It checks rename/delete refusal for main/WAL/SHM files with an active WAL
+writer and with a read-only transaction after the writer closes. A separate
+rollback-journal fixture checks main/journal files during a write transaction
+and the main file with the retained reader. The rollback mode is diagnostic;
+the production store still uses WAL.
+
+Readable bytes are retained before probes and compared afterward, alongside
+file metadata. An exact Windows byte-range error33 while reading SHM is
+reported as byte-unverified; metadata equality does not prove stable object
+identity. Other observation errors fail the check. The harness verifies real
+rollback, the literal committed row, handle release and a fresh integrity
+check. SQLite's own side-file cleanup is recorded separately. These bounded
+observations do not implement Instance/root discard or establish every open
+file, hostile-race or durability guarantee.

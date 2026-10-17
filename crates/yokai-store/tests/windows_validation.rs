@@ -41,6 +41,7 @@ mod native {
             ("WV-SQLITE-OPTIONS",sqlite_options),
             ("WV-ALIAS",aliases),
             ("WV-OPEN-FILES",open_files),
+            ("WV-SQLITE-FILES",sqlite_files),
             ("WV-LOCK-SOAK",lock_soak),
         ];
         let selected:Vec<_>=match args.as_slice(){
@@ -336,6 +337,106 @@ mod native {
             || fs::read(&retained).map_err(|e|e.to_string())?!=bytes{return Err("shared-delete handle/content or final unlink state mismatch".into());}
         println!("INFO WV synthetic_share7 rename=allowed unlink=allowed metadata_while_open={pending} original_handle_bytes={observed:?} destination_absent_after_owned_close=true original_retained={}",retained.display());
         Ok("product share0 refuses raw data handles on create/reopen and second Instance is Busy; held lock rename/delete refuse32 unchanged; separate share0/share7 owned probes record rename/delete/handle semantics with original bytes retained; no database/root deletion or discard design".into())
+    }
+    #[derive(Debug,PartialEq,Eq)]
+    struct SqliteEntry {
+        length:u64,
+        attributes:u32,
+        created:u64,
+        bytes:Option<Vec<u8>>,
+        raw_read_error:Option<i32>,
+    }
+    fn sqlite_entry(path:&Path)->Result<SqliteEntry,String>{
+        use std::os::windows::fs::MetadataExt;
+        let metadata=fs::symlink_metadata(path).map_err(|e|format!("SQLite entry {}: {e}",path.display()))?;
+        if !metadata.is_file() || metadata.file_type().is_symlink() || metadata.file_attributes()&0x400!=0 || metadata.len()==0 {
+            return Err(format!("SQLite entry is not a nonempty regular file: {}",path.display()));
+        }
+        yokai_platform::location::validate_regular_single_link(path,&metadata).map_err(|e|e.to_string())?;
+        let (bytes,raw_read_error)=match fs::read(path){
+            Ok(bytes)=>(Some(bytes),None),
+            Err(e) if path.file_name()==Some(std::ffi::OsStr::new("probe.db-shm")) && e.raw_os_error()==Some(33)=>(None,Some(33)),
+            Err(e)=>return Err(format!("SQLite entry read {}: {e}",path.display())),
+        };
+        Ok(SqliteEntry{length:metadata.len(),attributes:metadata.file_attributes(),created:metadata.creation_time(),bytes,raw_read_error})
+    }
+    fn sqlite_file_refusals(dir:&Path,mode:&str,phase:&str,names:&[&str])->Result<(),String>{
+        let retained=dir.join(format!("retained-{phase}"));fs::create_dir(&retained).map_err(|e|e.to_string())?;
+        let mut before=Vec::new();
+        for name in names {
+            let source=dir.join(name);let destination=dir.join(format!("{name}-{phase}-rename"));
+            owned_file_paths(dir,&source,&destination)?;
+            let snapshot=sqlite_entry(&source)?;
+            if let Some(bytes)=&snapshot.bytes {
+                let mut copy=File::create_new(retained.join(name)).map_err(|e|e.to_string())?;
+                copy.write_all(bytes).map_err(|e|e.to_string())?;copy.sync_all().map_err(|e|e.to_string())?;
+            }
+            println!("INFO WV sqlite_file mode={mode} phase={phase} file={name} length={} attributes={} created={} bytes_verified={} raw_read_error={:?} baseline_directory={}",
+                snapshot.length,snapshot.attributes,snapshot.created,snapshot.bytes.is_some(),snapshot.raw_read_error,retained.display());
+            before.push((source,destination,snapshot));
+        }
+        // The fixture connections perform no SQL between these snapshots.
+        for (source,destination,_) in &before {
+            sharing_violation(fs::rename(source,destination),&format!("sqlite-{mode}-{phase}-{}-rename",source.file_name().unwrap().to_string_lossy()))?;
+            sharing_violation(fs::remove_file(source),&format!("sqlite-{mode}-{phase}-{}-delete",source.file_name().unwrap().to_string_lossy()))?;
+        }
+        for (source,destination,snapshot) in before {
+            if sqlite_entry(&source)?!=snapshot || support::entry_exists(&destination)? {
+                return Err(format!("SQLite refusal changed observed source/destination: {}",source.display()));
+            }
+        }
+        println!("INFO WV sqlite_phase mode={mode} phase={phase} files={} operations={} all_refused_os=32 readable_bytes_unchanged=true metadata_unchanged=true stable_object_id=not_checked",names.len(),names.len()*2);
+        Ok(())
+    }
+    fn sqlite_rows(c:&Connection,pending:bool)->Result<(),String>{
+        let mut query=c.prepare("SELECT id,payload FROM w5_probe ORDER BY id").map_err(|e|e.to_string())?;
+        let rows=query.query_map([],|r|Ok((r.get::<_,i64>(0)?,r.get::<_,Vec<u8>>(1)?))).map_err(|e|e.to_string())?
+            .collect::<rusqlite::Result<Vec<_>>>().map_err(|e|e.to_string())?;
+        let mut expected=vec![(1,b"committed-owned".to_vec())];
+        if pending {expected.push((2,b"pending-owned".to_vec()));}
+        if rows!=expected{return Err(format!("SQLite logical rows differ: {rows:?}"));}
+        Ok(())
+    }
+    fn sqlite_files()->Result<String,String>{
+        for mode in ["WAL","DELETE"] {
+            let dir=parent(&format!("sqlite-files-{}",mode.to_ascii_lowercase()))?;let path=dir.join("probe.db");
+            let writer=store::test_api::create_file(&path).map_err(|e|e.to_string())?;
+            let actual:String=writer.query_row(&format!("PRAGMA journal_mode={mode}"),[],|r|r.get(0)).map_err(|e|e.to_string())?;
+            if !actual.eq_ignore_ascii_case(mode){return Err(format!("SQLite fixture mode={actual}, expected {mode}"));}
+            writer.execute_batch("CREATE TABLE w5_probe(id INTEGER PRIMARY KEY,payload BLOB NOT NULL)").map_err(|e|e.to_string())?;
+            writer.execute("INSERT INTO w5_probe VALUES(1,?1)",[b"committed-owned".as_slice()]).map_err(|e|e.to_string())?;
+            writer.execute_batch("BEGIN IMMEDIATE").map_err(|e|e.to_string())?;
+            writer.execute("INSERT INTO w5_probe VALUES(2,?1)",[b"pending-owned".as_slice()]).map_err(|e|e.to_string())?;
+            if writer.is_autocommit(){return Err("SQLite pending writer transaction not active".into());}
+            sqlite_rows(&writer,true)?;
+            let writer_files:&[&str]=if mode=="WAL" {&["probe.db","probe.db-wal","probe.db-shm"]} else {&["probe.db","probe.db-journal"]};
+            sqlite_file_refusals(&dir,mode,"writer-transaction",writer_files)?;
+            writer.execute_batch("ROLLBACK").map_err(|e|e.to_string())?;
+            if !writer.is_autocommit(){return Err("SQLite rollback did not end writer transaction".into());}
+            sqlite_rows(&writer,false)?;
+            let reader=Connection::open_with_flags(&path,OpenFlags::SQLITE_OPEN_READ_ONLY|OpenFlags::SQLITE_OPEN_NO_MUTEX).map_err(|e|e.to_string())?;
+            reader.execute_batch("BEGIN").map_err(|e|e.to_string())?;sqlite_rows(&reader,false)?;
+            writer.close().map_err(|(_,e)|e.to_string())?;
+            if reader.is_autocommit(){return Err("SQLite read snapshot not active after writer close".into());}
+            let reader_files:&[&str]=if mode=="WAL" {&["probe.db","probe.db-wal","probe.db-shm"]} else {&["probe.db"]};
+            sqlite_file_refusals(&dir,mode,"reader-after-writer-close",reader_files)?;
+            sqlite_rows(&reader,false)?;
+            reader.execute_batch("ROLLBACK").map_err(|e|e.to_string())?;
+            reader.close().map_err(|(_,e)|e.to_string())?;
+            for name in ["probe.db","probe.db-wal","probe.db-shm","probe.db-journal"] {
+                let file=dir.join(name);let present=support::entry_exists(&file)?;
+                if present {drop(OpenOptions::new().read(true).write(true).share_mode(0).open(&file).map_err(|e|format!("SQLite released handle {name}: {e}"))?);}
+                let release=if present {"allowed"} else {"not_applicable_absent"};
+                println!("INFO WV sqlite_after_close mode={mode} file={name} present={present} exclusive_data_open={release} cleanup=SQLite_intrinsic_not_test_delete");
+            }
+            let reopened=Connection::open_with_flags(&path,OpenFlags::SQLITE_OPEN_READ_ONLY|OpenFlags::SQLITE_OPEN_NO_MUTEX).map_err(|e|e.to_string())?;
+            sqlite_rows(&reopened,false)?;
+            let integrity:String=reopened.query_row("PRAGMA integrity_check",[],|r|r.get(0)).map_err(|e|e.to_string())?;
+            if integrity!="ok"{return Err(format!("SQLite fixture integrity: {integrity}"));}
+            reopened.close().map_err(|(_,e)|e.to_string())?;
+            println!("INFO WV sqlite_logical mode={mode} pending_before_rollback=true pending_after_rollback=false reader_snapshot=committed_literal_row reopened=committed_literal_row integrity=ok synthetic_non_Instance=true");
+        }
+        Ok("WAL writer+reader main/WAL/SHM and DELETE writer main/journal+reader main:18 rename/delete refusals32; readable bytes and metadata preserved, SHM read-lock limits explicit; real rollback, reader snapshot, released handles and fresh logical reopen verified; owned synthetic files only, no Instance/root discard".into())
     }
     fn lock_soak()->Result<String,String>{
         let start=Instant::now();let i=instance("lock-soak")?;let root=i.root().to_owned();let until=Instant::now()+Duration::from_secs(20);let mut rounds=0;
