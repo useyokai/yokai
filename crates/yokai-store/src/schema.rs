@@ -40,39 +40,53 @@ fn normalized(sql: &str) -> String { sql.trim().trim_end_matches(';').split_whit
 
 /// Read-only validation, shared by both compatibility stages. Caller owns the Instance lock.
 pub(crate) fn inspect(conn: &Connection, id: InstanceId, created: &str, plan:Plan) -> Result<u32, InstanceError> {
-    let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).map_err(inconsistent)?;
+    inspect_with_sqlite_error(conn,id,created,plan,inconsistent)
+}
+
+/// Stage A distinguishes inability to read a WAL snapshot from schema inconsistency.
+/// Other inspection callers and semantic/schema errors retain their existing mapping.
+pub(crate) fn inspect_read_only(conn: &Connection, id: InstanceId, created: &str, plan:Plan) -> Result<u32, InstanceError> {
+    inspect_with_sqlite_error(conn,id,created,plan,|error| {
+        if matches!(error.sqlite_error_code(),Some(rusqlite::ErrorCode::CannotOpen | rusqlite::ErrorCode::ReadOnly)) {
+            InstanceError::PreflightUnavailable(format!("read-only SQLite inspection {:?}: {error}",error.sqlite_error()))
+        } else {inconsistent(error)}
+    })
+}
+
+fn inspect_with_sqlite_error(conn: &Connection, id: InstanceId, created: &str, plan:Plan, sqlite_error:fn(rusqlite::Error)->InstanceError) -> Result<u32, InstanceError> {
+    let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).map_err(sqlite_error)?;
     if version < 0 { return Err(inconsistent("negative user_version")); }
     if version > i64::from(plan.latest()) { return Err(InstanceError::SchemaTooNew { found: version as u32, maximum: plan.latest() }); }
-    let mut stmt = conn.prepare("PRAGMA integrity_check").map_err(inconsistent)?;
-    let results: Vec<String> = stmt.query_map([], |r| r.get(0)).map_err(inconsistent)?
-        .collect::<Result<_, _>>().map_err(inconsistent)?;
+    let mut stmt = conn.prepare("PRAGMA integrity_check").map_err(sqlite_error)?;
+    let results: Vec<String> = stmt.query_map([], |r| r.get(0)).map_err(sqlite_error)?
+        .collect::<Result<_, _>>().map_err(sqlite_error)?;
     if results != ["ok"] { return Err(InstanceError::Integrity(format!("{results:?}"))); }
-    let fk = crate::foreign_key_violations(conn).map_err(inconsistent)?;
+    let fk = crate::foreign_key_violations(conn).map_err(sqlite_error)?;
     if !fk.is_empty() { return Err(InstanceError::ForeignKeyViolations(fk)); }
-    let mut stmt = conn.prepare("SELECT type, name, sql FROM sqlite_schema WHERE lower(substr(name, 1, 7)) <> 'sqlite_' ORDER BY name").map_err(inconsistent)?;
-    let objects: Vec<(String,String,String)> = stmt.query_map([], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?))).map_err(inconsistent)?
-        .collect::<Result<_, _>>().map_err(inconsistent)?;
+    let mut stmt = conn.prepare("SELECT type, name, sql FROM sqlite_schema WHERE lower(substr(name, 1, 7)) <> 'sqlite_' ORDER BY name").map_err(sqlite_error)?;
+    let objects: Vec<(String,String,String)> = stmt.query_map([], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?))).map_err(sqlite_error)?
+        .collect::<Result<_, _>>().map_err(sqlite_error)?;
     if version == 0 {
         if !objects.is_empty() { return Err(inconsistent(format!("{} schema objects at version 0", objects.len()))); }
         return Ok(0);
     }
     // SQLite itself determines statement/trigger boundaries in the reference schema.
     // The reference is memory-only; the inspected database connection remains read-only.
-    let reference=Connection::open_in_memory().map_err(inconsistent)?;
-    reference.execute_batch(HISTORY).map_err(inconsistent)?;
+    let reference=Connection::open_in_memory().map_err(sqlite_error)?;
+    reference.execute_batch(HISTORY).map_err(sqlite_error)?;
     for m in plan.0.iter().filter(|m|i64::from(m.version)<=version) {
-        reference.execute_batch(m.sql).map_err(inconsistent)?;
+        reference.execute_batch(m.sql).map_err(sqlite_error)?;
     }
-    let mut expected_stmt=reference.prepare("SELECT type,name,sql FROM sqlite_schema WHERE lower(substr(name,1,7)) <> 'sqlite_' ORDER BY name").map_err(inconsistent)?;
+    let mut expected_stmt=reference.prepare("SELECT type,name,sql FROM sqlite_schema WHERE lower(substr(name,1,7)) <> 'sqlite_' ORDER BY name").map_err(sqlite_error)?;
     let expected:Vec<(String,String,String)>=expected_stmt.query_map([],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?)))
-        .map_err(inconsistent)?.collect::<Result<_,_>>().map_err(inconsistent)?;
+        .map_err(sqlite_error)?.collect::<Result<_,_>>().map_err(sqlite_error)?;
     if objects.len() != expected.len() || !objects.iter().zip(expected).all(|((kind,name,sql),(want_kind,want_name,ddl))|
         kind == &want_kind && name == &want_name && normalized(sql) == normalized(&ddl)) {
         return Err(inconsistent("schema objects differ from the embedded version"));
     }
-    let mut stmt = conn.prepare("SELECT version,name,checksum,applied_at FROM yokai_schema_history ORDER BY version").map_err(inconsistent)?;
+    let mut stmt = conn.prepare("SELECT version,name,checksum,applied_at FROM yokai_schema_history ORDER BY version").map_err(sqlite_error)?;
     let history: Vec<(i64,String,String,String)> = stmt.query_map([], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?)))
-        .map_err(inconsistent)?.collect::<Result<_,_>>().map_err(inconsistent)?;
+        .map_err(sqlite_error)?.collect::<Result<_,_>>().map_err(sqlite_error)?;
     if history.len()!=version as usize || !history.iter().zip(plan.0).all(|(row,m)|row.0==i64::from(m.version)) {
         return Err(inconsistent("user_version and contiguous migration history disagree"));
     }
@@ -82,9 +96,9 @@ pub(crate) fn inspect(conn: &Connection, id: InstanceId, created: &str, plan:Pla
     if !history.iter().zip(plan.0).all(|(row,m)|row.1==m.name && row.2==checksum(m.sql)) {
         return Err(InstanceError::MigrationDiverged("migration name/checksum mismatch".into()));
     }
-    let mut stmt = conn.prepare("SELECT id,instance_id,format,created_at,last_health_check FROM instance_meta").map_err(inconsistent)?;
+    let mut stmt = conn.prepare("SELECT id,instance_id,format,created_at,last_health_check FROM instance_meta").map_err(sqlite_error)?;
     let meta: Vec<(i64,Vec<u8>,i64,String,Option<String>)> = stmt.query_map([], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?)))
-        .map_err(inconsistent)?.collect::<Result<_,_>>().map_err(inconsistent)?;
+        .map_err(sqlite_error)?.collect::<Result<_,_>>().map_err(sqlite_error)?;
     if meta.len() != 1 || meta[0].0 != 1 || meta[0].1.as_slice() != id.as_bytes() || meta[0].2 != 1 || meta[0].3 != created {
         return Err(InstanceError::IdentityMismatch);
     }
@@ -92,8 +106,8 @@ pub(crate) fn inspect(conn: &Connection, id: InstanceId, created: &str, plan:Pla
         return Err(inconsistent("invalid last_health_check"));
     }
     if version>=2 && plan.has_durable() {
-        let epochs:Vec<(i64,i64)>=conn.prepare("SELECT id,epoch FROM runtime_epoch").map_err(inconsistent)?
-            .query_map([],|r|Ok((r.get(0)?,r.get(1)?))).map_err(inconsistent)?.collect::<Result<_,_>>().map_err(inconsistent)?;
+        let epochs:Vec<(i64,i64)>=conn.prepare("SELECT id,epoch FROM runtime_epoch").map_err(sqlite_error)?
+            .query_map([],|r|Ok((r.get(0)?,r.get(1)?))).map_err(sqlite_error)?.collect::<Result<_,_>>().map_err(sqlite_error)?;
         if epochs.len()!=1 || epochs[0].0!=1 || epochs[0].1<1{return Err(inconsistent("runtime epoch singleton missing or invalid"));}
     }
     Ok(version as u32)

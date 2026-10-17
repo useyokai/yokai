@@ -288,3 +288,39 @@ These future-version fixtures do not establish supported-version foreign-file
 safety, later identity/integrity validation, all inconsistent layouts or full
 PF-12/W2 acceptance. No main database, WAL or Instance root is removed or
 repaired, and no host permissions change.
+
+### Owned Windows ACL-denial fixtures
+
+`WV-PREFLIGHT-ACL` uses three fresh closed synthetic main3/WAL4 Instances.
+The test-only Windows PowerShell helper journals each original DACL before
+adding a non-inheriting deny for the current SID: ReadData on the database or
+SHM, or CreateFiles/CreateDirectories on the root with SHM absent. Only these
+new owned targets change. No owner, SACL, privilege, execution policy or broader
+host permissions change. Windows PowerShell and its Security module must already
+be installed; the bounded runner pins the executable and supplies
+`YOKAI_TEST_POWERSHELL`. The reviewed script is supplied over stdin without a
+profile or execution-policy override.
+
+Each raw access probe must fail with Windows access-denied5. File denials must
+return `PreflightUnavailable` before SQLite; directory creation denial must
+return it through Stage-A read-only. No writable or raw-header fallback is
+allowed. Original permission ACE bytes and protection bits, and complete
+refusal-window names/types/bytes, are restored and verified, along with retained pristine/baseline files and released
+data handles. A post-restoration read-only control must still see WAL4; its SHM
+creation is recorded separately. Only closed owned SHM is removed during that
+fixture's construction; no main database, WAL or Instance root is removed.
+
+RAII attempts emergency restoration. The bounded wrapper also restores scoped
+journals after Cargo and after confirmed worker termination, before sealing;
+rule-restoration uncertainty stops unsealed. Windows may initialize the
+auto-inheritance control flag on these new fixtures; original, applied and
+restored descriptors are retained. Exact full-descriptor restoration is not
+claimed. A separate OS-only injected-controller
+failure checks the shared cleanup path. This does not prove every kill/crash
+window, Unix mode000 equivalence, arbitrary ACL/token/inheritance behavior,
+hostile-race safety, supported-version startup or complete PF-13/W2 acceptance.
+
+Stage-A read-only inspection classifies SQLite CANTOPEN and READONLY errors as
+`PreflightUnavailable`, preserving their diagnostic codes. These access failures
+do not establish schema inconsistency. Other inspection callers and semantic
+schema/identity/integrity refusals retain their existing classifications.
