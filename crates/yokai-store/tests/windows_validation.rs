@@ -44,6 +44,7 @@ mod native {
             ("WV-OPEN-FILES",open_files),
             ("WV-SQLITE-FILES",sqlite_files),
             ("WV-PREFLIGHT-ACCESS",preflight_access),
+            ("WV-PREFLIGHT-DAMAGE",preflight_damage),
             ("WV-LOCK-SOAK",lock_soak),
         ];
         let selected:Vec<_>=match args.as_slice(){
@@ -459,13 +460,13 @@ mod native {
         }
         Ok(snapshot)
     }
-    fn future_wal_control(root:&Path)->Result<(),String>{
+    fn future_wal_control(root:&Path,expected:u32)->Result<(),String>{
         store::test_api::clear();
         let result=store::open_instance(root);let events=store::test_api::connection_events();
         match result {
-            Err(InstanceError::SchemaTooNew{found:3,maximum:2}) if events==["stage-a-read-only"]=>Ok(()),
+            Err(InstanceError::SchemaTooNew{found,maximum:2}) if found==expected && events==["stage-a-read-only"]=>Ok(()),
             Ok(i)=>{i.close().map_err(|e|e.to_string())?;Err(format!("future WAL unexpectedly admitted an Instance; events={events:?}"))},
-            Err(e)=>Err(format!("future WAL control: {e:?}; events={events:?}")),
+            Err(e)=>Err(format!("future WAL control expected={expected}: {e:?}; events={events:?}")),
         }
     }
     fn preflight_access()->Result<String,String>{
@@ -477,7 +478,7 @@ mod native {
             let wal_version:i64=c.query_row("PRAGMA user_version",[],|r|r.get(0)).map_err(|e|e.to_string())?;
             if wal_version!=3{return Err("future version did not commit to WAL".into());}
             c.close().map_err(|(_,e)|e.to_string())?;
-            future_wal_control(&root)?;
+            future_wal_control(&root,3)?;
             let before=access_snapshot(&root)?;
             let file=|name:&str|before.get(name).and_then(Option::as_ref).ok_or_else(||format!("missing access fixture file {name}"));
             if file("instance.db")?.get(60..64)!=Some(2u32.to_be_bytes().as_slice())
@@ -509,7 +510,7 @@ mod native {
                 if let Some(bytes)=bytes {if fs::read(retained.join(name)).map_err(|e|e.to_string())?!=*bytes{return Err("retained access baseline differs".into());}}
             }
             drop(OpenOptions::new().read(true).write(true).share_mode(0).open(&path).map_err(|e|format!("released access guard: {e}"))?);
-            future_wal_control(&root)?;
+            future_wal_control(&root,3)?;
             let after=access_snapshot(&root)?;
             if before.keys().ne(after.keys()) || before.iter().any(|(name,bytes)|name!="instance.db-shm" && after.get(name)!=Some(bytes)) {
                 return Err("post-release read-only control changed names or non-SHM bytes".into());
@@ -517,6 +518,75 @@ mod native {
             println!("INFO WV preflight_access blocked={blocked} raw_read_error=32 refusal=PreflightUnavailable sqlite_events=[] all_entries_bytes_unchanged_after_refusal=true retained_copies_verified=true released_exclusive_open=allowed control_before=SchemaTooNew3 control_after=SchemaTooNew3 control_sqlite_events=[stage-a-read-only] non_shm_bytes_unchanged=true shm_changed_by_readonly_control={} reason={error:?}",before.get("instance.db-shm")!=after.get("instance.db-shm"));
         }
         Ok("database/WAL/SHM independently share-denied32: PreflightUnavailable without SQLite fallback; complete root bytes/entries and retained copies unchanged after refusal; released handles restore Stage-A read-only future-WAL refusal; ACL/directory-writability and full PF-13/W2 remain untested".into())
+    }
+    fn retain_damage_snapshot(root:&Path,label:&str,snapshot:&BTreeMap<String,Option<Vec<u8>>>)->Result<PathBuf,String>{
+        let retained=root.parent().ok_or("damage fixture parent missing")?.join(label);
+        fs::create_dir(&retained).map_err(|e|e.to_string())?;
+        for (name,bytes) in snapshot {
+            if let Some(bytes)=bytes {
+                let mut copy=File::create_new(retained.join(name)).map_err(|e|e.to_string())?;
+                copy.write_all(bytes).map_err(|e|e.to_string())?;copy.sync_all().map_err(|e|e.to_string())?;
+            }
+        }
+        Ok(retained)
+    }
+    fn preflight_damage()->Result<String,String>{
+        for (case,expected) in [("truncate",3),("checksum",3),("shm",4)] {
+            let i=instance("preflight-damage")?;let root=i.root().to_owned();i.close().map_err(|e|e.to_string())?;
+            let db=root.join("instance.db");let wal_path=root.join("instance.db-wal");let shm_path=root.join("instance.db-shm");
+            let c=Connection::open_with_flags(&db,OpenFlags::SQLITE_OPEN_READ_WRITE|OpenFlags::SQLITE_OPEN_NO_MUTEX).map_err(|e|e.to_string())?;
+            c.set_db_config(DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE,true).map_err(|e|e.to_string())?;
+            c.execute_batch("PRAGMA wal_autocheckpoint=0; PRAGMA user_version=4;").map_err(|e|e.to_string())?;
+            c.close().map_err(|(_,e)|e.to_string())?;
+            let mut main=fs::read(&db).map_err(|e|e.to_string())?;
+            if main.get(60..64)!=Some(2u32.to_be_bytes().as_slice()){return Err("damage fixture did not start with main2".into());}
+            main[60..64].copy_from_slice(&3u32.to_be_bytes());fs::write(&db,&main).map_err(|e|e.to_string())?;
+            future_wal_control(&root,4)?;
+            let pristine=access_snapshot(&root)?;
+            let file=|name:&str|pristine.get(name).and_then(Option::as_ref).ok_or_else(||format!("missing pristine damage file {name}"));
+            let wal=file("instance.db-wal")?;let shm=file("instance.db-shm")?;
+            if wal.len()<120 || shm.len()<128 || shm.len()>1_048_576 || pristine.contains_key("instance.db-journal"){return Err("invalid damage fixture files".into());}
+            let page=u32::from_be_bytes(wal[8..12].try_into().map_err(|_|"WAL page field")?) as usize;
+            let db_size=u32::from_be_bytes(wal[36..40].try_into().map_err(|_|"WAL commit field")?);
+            if !(512..=65_536).contains(&page) || !page.is_power_of_two() || wal.len()!=32+24+page
+                || wal[32..36]!=1u32.to_be_bytes() || db_size==0 || wal[116..120]!=4u32.to_be_bytes()
+                || file("instance.db")?.get(60..64)!=Some(3u32.to_be_bytes().as_slice()) {
+                return Err("damage fixture is not one committed page1 WAL4 over main3".into());
+            }
+            let original=retain_damage_snapshot(&root,"retained-pristine",&pristine)?;
+            let mut changed=wal.clone();
+            if case=="shm" {
+                fs::write(&shm_path,vec![0xa5;shm.len()]).map_err(|e|e.to_string())?;
+            }else {
+                // All SQLite connections are closed. Remove only owned SHM so the probe must recover the index.
+                drop(OpenOptions::new().read(true).write(true).share_mode(0).open(&shm_path).map_err(|e|e.to_string())?);
+                fs::remove_file(&shm_path).map_err(|e|e.to_string())?;
+                if support::entry_exists(&shm_path)?{return Err("closed fixture SHM still exists".into());}
+                if case=="truncate" {changed.truncate(32+24+page/2);}else{changed[48]^=1;}
+                if changed[..32]!=wal[..32] || (case=="checksum" && changed.iter().zip(wal).filter(|(a,b)|a!=b).count()!=1){return Err("damage changed the WAL header or wrong checksum extent".into());}
+                fs::write(&wal_path,&changed).map_err(|e|e.to_string())?;
+            }
+            let before=access_snapshot(&root)?;
+            let damaged=retain_damage_snapshot(&root,"retained-damaged",&before)?;
+            println!("INFO WV preflight_damage fixture={} case={case} main_header=3 pristine_wal_version=4 page_size={page} committed_page=1 commit_db_pages={db_size} pristine_wal_bytes={} damaged_wal_bytes={} shm_before={} pristine={} damaged={}",
+                root.display(),wal.len(),changed.len(),before.contains_key("instance.db-shm"),original.display(),damaged.display());
+            future_wal_control(&root,expected)?;
+            let after=access_snapshot(&root)?;
+            for name in before.keys().chain(after.keys()) {
+                if name!="instance.db-shm" && before.get(name)!=after.get(name){return Err(format!("{case} read-only refusal changed non-SHM entry {name}"));}
+            }
+            for (snapshot,retained) in [(&pristine,&original),(&before,&damaged)] {
+                for (name,bytes) in snapshot {
+                    if let Some(bytes)=bytes {if fs::read(retained.join(name)).map_err(|e|e.to_string())?!=*bytes{return Err("damage baseline copy changed".into());}}
+                }
+            }
+            for (name,bytes) in &after {
+                if bytes.is_some(){drop(OpenOptions::new().read(true).write(true).share_mode(0).open(root.join(name)).map_err(|e|format!("damage probe left an open handle {name}: {e}"))?);}
+            }
+            println!("INFO WV preflight_damage case={case} refusal=SchemaTooNew{expected} maximum=2 sqlite_events=[stage-a-read-only] non_shm_entries_bytes_unchanged=true retained_copies_verified=true released_exclusive_opens=allowed shm_after={} shm_changed={} cleanup=SQLite_SHM_only_no_main_WAL_repair",
+                after.contains_key("instance.db-shm"),before.get("instance.db-shm")!=after.get("instance.db-shm"));
+        }
+        Ok("incomplete frame and bad stored frame checksum recover main3; damaged SHM recovers valid WAL4; exact future-version Stage-A-only refusals, main/WAL/non-SHM bytes preserved, pristine+damaged copies retained and handles released; synthetic future versions only, no supported-version startup or full PF11/W2 acceptance".into())
     }
     fn lock_soak()->Result<String,String>{
         let start=Instant::now();let i=instance("lock-soak")?;let root=i.root().to_owned();let until=Instant::now()+Duration::from_secs(20);let mut rounds=0;
