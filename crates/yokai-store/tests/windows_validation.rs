@@ -61,6 +61,7 @@ mod native {
             ("WV-RAW-HEADER",raw_headers),
             ("WV-JOURNAL-EMPTY",journal_empty),
             ("WV-STALE-SHM",stale_shm),
+            ("WV-EMPTY-WAL",empty_wal),
         ];
         let selected:Vec<_>=match args.as_slice(){
             [_]=>checks.iter().collect(),
@@ -202,6 +203,13 @@ mod native {
                     let before=access_snapshot(root)?;let outcome=stale_shm_refusal(root,case)?;let after=access_snapshot(root)?;
                     if before!=after{return Err("stale-SHM child changed complete closed root".into());}
                     println!("INFO WV stale_shm_child case={case} outcome={outcome} sqlite_events=[] exact_refusal=true complete_closed_bytes_unchanged=true inventory_before={:?} inventory_after={:?}",stageb_inventory(&before)?,stageb_inventory(&after)?);
+                },
+                "__empty_wal_refusal"=>{
+                    let case=args.get(3).ok_or("missing empty-WAL case")?;
+                    let wal=EMPTY_WAL_CASES.iter().find(|(name,_,_)|*name==case).map(|(_,_,wal)|*wal).ok_or("unknown empty-WAL case")?;
+                    let before=access_snapshot(root)?;let outcome=empty_wal_refusal(root,case)?;let after=access_snapshot(root)?;
+                    empty_wal_preserved(&before,&after,wal)?;
+                    println!("INFO WV empty_wal_child case={case} outcome={outcome} protected_non_shm_unchanged=true inventory_before={:?} inventory_after={:?}",stageb_inventory(&before)?,stageb_inventory(&after)?);
                 },
                 "__close_error"=>{
                     store::test_api::fail_startup_close_once();
@@ -1366,6 +1374,67 @@ mod native {
             println!("INFO WV stale_shm fixture={} case={case} pristine={} baseline={} after={} child_after={} child_logs={} outcome={outcome} sqlite_events=[] complete_closed_bytes_unchanged=true all_copies_verified=true exclusive_data_opens=allowed child_lock_reacquired=true inventory_before={:?} inventory_after={:?} inventory_child_after={:?}",root.display(),original.display(),baseline.display(),final_copy.display(),child_copy.display(),logs.display(),stageb_inventory(&before)?,stageb_inventory(&after)?,stageb_inventory(&repeated)?);
         }
         Ok("empty/nonempty stale SHM without WAL at header0/1/2/3/max refuses exact version before SQLite;150 retained files,20 parent/child traces and complete fixed inventories; selected PF2b/PF10(a) only, no transient-write/metadata/identity/race/durability or fullW2 acceptance".into())
+    }
+
+    const EMPTY_WAL_CASES:[(&str,u32,bool);6]=[
+        ("future3-empty-wal",3,true),("future3-absent-wal",3,false),
+        ("future-be-empty-wal",0x01020304,true),("future-be-absent-wal",0x01020304,false),
+        ("future-i32-max-empty-wal",0x7fffffff,true),("future-i32-max-absent-wal",0x7fffffff,false),
+    ];
+    fn empty_wal_refusal(root:&Path,case:&str)->Result<String,String>{
+        let (_,version,wal)=EMPTY_WAL_CASES.iter().find(|(name,_,_)|*name==case).copied().ok_or("unknown empty-WAL case")?;
+        store::test_api::clear();let result=store::open_instance(root);
+        let events=store::test_api::connection_events();
+        match result {
+            Err(InstanceError::SchemaTooNew{found,maximum:2}) if found==version=>{},
+            Ok(i)=>{i.close().map_err(|e|e.to_string())?;return Err(format!("empty-WAL {case} unexpectedly opened; events={events:?}"));},
+            Err(error)=>return Err(format!("empty-WAL {case} wrong refusal {error:?}; events={events:?}")),
+        }
+        let decoded=store::test_api::header_versions()?;let second_take=store::test_api::header_versions()?;
+        let expected_events=if wal {vec!["stage-a-read-only"]} else {Vec::new()};
+        if events!=expected_events || decoded!=[version] || !second_take.is_empty(){return Err(format!("empty-WAL {case} decoded={decoded:?} expected=[{version}] second_take={second_take:?} events={events:?} expected_events={expected_events:?}"));}
+        let outcome=format!("SchemaTooNew({version},2)");
+        println!("INFO WV empty_wal_trace case={case} outcome={outcome} decoded={decoded:?} second_take={second_take:?} sqlite_events={events:?}");
+        Ok(outcome)
+    }
+    fn empty_wal_preserved(before:&BTreeMap<String,Option<Vec<u8>>>,after:&BTreeMap<String,Option<Vec<u8>>>,wal:bool)->Result<(),String>{
+        if !wal && before!=after{return Err("absent-WAL refusal changed complete closed root".into());}
+        if !before.iter().filter(|(n,_)|n.as_str()!="instance.db-shm").eq(after.iter().filter(|(n,_)|n.as_str()!="instance.db-shm")) {
+            return Err("empty-WAL refusal changed protected non-SHM entries".into());
+        }
+        if wal && after.get("instance.db-wal")!=Some(&Some(Vec::new())){return Err("empty WAL was removed or changed".into());}
+        Ok(())
+    }
+    fn empty_wal()->Result<String,String>{
+        let mut retained_files=0;
+        for &(case,version,wal) in &EMPTY_WAL_CASES {
+            let i=instance("empty-wal")?;let root=i.root().to_owned();i.close().map_err(|e|e.to_string())?;
+            let pristine=access_snapshot(&root)?;
+            if pristine.keys().map(String::as_str).collect::<Vec<_>>()!=["instance.db","instance.id","instance.lock"]
+                || pristine.get("instance.lock")!=Some(&Some(Vec::new())){return Err("empty-WAL pristine names/lock differ".into());}
+            let main=pristine.get("instance.db").and_then(Option::as_ref).ok_or("empty-WAL pristine main missing")?;
+            if main.len()<100 || main.len()%4096!=0 || &main[..16]!=b"SQLite format 3\0"
+                || main[16..24]!=[0x10,0,2,2,0,64,32,32] || main[60..64]!=2u32.to_be_bytes(){return Err("empty-WAL pristine layout/version differs".into());}
+            let original=retain_damage_snapshot(&root,"retained-ew-pristine",&pristine)?;
+            let mut expected=pristine.clone();let mut header=main.clone();header[60..64].copy_from_slice(&version.to_be_bytes());
+            fs::write(root.join("instance.db"),&header).map_err(|e|e.to_string())?;expected.insert("instance.db".into(),Some(header));
+            if wal {fs::write(root.join("instance.db-wal"),[]).map_err(|e|e.to_string())?;expected.insert("instance.db-wal".into(),Some(Vec::new()));}
+            let before=access_snapshot(&root)?;if before!=expected{return Err("empty-WAL setup changed unintended entries".into());}
+            let baseline=retain_damage_snapshot(&root,"retained-ew-before",&before)?;
+            let outcome=empty_wal_refusal(&root,case)?;let after=access_snapshot(&root)?;empty_wal_preserved(&before,&after,wal)?;
+            let final_copy=retain_damage_snapshot(&root,"retained-ew-after",&after)?;stageb_released(&root)?;
+            let mut probe=command("__empty_wal_refusal",&root)?;probe.arg(case);
+            let (mut child,logs)=launch(probe,"empty-wal-probe")?;
+            if !wait(&mut child,Duration::from_secs(15))?.success(){return Err(format!("empty-WAL child failed; logs={}",logs.display()));}
+            let repeated=access_snapshot(&root)?;empty_wal_preserved(&after,&repeated,wal)?;empty_wal_preserved(&before,&repeated,wal)?;
+            stageb_released(&root)?;let child_copy=retain_damage_snapshot(&root,"retained-ew-child-after",&repeated)?;
+            for (snapshot,path) in [(&pristine,&original),(&before,&baseline),(&after,&final_copy),(&repeated,&child_copy)] {
+                if access_snapshot(path)?!=*snapshot{return Err("empty-WAL retained copy differs".into());}
+                retained_files+=snapshot.len();
+            }
+            println!("INFO WV empty_wal fixture={} case={case} empty_wal={wal} pristine={} baseline={} after={} child_after={} child_logs={} outcome={outcome} protected_non_shm_unchanged=true all_copies_verified=true exclusive_data_opens=allowed child_lock_reacquired=true inventory_before={:?} inventory_after={:?} inventory_child_after={:?}",root.display(),original.display(),baseline.display(),final_copy.display(),child_copy.display(),logs.display(),stageb_inventory(&before)?,stageb_inventory(&after)?,stageb_inventory(&repeated)?);
+        }
+        Ok(format!("empty versus absent WAL at future headers3/16909060/2147483647 selects exact read-only versus raw refusal;{retained_files} retained files,12 parent/child traces,18 fixed inventories; WAL stays empty, SHM effects measured; selected PF10(b)/future PF2a and PF10(c) only, no recovery/transient-write/metadata/race/durability or fullW2 acceptance"))
     }
 
     fn lock_soak()->Result<String,String>{

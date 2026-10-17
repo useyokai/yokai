@@ -17,9 +17,9 @@ Recorded Windows runs use fixed NTFS:
 | `instance_migrations` | 18 | `YOKAI_TEST_V0_FIXTURE`, `YOKAI_TEST_V0_BINARY` |
 | `sqlite_runtime` | 12 | None |
 | `store_runtime` | 31 | None |
-| `windows_validation` | 22 | `YOKAI_TEST_V0_FIXTURE`, `YOKAI_TEST_V2_FIXTURE`, `YOKAI_TEST_V2_BINARY`, `YOKAI_TEST_POWERSHELL` |
+| `windows_validation` | 23 | `YOKAI_TEST_V0_FIXTURE`, `YOKAI_TEST_V2_FIXTURE`, `YOKAI_TEST_V2_BINARY`, `YOKAI_TEST_POWERSHELL` |
 
-These 150 records include explicitly qualified platform branches; R12's
+These 151 records include explicitly qualified platform branches; R12's
 dangling-file-symlink subcheck remains Unix-only and reports `not_checked` on
 Windows. The Windows-only target reports `RESULT NOT_CHECKED` on other platforms.
 The checkpoint's WSL gate parsed saved Windows output; it ran no Linux candidate
@@ -419,4 +419,26 @@ byte equality, fixed SQLite entry inventories and released data handles.
 Empty-present SHM is distinct from absence. These selected PF2b/PF10(a) checks
 do not establish supported-version side-file recovery, every layout, transient
 writes, metadata/ADS/object identity, hostile races, Linux parity, full W2,
+power-loss durability or product/security/release acceptance.
+
+### Empty WAL versus absent WAL
+
+`WV-EMPTY-WAL` pairs six independent closed V2 fixtures at future header
+versions 3, 16909060 (0x01020304) and 2147483647. Each has an empty or absent
+WAL, with SHM and journal absent at setup. An empty WAL requires exactly one
+`stage-a-read-only` connection; an absent WAL requires none. Both paths must
+return exact `SchemaTooNew` with the observed version and maximum 2, record
+one decoded header value and drain the observation on a second take. A fresh
+bounded child independently repeats each oracle.
+
+Complete pristine, altered, parent-after and child-after snapshots are retained
+and compared with all fixed SQLite inventories. An empty WAL must remain
+present and zero bytes; all non-SHM entries stay byte-identical. SHM effects
+are measured and retained. Absent-WAL complete roots stay byte-identical.
+Exclusive data opens and child lock reacquisition check released handles.
+
+These selected PF10(b) and future-header PF2a/PF10(c) witnesses do not qualify
+legacy or supported-version recovery, actual future schemas, header values
+above SQLite's signed PRAGMA range, every layout, transient writes,
+metadata/ADS/object identity, hostile races, Linux parity, full W2,
 power-loss durability or product/security/release acceptance.
