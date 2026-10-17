@@ -381,7 +381,7 @@ impl Instance {
     }
     pub fn store(&self) -> crate::StoreHandle { self.runtime.handle() }
     /// Creation initializes epoch1; later successful opens complete startup before returning.
-    /// None is reserved for diagnostic plans deliberately stopping at V1.
+    /// None is reserved for diagnostic plans without durable startup (V0/V1).
     pub fn startup_report(&self)->Option<&crate::StartupReport>{self.startup.as_ref()}
     pub fn root(&self) -> &Path { &self.root }
     pub fn id(&self) -> InstanceId { self.id }
