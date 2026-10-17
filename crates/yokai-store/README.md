@@ -248,3 +248,21 @@ all other entries and bytes must remain unchanged. These sharing-denial cases
 do not establish ACL denial, non-writable-directory behavior, or complete
 PF-13/W2 acceptance. No host permissions are changed and no Instance file or
 root is renamed or deleted.
+
+### Damaged Windows WAL frames and shared memory
+
+`WV-PREFLIGHT-DAMAGE` uses fresh synthetic future-version Instances with one
+committed page-1 WAL frame. A pristine read-only control must see WAL version4
+over main version3. The check then truncates a frame inside its payload, flips
+one stored frame-checksum byte, or fills SHM with deterministic nonzero bytes.
+For the two WAL cases, only the closed owned SHM fixture is removed before the
+probe baseline so SQLite must recover its index rather than reuse stale SHM.
+
+The WAL cases must refuse main version3; the SHM case must recover WAL version4.
+Each refusal must use Stage-A read-only with no writable fallback. Every
+non-SHM entry and byte must remain unchanged; SHM creation/rebuild is recorded
+separately. Pristine and damaged copies are retained before the probe, and
+released handles are checked afterward. These cases do not establish
+supported-version startup, every corruption/recovery mode, power-loss
+durability or complete PF-11/W2 acceptance. No main database, WAL or Instance
+root is removed, and no host permissions change.
