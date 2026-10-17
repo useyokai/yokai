@@ -231,3 +231,20 @@ rollback, the literal committed row, handle release and a fresh integrity
 check. SQLite's own side-file cleanup is recorded separately. These bounded
 observations do not implement Instance/root discard or establish every open
 file, hostile-race or durability guarantee.
+
+### Windows preflight access refusal
+
+`WV-PREFLIGHT-ACCESS` uses three fresh synthetic Instances with committed
+future-version WALs over supported main-file headers. With all fixture SQLite
+connections closed, an owned share-zero handle independently denies raw reads
+of the database, WAL or SHM. Each case requires the exact Windows sharing error,
+typed `PreflightUnavailable`, and no SQLite connection or fallback.
+
+Readable baseline files are retained before denial. After releasing the guard,
+the complete root listing and file bytes must match; an exclusive handle can
+be reacquired, and a read-only Stage-A control must still refuse the future
+WAL version without reaching Stage B. That read-only control may change SHM;
+all other entries and bytes must remain unchanged. These sharing-denial cases
+do not establish ACL denial, non-writable-directory behavior, or complete
+PF-13/W2 acceptance. No host permissions are changed and no Instance file or
+root is renamed or deleted.

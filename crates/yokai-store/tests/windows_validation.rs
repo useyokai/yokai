@@ -14,6 +14,7 @@ mod support;
 #[cfg(windows)]
 mod native {
     use super::support;
+    use std::collections::BTreeMap;
     use std::fs::{self,File,OpenOptions};
     use std::io::{Read,Seek,SeekFrom,Write};
     use std::os::windows::fs::OpenOptionsExt;
@@ -42,6 +43,7 @@ mod native {
             ("WV-ALIAS",aliases),
             ("WV-OPEN-FILES",open_files),
             ("WV-SQLITE-FILES",sqlite_files),
+            ("WV-PREFLIGHT-ACCESS",preflight_access),
             ("WV-LOCK-SOAK",lock_soak),
         ];
         let selected:Vec<_>=match args.as_slice(){
@@ -437,6 +439,84 @@ mod native {
             println!("INFO WV sqlite_logical mode={mode} pending_before_rollback=true pending_after_rollback=false reader_snapshot=committed_literal_row reopened=committed_literal_row integrity=ok synthetic_non_Instance=true");
         }
         Ok("WAL writer+reader main/WAL/SHM and DELETE writer main/journal+reader main:18 rename/delete refusals32; readable bytes and metadata preserved, SHM read-lock limits explicit; real rollback, reader snapshot, released handles and fresh logical reopen verified; owned synthetic files only, no Instance/root discard".into())
+    }
+    fn access_snapshot(root:&Path)->Result<BTreeMap<String,Option<Vec<u8>>>,String>{
+        use std::os::windows::fs::MetadataExt;
+        let mut snapshot=BTreeMap::new();
+        for entry in fs::read_dir(root).map_err(|e|e.to_string())? {
+            let entry=entry.map_err(|e|e.to_string())?;let path=entry.path();
+            let name=entry.file_name().into_string().map_err(|_|"non-UTF8 owned fixture entry")?;
+            let meta=fs::symlink_metadata(&path).map_err(|e|e.to_string())?;
+            if meta.file_type().is_symlink() || meta.file_attributes()&0x400!=0{return Err("access fixture contains a link/reparse entry".into());}
+            let bytes=if meta.is_file(){
+                yokai_platform::location::validate_regular_single_link(&path,&meta).map_err(|e|e.to_string())?;
+                Some(fs::read(&path).map_err(|e|e.to_string())?)
+            }else if meta.is_dir(){
+                if fs::read_dir(&path).map_err(|e|e.to_string())?.next().transpose().map_err(|e|e.to_string())?.is_some(){return Err("access fixture contains a nonempty subdirectory".into());}
+                None
+            }else{return Err("unexpected access fixture entry type".into());};
+            snapshot.insert(name,bytes);
+        }
+        Ok(snapshot)
+    }
+    fn future_wal_control(root:&Path)->Result<(),String>{
+        store::test_api::clear();
+        let result=store::open_instance(root);let events=store::test_api::connection_events();
+        match result {
+            Err(InstanceError::SchemaTooNew{found:3,maximum:2}) if events==["stage-a-read-only"]=>Ok(()),
+            Ok(i)=>{i.close().map_err(|e|e.to_string())?;Err(format!("future WAL unexpectedly admitted an Instance; events={events:?}"))},
+            Err(e)=>Err(format!("future WAL control: {e:?}; events={events:?}")),
+        }
+    }
+    fn preflight_access()->Result<String,String>{
+        for blocked in ["instance.db","instance.db-wal","instance.db-shm"] {
+            let i=instance("preflight-access")?;let root=i.root().to_owned();i.close().map_err(|e|e.to_string())?;
+            let c=Connection::open_with_flags(root.join("instance.db"),OpenFlags::SQLITE_OPEN_READ_WRITE|OpenFlags::SQLITE_OPEN_NO_MUTEX).map_err(|e|e.to_string())?;
+            c.set_db_config(DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE,true).map_err(|e|e.to_string())?;
+            c.execute_batch("PRAGMA wal_autocheckpoint=0; PRAGMA user_version=3;").map_err(|e|e.to_string())?;
+            let wal_version:i64=c.query_row("PRAGMA user_version",[],|r|r.get(0)).map_err(|e|e.to_string())?;
+            if wal_version!=3{return Err("future version did not commit to WAL".into());}
+            c.close().map_err(|(_,e)|e.to_string())?;
+            future_wal_control(&root)?;
+            let before=access_snapshot(&root)?;
+            let file=|name:&str|before.get(name).and_then(Option::as_ref).ok_or_else(||format!("missing access fixture file {name}"));
+            if file("instance.db")?.get(60..64)!=Some(2u32.to_be_bytes().as_slice())
+                || file("instance.db-wal")?.len()<=32 || file("instance.db-shm")?.len()<=128
+                || before.contains_key("instance.db-journal"){return Err("future WAL fixture lacks main2/nonempty WAL+SHM or has journal".into());}
+            let retained=root.parent().ok_or("access fixture parent missing")?.join("retained-before-denial");
+            fs::create_dir(&retained).map_err(|e|e.to_string())?;
+            for (name,bytes) in &before {
+                if let Some(bytes)=bytes {
+                    let mut copy=File::create_new(retained.join(name)).map_err(|e|e.to_string())?;
+                    copy.write_all(bytes).map_err(|e|e.to_string())?;copy.sync_all().map_err(|e|e.to_string())?;
+                }
+            }
+            println!("INFO WV preflight_access fixture={} blocked={blocked} main_header=2 committed_wal_version=3 fixture_connection=closed retained={} entries={:?}",root.display(),retained.display(),before.keys().collect::<Vec<_>>());
+            let path=root.join(blocked);
+            let guard=OpenOptions::new().read(true).write(true).share_mode(0).open(&path).map_err(|e|e.to_string())?;
+            sharing_violation(fs::read(&path).map(|_|()),&format!("preflight-{blocked}-raw-read"))?;
+            store::test_api::clear();
+            let result=store::open_instance(&root);let events=store::test_api::connection_events();
+            let error=match result {
+                Err(InstanceError::PreflightUnavailable(reason))=>reason,
+                Ok(i)=>{i.close().map_err(|e|e.to_string())?;return Err("share-denied preflight admitted an Instance".into());},
+                Err(e)=>return Err(format!("share-denied preflight wrong refusal: {e:?}")),
+            };
+            if !events.is_empty(){return Err(format!("share-denied preflight reached SQLite: {events:?}"));}
+            drop(guard);
+            if access_snapshot(&root)?!=before{return Err(format!("{blocked} access refusal changed root entries/bytes"));}
+            for (name,bytes) in &before {
+                if let Some(bytes)=bytes {if fs::read(retained.join(name)).map_err(|e|e.to_string())?!=*bytes{return Err("retained access baseline differs".into());}}
+            }
+            drop(OpenOptions::new().read(true).write(true).share_mode(0).open(&path).map_err(|e|format!("released access guard: {e}"))?);
+            future_wal_control(&root)?;
+            let after=access_snapshot(&root)?;
+            if before.keys().ne(after.keys()) || before.iter().any(|(name,bytes)|name!="instance.db-shm" && after.get(name)!=Some(bytes)) {
+                return Err("post-release read-only control changed names or non-SHM bytes".into());
+            }
+            println!("INFO WV preflight_access blocked={blocked} raw_read_error=32 refusal=PreflightUnavailable sqlite_events=[] all_entries_bytes_unchanged_after_refusal=true retained_copies_verified=true released_exclusive_open=allowed control_before=SchemaTooNew3 control_after=SchemaTooNew3 control_sqlite_events=[stage-a-read-only] non_shm_bytes_unchanged=true shm_changed_by_readonly_control={} reason={error:?}",before.get("instance.db-shm")!=after.get("instance.db-shm"));
+        }
+        Ok("database/WAL/SHM independently share-denied32: PreflightUnavailable without SQLite fallback; complete root bytes/entries and retained copies unchanged after refusal; released handles restore Stage-A read-only future-WAL refusal; ACL/directory-writability and full PF-13/W2 remain untested".into())
     }
     fn lock_soak()->Result<String,String>{
         let start=Instant::now();let i=instance("lock-soak")?;let root=i.root().to_owned();let until=Instant::now()+Duration::from_secs(20);let mut rounds=0;
