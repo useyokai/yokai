@@ -17,9 +17,9 @@ Recorded Windows runs use fixed NTFS:
 | `instance_migrations` | 18 | `YOKAI_TEST_V0_FIXTURE`, `YOKAI_TEST_V0_BINARY` |
 | `sqlite_runtime` | 12 | None |
 | `store_runtime` | 31 | None |
-| `windows_validation` | 23 | `YOKAI_TEST_V0_FIXTURE`, `YOKAI_TEST_V2_FIXTURE`, `YOKAI_TEST_V2_BINARY`, `YOKAI_TEST_POWERSHELL` |
+| `windows_validation` | 24 | `YOKAI_TEST_V0_FIXTURE`, `YOKAI_TEST_V1_FIXTURE`, `YOKAI_TEST_V2_FIXTURE`, `YOKAI_TEST_V2_BINARY`, `YOKAI_TEST_POWERSHELL` |
 
-These 151 records include explicitly qualified platform branches; R12's
+These 152 records include explicitly qualified platform branches; R12's
 dangling-file-symlink subcheck remains Unix-only and reports `not_checked` on
 Windows. The Windows-only target reports `RESULT NOT_CHECKED` on other platforms.
 The checkpoint's WSL gate parsed saved Windows output; it ran no Linux candidate
@@ -442,3 +442,27 @@ legacy or supported-version recovery, actual future schemas, header values
 above SQLite's signed PRAGMA range, every layout, transient writes,
 metadata/ADS/object identity, hostile races, Linux parity, full W2,
 power-loss durability or product/security/release acceptance.
+
+### Supported opens with all side files absent
+
+`WV-SUPPORTED-OPEN` copies the three ordinary files from pinned genuine V0,
+V1 and V2 fixtures into separate owned roots. It preserves the originals and
+uses production `open_instance`, with no altered header values or diagnostic
+migration plans. Each raw-header path records its original version once,
+drains the observation, and proceeds through exactly one Stage-B read/write
+connection, with no Stage-A read-only event. Close records connection release
+before lock release.
+
+V0 and V1 upgrade to V2 and retain their two and one pre-migration backups;
+current V2 creates none. Startup reports epoch 2 with no examined or changed
+runs. A fresh bounded child opens the resulting V2 root at epoch 3 without
+another migration. All closed states have WAL, SHM and journal absent.
+
+Before, parent-after and child-after snapshots retain 33 ordinary files,
+including every backup, and the backup-directory layout. Identity/lock bytes,
+source fixtures and child-reopen backup bytes remain equal; main database
+changes are expected and measured. Exclusive opens check released handles for
+data, backups and lock files. These are selected PF10(c) and upgrade witnesses,
+not a non-mutating startup claim or full PF10/W2, historical-binary, transient
+write, metadata/ADS/object-identity, hostile-race, power-loss/OS-crash, Linux
+runtime or product/security/release acceptance.

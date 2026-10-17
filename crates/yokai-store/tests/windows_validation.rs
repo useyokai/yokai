@@ -62,6 +62,7 @@ mod native {
             ("WV-JOURNAL-EMPTY",journal_empty),
             ("WV-STALE-SHM",stale_shm),
             ("WV-EMPTY-WAL",empty_wal),
+            ("WV-SUPPORTED-OPEN",supported_open),
         ];
         let selected:Vec<_>=match args.as_slice(){
             [_]=>checks.iter().collect(),
@@ -210,6 +211,16 @@ mod native {
                     let before=access_snapshot(root)?;let outcome=empty_wal_refusal(root,case)?;let after=access_snapshot(root)?;
                     empty_wal_preserved(&before,&after,wal)?;
                     println!("INFO WV empty_wal_child case={case} outcome={outcome} protected_non_shm_unchanged=true inventory_before={:?} inventory_after={:?}",stageb_inventory(&before)?,stageb_inventory(&after)?);
+                },
+                "__supported_open"=>{
+                    let case=args.get(3).ok_or("missing supported case")?;
+                    let initial=SUPPORTED_OPEN_CASES.iter().find(|(name,_,_)|*name==case).map(|(_,_,v)|*v).ok_or("unknown supported case")?;
+                    let before=supported_snapshot(root)?;supported_closed(&before,initial)?;supported_open_once(root,case,2,3)?;
+                    let after=supported_snapshot(root)?;supported_closed(&after,initial)?;
+                    for (name,bytes) in &before{if name!="instance.db" && after.get(name)!=Some(bytes){return Err("supported child changed protected bytes".into());}}
+                    if before.keys().ne(after.keys()) || before.get("instance.db")==after.get("instance.db"){return Err("supported child closed layout/main change differs".into());}
+                    supported_released(root,&after)?;
+                    println!("INFO WV supported_open_child case={case} header=2 epoch=3 backups_unchanged=true identity_lock_unchanged=true exclusive_opens=allowed inventory_before={:?} inventory_after={:?}",stageb_inventory(&before)?,stageb_inventory(&after)?);
                 },
                 "__close_error"=>{
                     store::test_api::fail_startup_close_once();
@@ -1435,6 +1446,106 @@ mod native {
             println!("INFO WV empty_wal fixture={} case={case} empty_wal={wal} pristine={} baseline={} after={} child_after={} child_logs={} outcome={outcome} protected_non_shm_unchanged=true all_copies_verified=true exclusive_data_opens=allowed child_lock_reacquired=true inventory_before={:?} inventory_after={:?} inventory_child_after={:?}",root.display(),original.display(),baseline.display(),final_copy.display(),child_copy.display(),logs.display(),stageb_inventory(&before)?,stageb_inventory(&after)?,stageb_inventory(&repeated)?);
         }
         Ok(format!("empty versus absent WAL at future headers3/16909060/2147483647 selects exact read-only versus raw refusal;{retained_files} retained files,12 parent/child traces,18 fixed inventories; WAL stays empty, SHM effects measured; selected PF10(b)/future PF2a and PF10(c) only, no recovery/transient-write/metadata/race/durability or fullW2 acceptance"))
+    }
+
+    const SUPPORTED_OPEN_CASES:[(&str,&str,u32);3]=[
+        ("current2","YOKAI_TEST_V2_FIXTURE",2),("legacy0","YOKAI_TEST_V0_FIXTURE",0),("legacy1","YOKAI_TEST_V1_FIXTURE",1),
+    ];
+    fn supported_snapshot(root:&Path)->Result<BTreeMap<String,Option<Vec<u8>>>,String>{
+        fn walk(base:&Path,dir:&Path,depth:u8,out:&mut BTreeMap<String,Option<Vec<u8>>>)->Result<(),String>{
+            use std::os::windows::fs::MetadataExt;
+            for entry in fs::read_dir(dir).map_err(|e|e.to_string())? {
+                let path=entry.map_err(|e|e.to_string())?.path();let meta=fs::symlink_metadata(&path).map_err(|e|e.to_string())?;
+                let key=path.strip_prefix(base).map_err(|e|e.to_string())?.to_str().ok_or("non-UTF8 supported snapshot name")?.replace(std::path::MAIN_SEPARATOR,"/");
+                if meta.file_type().is_symlink() || meta.file_attributes()&0x400!=0{return Err("supported snapshot contains a link/reparse entry".into());}
+                if meta.is_dir(){
+                    if depth!=0 || key!="backups"{return Err("unsupported snapshot directory".into());}
+                    out.insert(key,None);walk(base,&path,1,out)?;
+                }else{
+                    yokai_platform::location::validate_regular_single_link(&path,&meta).map_err(|e|e.to_string())?;
+                    out.insert(key,Some(fs::read(path).map_err(|e|e.to_string())?));
+                }
+            }
+            Ok(())
+        }
+        let mut out=BTreeMap::new();walk(root,root,0,&mut out)?;Ok(out)
+    }
+    fn supported_retain(root:&Path,label:&str,snapshot:&BTreeMap<String,Option<Vec<u8>>>)->Result<PathBuf,String>{
+        let copy=root.parent().ok_or("supported root lacks parent")?.join(label);fs::create_dir(&copy).map_err(|e|e.to_string())?;
+        for (name,bytes) in snapshot {
+            if let Some(bytes)=bytes{
+                let mut file=File::create_new(copy.join(name)).map_err(|e|e.to_string())?;
+                file.write_all(bytes).map_err(|e|e.to_string())?;file.sync_all().map_err(|e|e.to_string())?;
+            }else{if name!="backups"{return Err("unexpected retained directory".into());}fs::create_dir(copy.join(name)).map_err(|e|e.to_string())?;}
+        }
+        if supported_snapshot(&copy)?!=*snapshot{return Err("supported retained snapshot differs".into());}Ok(copy)
+    }
+    fn supported_header(snapshot:&BTreeMap<String,Option<Vec<u8>>>,name:&str)->Result<u32,String>{
+        let bytes=snapshot.get(name).and_then(Option::as_ref).ok_or("supported database missing")?;
+        if bytes.len()<100 || &bytes[..16]!=b"SQLite format 3\0"{return Err("supported database header invalid".into());}
+        Ok(u32::from_be_bytes(bytes[60..64].try_into().map_err(|_|"short supported header")?))
+    }
+    fn supported_closed(snapshot:&BTreeMap<String,Option<Vec<u8>>>,initial:u32)->Result<(),String>{
+        let names:Vec<_>=snapshot.keys().filter(|n|!n.contains('/')).map(String::as_str).collect();
+        let expected=if initial<2{vec!["backups","instance.db","instance.id","instance.lock"]}else{vec!["instance.db","instance.id","instance.lock"]};
+        if names!=expected || supported_header(snapshot,"instance.db")?!=2{return Err("supported closed root layout/version differs".into());}
+        let mut versions=Vec::new();
+        for name in snapshot.keys().filter(|n|n.starts_with("backups/")) {
+            let version=supported_header(snapshot,name)?;
+            if !name.starts_with(&format!("backups/pre-v{version}-to-v2-")){return Err("supported backup name/version differs".into());}
+            versions.push(version);
+        }
+        versions.sort_unstable();let expected=match initial{0=>vec![0,1],1=>vec![1],2=>Vec::new(),_=>return Err("unsupported initial version".into())};
+        if versions!=expected{return Err(format!("supported backup versions {versions:?} expected {expected:?}"));}Ok(())
+    }
+    fn supported_released(root:&Path,snapshot:&BTreeMap<String,Option<Vec<u8>>>)->Result<(),String>{
+        for (name,bytes) in snapshot {if bytes.is_some(){drop(OpenOptions::new().read(true).write(true).share_mode(0).open(root.join(name)).map_err(|e|format!("supported retained data handle {name}: {e}"))?);}}
+        Ok(())
+    }
+    fn supported_open_once(root:&Path,case:&str,header:u32,epoch:i64)->Result<(),String>{
+        store::test_api::clear();
+        let i=match store::open_instance(root){Ok(i)=>i,Err(error)=>{
+            let events=store::test_api::connection_events();let decoded=store::test_api::header_versions()?;
+            return Err(format!("supported-open {case} open failed {error:?}; events={events:?}; decoded={decoded:?}"));
+        }};
+        let version=store::test_api::user_version(&i);let report=i.startup_report().copied();let open_events=store::test_api::connection_events();
+        let decoded=store::test_api::header_versions();let second_take=store::test_api::header_versions();
+        let closed=i.close();let close_events=store::test_api::connection_events();closed.map_err(|e|e.to_string())?;
+        let version=version.map_err(|e|e.to_string())?;let decoded=decoded?;let second_take=second_take?;
+        if version!=2 || !report.is_some_and(|r|r.epoch==epoch && r.runs_examined==0 && r.runs_changed==0)
+            || open_events!=["stage-b-read-write"] || close_events!=["connection-closed","lock-released"] || decoded!=[header] || !second_take.is_empty(){
+            return Err(format!("supported-open {case} oracle header={decoded:?} second_take={second_take:?} open_events={open_events:?} close_events={close_events:?} version={version} report={report:?} expected_epoch={epoch}"));
+        }
+        println!("INFO WV supported_open_trace case={case} decoded={decoded:?} second_take={second_take:?} open_events={open_events:?} close_events={close_events:?} version={version} epoch={epoch} runs_examined=0 runs_changed=0");Ok(())
+    }
+    fn supported_open()->Result<String,String>{
+        let mut retained_files=0;
+        for &(case,input,version) in &SUPPORTED_OPEN_CASES {
+            let source=PathBuf::from(std::env::var_os(input).ok_or("missing pinned supported fixture")?);let original=supported_snapshot(&source)?;
+            if original.keys().map(String::as_str).collect::<Vec<_>>()!=["instance.db","instance.id","instance.lock"]
+                || original.get("instance.lock")!=Some(&Some(Vec::new())) || supported_header(&original,"instance.db")?!=version{return Err("supported source layout/version differs".into());}
+            let name=source.file_name().and_then(|n|n.to_str()).ok_or("supported source identity missing")?;
+            if name.len()!=32 || !name.bytes().all(|b|b.is_ascii_digit() || (b'a'..=b'f').contains(&b)){return Err("supported source name invalid".into());}
+            let root=parent("supported-open")?.join(name);fs::create_dir(&root).map_err(|e|e.to_string())?;
+            for (name,bytes) in &original{let mut file=File::create_new(root.join(name)).map_err(|e|e.to_string())?;file.write_all(bytes.as_ref().ok_or("supported source directory")?).map_err(|e|e.to_string())?;file.sync_all().map_err(|e|e.to_string())?;}
+            let before=supported_snapshot(&root)?;if before!=original{return Err("supported source copy differs".into());}
+            let baseline=supported_retain(&root,"retained-so-before",&before)?;
+            supported_open_once(&root,case,version,2)?;let after=supported_snapshot(&root)?;supported_closed(&after,version)?;
+            for name in ["instance.id","instance.lock"]{if before.get(name)!=after.get(name){return Err("supported parent changed identity/lock bytes".into());}}
+            if before.get("instance.db")==after.get("instance.db"){return Err("supported startup did not change main bytes".into());}
+            let final_copy=supported_retain(&root,"retained-so-after",&after)?;supported_released(&root,&after)?;
+            let mut probe=command("__supported_open",&root)?;probe.arg(case);let (mut child,logs)=launch(probe,"supported-open-probe")?;
+            if !wait(&mut child,Duration::from_secs(15))?.success(){return Err(format!("supported child failed; logs={}",logs.display()));}
+            let repeated=supported_snapshot(&root)?;supported_closed(&repeated,version)?;
+            for (name,bytes) in &after{if name!="instance.db" && repeated.get(name)!=Some(bytes){return Err("supported child changed identity/lock/backups".into());}}
+            if after.keys().ne(repeated.keys()) || after.get("instance.db")==repeated.get("instance.db"){return Err("supported child layout or startup main change differs".into());}
+            supported_released(&root,&repeated)?;let child_copy=supported_retain(&root,"retained-so-child-after",&repeated)?;
+            for (snapshot,path) in [(&before,&baseline),(&after,&final_copy),(&repeated,&child_copy)]{if supported_snapshot(path)?!=*snapshot{return Err("supported retained copy changed".into());}retained_files+=snapshot.values().filter(|b|b.is_some()).count();}
+            if supported_snapshot(&source)?!=original{return Err("supported original fixture changed".into());}
+            println!("INFO WV supported_open source={} fixture={} case={case} original_version={version} baseline={} after={} child_after={} child_logs={} final_version=2 parent_epoch=2 child_epoch=3 original_unchanged=true copies_verified=true identity_lock_unchanged=true backups_retained=true exclusive_opens=allowed inventory_before={:?} inventory_after={:?} inventory_child_after={:?}",source.display(),root.display(),baseline.display(),final_copy.display(),child_copy.display(),logs.display(),stageb_inventory(&before)?,stageb_inventory(&after)?,stageb_inventory(&repeated)?);
+        }
+        if retained_files!=33{return Err(format!("supported retained file count={retained_files}"));}
+        Ok("genuine V0/V1/V2 no-side-file production opens decode raw headers then Stage B; V0/V1 upgrade and V2 reopens, child epoch2-to3 without repeated migration;33 retained files including backups,6 traces and measured inventories; no non-mutating/durability/fullPF10/W2/product acceptance".into())
     }
 
     fn lock_soak()->Result<String,String>{
