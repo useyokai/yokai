@@ -97,18 +97,18 @@ fn run(c: &mut Checks) -> Result<(), String> {
     println!("INFO db_path={}", path.display());
 
     // R1: the store refuses a relative path and an existing path, and creates a new file.
-    let relative = store::create_file(Path::new("relative.db"));
-    let existing = store::create_file(&dir);
+    let relative = store::test_api::create_file(Path::new("relative.db"));
+    let existing = store::test_api::create_file(&dir);
     c.record(
         "R1_path_rules",
         matches!(relative, Err(store::StoreError::NotAbsolutePath(_)))
             && matches!(existing, Err(store::StoreError::AlreadyExists(_))),
         format!("relative={:?} existing={:?}", relative.err(), existing.err()),
     );
-    let conn = store::create_file(&path).map_err(|e| format!("create_file: {e}"))?;
+    let conn = store::test_api::create_file(&path).map_err(|e| format!("create_file: {e}"))?;
 
     // R2: the linked SQLite is the bundled release, at or above the minimum.
-    let rt = store::sqlite_runtime(&conn).map_err(|e| format!("sqlite_runtime: {e}"))?;
+    let rt = store::test_api::sqlite_runtime(&conn).map_err(|e| format!("sqlite_runtime: {e}"))?;
     let at_least_min = store::parse_version(&rt.version).is_some_and(|v| v >= store::MIN_SQLITE_VERSION);
     c.record(
         "R2_sqlite_version",
@@ -117,11 +117,11 @@ fn run(c: &mut Checks) -> Result<(), String> {
     );
 
     // R3: settings read back after initialization.
-    let s = store::read_settings(&conn).map_err(|e| format!("read_settings: {e}"))?;
+    let s = store::test_api::read_settings(&conn).map_err(|e| format!("read_settings: {e}"))?;
     c.record("R3_settings", settings_ok(&s), format!("{s:?}"));
 
     // R4: the main database is the file at `path`.
-    let file = store::main_database_file(&conn).map_err(|e| format!("main_database_file: {e}"))?;
+    let file = store::test_api::main_database_file(&conn).map_err(|e| format!("main_database_file: {e}"))?;
     let canonical = std::fs::canonicalize(&path).map_err(|e| format!("canonicalize: {e}"))?;
     let same_file = !file.is_empty()
         && std::fs::canonicalize(Path::new(&file))
@@ -134,7 +134,7 @@ fn run(c: &mut Checks) -> Result<(), String> {
     );
 
     // R5: extension loading is refused from SQL.
-    let ext = store::load_extension_refused(&conn);
+    let ext = store::test_api::load_extension_refused(&conn);
     c.record(
         "R5_load_extension_refused",
         matches!(&ext, Ok(msg) if msg.contains("not authorized")),
@@ -177,9 +177,9 @@ fn run(c: &mut Checks) -> Result<(), String> {
         .map_err(|e| format!("control readback: {e}"))?;
     let inserted = raw.execute("INSERT INTO child(id, parent_id) VALUES (3, 77)", []);
     drop(raw);
-    let found = store::foreign_key_violations(&conn).map_err(|e| format!("foreign_key_check: {e}"))?;
+    let found = store::test_api::foreign_key_violations(&conn).map_err(|e| format!("foreign_key_check: {e}"))?;
     let removed = conn.execute("DELETE FROM child WHERE id = 3", []);
-    let after = store::foreign_key_violations(&conn).map_err(|e| format!("foreign_key_check: {e}"))?;
+    let after = store::test_api::foreign_key_violations(&conn).map_err(|e| format!("foreign_key_check: {e}"))?;
     c.record(
         "R8_fk_control",
         fk_off == 0
@@ -193,8 +193,8 @@ fn run(c: &mut Checks) -> Result<(), String> {
     drop(conn);
 
     // R9: reopened from disk, the settings are applied again and the committed rows remain.
-    let conn = store::open_file(&path).map_err(|e| format!("open_file: {e}"))?;
-    let s = store::read_settings(&conn).map_err(|e| format!("read_settings: {e}"))?;
+    let conn = store::test_api::open_file(&path).map_err(|e| format!("open_file: {e}"))?;
+    let s = store::test_api::read_settings(&conn).map_err(|e| format!("read_settings: {e}"))?;
     let (parents, children) = (count(&conn, "parent")?, count(&conn, "child")?);
     c.record(
         "R9_reopen",
@@ -248,7 +248,7 @@ fn run(c: &mut Checks) -> Result<(), String> {
         .map_err(|e| format!("existing db schema: {e}"))?;
     drop(other);
     let before = std::fs::read(&existing_path).map_err(|e| format!("read existing: {e}"))?;
-    let refused = store::create_file(&existing_path);
+    let refused = store::test_api::create_file(&existing_path);
     let after = std::fs::read(&existing_path).map_err(|e| format!("read existing: {e}"))?;
     let side_files = ["existing.db-wal", "existing.db-shm", "existing.db-journal"]
         .into_iter()
@@ -274,10 +274,10 @@ fn run(c: &mut Checks) -> Result<(), String> {
 /// connection is backed by the raced file and has the required settings.
 fn creator_outcome(barrier: &Barrier, path: &Path, canonical_dir: &Path) -> String {
     barrier.wait();
-    match store::create_file(path) {
+    match store::test_api::create_file(path) {
         Ok(conn) => {
-            let file = store::main_database_file(&conn);
-            let settings = store::read_settings(&conn);
+            let file = store::test_api::main_database_file(&conn);
+            let settings = store::test_api::read_settings(&conn);
             let expected = canonical_dir.join(path.file_name().unwrap_or_default());
             let same_file = file.as_ref().ok()
                 .and_then(|reported| std::fs::canonicalize(Path::new(reported)).ok())
@@ -297,7 +297,7 @@ fn dangling_link_refused(dir: &Path) -> Result<(bool, String), String> {
     let link = dir.join("dangling.db");
     let target = dir.join("dangling-target.db");
     std::os::unix::fs::symlink(&target, &link).map_err(|e| format!("symlink: {e}"))?;
-    let result = store::create_file(&link);
+    let result = store::test_api::create_file(&link);
     let target_created = std::fs::symlink_metadata(&target).is_ok();
     let ok = matches!(result, Err(store::StoreError::AlreadyExists(_))) && !target_created;
     Ok((ok, format!("dangling_link={:?} target_created={target_created}", result.err())))

@@ -118,6 +118,10 @@ fn chosen_identity() -> Result<InstanceId, InstanceError> {
 }
 
 pub fn create_instance(parent: &Path) -> Result<Instance, InstanceError> {
+    create_instance_with_options(parent, crate::StoreOptions::default())
+}
+pub fn create_instance_with_options(parent: &Path, options: crate::StoreOptions) -> Result<Instance, InstanceError> {
+    options.validate()?;
     let parent = yokai_platform::location::validate_parent(parent).map_err(|e| path_error(e, true))?;
     let id = chosen_identity()?;
     let root = parent.join(id.to_hex());
@@ -146,13 +150,21 @@ pub fn create_instance(parent: &Path) -> Result<Instance, InstanceError> {
         .map_err(|e| InstanceError::Io(format!("flush Instance directory: {e}")))?;
     yokai_platform::location::flush_directory(&parent)
         .map_err(|e| InstanceError::Io(format!("flush parent directory: {e}")))?;
-    Ok(Instance::new(root, id, connection, lock))
+    Instance::new(root, id, connection, lock, options)
 }
 
 pub fn open_instance(root: &Path) -> Result<Instance, InstanceError> {
-    open_with_plan(root,crate::schema::production())
+    open_instance_with_options(root, crate::StoreOptions::default())
 }
-fn open_with_plan(root:&Path,plan:crate::schema::Plan)->Result<Instance,InstanceError>{
+pub fn open_instance_with_options(root: &Path, options: crate::StoreOptions) -> Result<Instance, InstanceError> {
+    open_with_options_plan(root, crate::schema::production(), options)
+}
+#[cfg(feature = "test-api")]
+pub(crate) fn open_with_plan(root: &Path, plan: crate::schema::Plan) -> Result<Instance, InstanceError> {
+    open_with_options_plan(root, plan, crate::StoreOptions::default())
+}
+fn open_with_options_plan(root: &Path, plan: crate::schema::Plan, options: crate::StoreOptions) -> Result<Instance, InstanceError> {
+    options.validate()?;
     let root = yokai_platform::location::validate_root(root).map_err(|e| path_error(e, false))?;
     let lock_path = root.join("instance.lock");
     let lock_meta = fs::symlink_metadata(&lock_path).map_err(|e| {
@@ -205,7 +217,7 @@ fn open_with_plan(root:&Path,plan:crate::schema::Plan)->Result<Instance,Instance
                 }
             }
             crate::schema::upgrade(&mut connection,&root,id,&created,plan)?;
-            Ok(Instance::new(root, id, connection, lock))
+            Instance::new(root, id, connection, lock, options)
         }
         Err(cause) => {
             let after = preflight::capture_inventory(&root)
@@ -341,82 +353,24 @@ fn open_rw_connection(path: &Path) -> Result<Connection, String> {
 pub struct Instance {
     pub(crate) root: PathBuf,
     pub(crate) id: InstanceId,
-    pub(crate) connection: Option<Connection>,
-    pub(crate) lock: Option<InstanceLock>,
+    pub(crate) runtime: crate::runtime::Runtime,
 }
 
 impl Instance {
-    pub(crate) fn new(root: PathBuf, id: InstanceId, connection: Connection, lock: InstanceLock) -> Self {
-        Self { root, id, connection: Some(connection), lock: Some(lock) }
+    pub(crate) fn new(root: PathBuf, id: InstanceId, connection: Connection, lock: InstanceLock, options: crate::StoreOptions) -> Result<Self, InstanceError> {
+        let runtime = crate::runtime::Runtime::start(connection, &root, id, lock, options)?;
+        Ok(Self { root, id, runtime })
     }
+    pub fn store(&self) -> crate::StoreHandle { self.runtime.handle() }
     pub fn root(&self) -> &Path { &self.root }
     pub fn id(&self) -> InstanceId { self.id }
-    pub fn is_locked(&self) -> bool { self.lock.as_ref().is_some_and(InstanceLock::is_locked) }
+    pub fn is_locked(&self) -> bool { self.runtime.is_locked() }
     /// All retained backup bytes, including partial attempts. No automatic deletion occurs.
     pub fn backup_usage(&self) -> Result<crate::BackupUsage, InstanceError> {
         crate::snapshot::usage(&self.root)
     }
 
-    /// Closes the SQLite handle before releasing the persistent lock-file handle.
-    pub fn close(mut self) -> Result<(), InstanceError> {
-        drop(self.connection.take());
-        #[cfg(feature = "test-api")]
-        crate::failpoint::record_connection("connection-closed");
-        drop(self.lock.take());
-        #[cfg(feature = "test-api")]
-        crate::failpoint::record_connection("lock-released");
-        Ok(())
-    }
-}
-
-#[cfg(feature = "test-api")]
-pub mod test_api {
-    use std::path::{Path, PathBuf};
-
-    use super::{Instance, InstanceError};
-    use crate::failpoint;
-    pub fn open_test_versions(root:&Path,latest:u32,fail:bool)->Result<Instance,InstanceError>{super::open_with_plan(root,crate::schema::test_plan(latest,fail)?)}
-    pub fn lint_migration(sql:&str,version:u32)->Result<(),String>{crate::schema::lint(sql,version)}
-    pub fn backup_warning_for_test(total:u64,threshold:u64)->bool{crate::snapshot::policy(total,threshold).warning}
-
-    pub fn set_next_identity(bytes: [u8; 16]) -> Result<(), String> { failpoint::set_next_identity(bytes) }
-    pub fn clear() {
-        failpoint::clear();
-        yokai_platform::location::clear_directory_flush_observations();
-    }
-    pub fn connection_events() -> Vec<&'static str> { failpoint::take_connection_events() }
-    pub fn directory_flush_observations() -> Vec<(PathBuf, bool)> {
-        yokai_platform::location::take_directory_flush_observations()
-    }
-    pub fn mutate_during_stage_a_once() -> Result<(), String> {
-        failpoint::arm_stage_a_mutation()
-    }
-    pub fn sha256_chunks_for_test(chunks: &[&[u8]]) -> String {
-        crate::preflight::sha256_chunks_for_test(chunks)
-    }
-    pub fn allow_tmpfs_for_test(path: &Path) -> std::io::Result<()> {
-        yokai_platform::location::allow_tmpfs_for_test(path)
-    }
-    pub fn user_version(instance: &Instance) -> Result<i64, InstanceError> {
-        instance.connection.as_ref().ok_or(InstanceError::CloseIncomplete)?
-            .query_row("PRAGMA user_version", [], |row| row.get(0))
-            .map_err(|e| InstanceError::Store(e.to_string()))
-    }
-    pub fn no_checkpoint_on_close(instance: &Instance) -> Result<(), InstanceError> {
-        instance.connection.as_ref().ok_or(InstanceError::CloseIncomplete)?
-            .set_db_config(rusqlite::config::DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE,true)
-            .map(|_|()).map_err(|e|InstanceError::Store(e.to_string()))
-    }
-    pub fn hardened_settings(instance: &Instance) -> Result<(i64,bool,i64,i64),InstanceError> {
-        let c=instance.connection.as_ref().ok_or(InstanceError::CloseIncomplete)?;
-        let read=||->rusqlite::Result<_>{Ok((c.query_row("PRAGMA trusted_schema",[],|r|r.get(0))?,
-            c.db_config(rusqlite::config::DbConfig::SQLITE_DBCONFIG_DEFENSIVE)?,
-            c.query_row("PRAGMA auto_vacuum",[],|r|r.get(0))?,c.query_row("PRAGMA wal_autocheckpoint",[],|r|r.get(0))?))};
-        read().map_err(|e|InstanceError::Store(e.to_string()))
-    }
-    pub fn schema_objects(instance: &Instance) -> Result<i64, InstanceError> {
-        instance.connection.as_ref().ok_or(InstanceError::CloseIncomplete)?
-            .query_row("SELECT count(*) FROM sqlite_schema WHERE lower(substr(name, 1, 7)) <> 'sqlite_'", [], |row| row.get(0))
-            .map_err(|e| InstanceError::Store(e.to_string()))
-    }
+    /// Rejects new/queued work, joins workers and closes all connections before releasing ownership.
+    /// A close deadline failure deliberately retains the lock until process exit.
+    pub fn close(mut self) -> Result<(), InstanceError> { self.runtime.close() }
 }
