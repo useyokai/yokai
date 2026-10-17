@@ -1,7 +1,6 @@
 # Yokai workspace.
 #
-# Every member is listed explicitly, so a stray directory under crates/ is not built as a
-# workspace member.
+# Every member is listed explicitly, so a stray directory under crates/ is not a workspace member.
 [workspace]
 resolver = "3"
 members = [
@@ -23,14 +22,12 @@ license = "Apache-2.0"
 publish = false
 
 [workspace.dependencies]
-# Exact version and explicit features. `bundled` compiles the SQLite amalgamation shipped with
-# libsqlite3-sys, so the SQLite release does not depend on the host; `cache` keeps the prepared
-# statement cache. Default features are off so that no WebAssembly-only dependency is enabled.
-# `load_extension` must never be enabled.
 rusqlite = { version = "=0.40.2", default-features = false, features = ["bundled", "cache"] }
 yokai-testsupport = { path = "crates/yokai-testsupport" }
+getrandom = { version = "=0.4.3", default-features = false }
+yokai-platform = { path = "crates/yokai-platform" }
+yokai-types = { path = "crates/yokai-types" }
 
-# Use stack unwinding rather than aborting on panic.
 [profile.dev]
 panic = "unwind"
 

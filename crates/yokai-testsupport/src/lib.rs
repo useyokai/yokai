@@ -1,10 +1,10 @@
 //! Test-only support code. This crate may appear only as a dev-dependency.
 //!
-//! Every test binary in the workspace must use a custom harness, call [`make_non_dumpable`] as its
-//! first action, print [`Dumpable::line`], and refuse to run any check unless [`Dumpable::ok`]
-//! holds, so that a crashing test does not produce a core dump (unless the host sets
-//! `fs.suid_dumpable=2`). Each process clears the flag for itself: `execve` resets it, so nothing
-//! set by a parent is relied on.
+//! Every test binary in the workspace must use a custom harness and report its dumpability
+//! status before running checks. Linux must clear the process dumpable flag. Windows has no
+//! equivalent implemented here, so checks remain disabled unless an isolated test runner sets
+//! YOKAI_TEST_ALLOW_UNPROTECTED_WINDOWS=1; this opt-in does not disable Windows Error Reporting
+//! or establish that Windows crash dumps are impossible. Other unsupported targets remain blocked.
 #![deny(unsafe_code)]
 
 /// Values observed while clearing the dumpable flag.
@@ -25,17 +25,46 @@ impl Dumpable {
     }
 
     /// The first line every test binary prints: `DUMPABLE before=<n> set_rc=<n> after=<n>`.
+    /// Allows checks only after Linux protection succeeds or with the explicit Windows opt-in.
+    pub fn permits_checks(&self) -> bool {
+        if self.ok() {
+            return true;
+        }
+        #[cfg(windows)]
+        {
+            self.before == -1 && self.set_rc == -1 && self.after == -1 && windows_test_opt_in()
+        }
+        #[cfg(not(windows))]
+        {
+            false
+        }
+    }
+
     pub fn line(&self) -> String {
+        #[cfg(windows)]
+        if self.before == -1 && self.set_rc == -1 && self.after == -1 {
+            return format!(
+                "DUMPABLE status=unsupported platform=windows opt_in={}",
+                u8::from(windows_test_opt_in())
+            );
+        }
         format!("DUMPABLE before={} set_rc={} after={}", self.before, self.set_rc, self.after)
     }
 }
 
-/// Reads the dumpable flag, clears it, and reads it back.
-///
-/// Implemented for Linux only. Elsewhere nothing is changed and every field is -1, so
-/// [`Dumpable::ok`] is false and a gated test refuses to run.
+/// Reads and clears the Linux dumpable flag. Windows reports the unsupported sentinel; its
+/// gated test can proceed only with the explicit isolated-test opt-in documented above.
+
 pub fn make_non_dumpable() -> Dumpable {
     sys::make_non_dumpable()
+}
+
+#[cfg(windows)]
+const WINDOWS_OPT_IN_ENV: &str = "YOKAI_TEST_ALLOW_UNPROTECTED_WINDOWS";
+
+#[cfg(windows)]
+fn windows_test_opt_in() -> bool {
+    matches!(std::env::var(WINDOWS_OPT_IN_ENV), Ok(value) if value == "1")
 }
 
 #[cfg(target_os = "linux")]

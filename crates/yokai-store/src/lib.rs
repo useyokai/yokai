@@ -116,6 +116,14 @@ pub fn create_file(path: &Path) -> Result<Connection, StoreError> {
         Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
             return Err(StoreError::AlreadyExists(path.display().to_string()));
         }
+        // Windows CREATE_NEW reports access denied for an existing directory. Confirm the
+        // directory entry before normalizing that platform-specific result.
+        #[cfg(windows)]
+        Err(error) if error.kind() == io::ErrorKind::PermissionDenied
+            && std::fs::symlink_metadata(path).is_ok() =>
+        {
+            return Err(StoreError::AlreadyExists(path.display().to_string()));
+        }
         Err(error) => return Err(StoreError::CreateFile { path: path.display().to_string(), error }),
     }
     let conn = Connection::open_with_flags(path, rw_flags() | OpenFlags::SQLITE_OPEN_NOFOLLOW)?;
@@ -189,9 +197,9 @@ pub fn read_settings(conn: &Connection) -> rusqlite::Result<ConnectionSettings> 
 
 /// Path of the file behind the `main` database; empty for an in-memory or temporary database.
 pub fn main_database_file(conn: &Connection) -> rusqlite::Result<String> {
-    let file: Option<String> =
+    let database_path: Option<String> =
         conn.query_row("SELECT file FROM pragma_database_list WHERE name = 'main'", [], |r| r.get(0))?;
-    Ok(file.unwrap_or_default())
+    Ok(database_path.unwrap_or_default())
 }
 
 pub fn sqlite_runtime(conn: &Connection) -> rusqlite::Result<SqliteRuntime> {
@@ -243,3 +251,12 @@ pub fn foreign_key_violations(conn: &Connection) -> rusqlite::Result<Vec<String>
     })?;
     rows.collect()
 }
+
+mod instance;
+mod preflight;
+#[cfg(feature = "test-api")]
+mod failpoint;
+pub use instance::{create_instance, open_instance, IncompleteReason, Instance, InstanceError};
+pub use preflight::{FileInventory, InventoryEntry};
+#[cfg(feature = "test-api")]
+pub use instance::test_api;

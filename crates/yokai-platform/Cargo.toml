@@ -14,3 +14,10 @@ autobenches = false
 [lib]
 test = false
 doctest = false
+
+[dependencies]
+getrandom = { workspace = true }
+yokai-types = { workspace = true }
+
+[features]
+test-api = []
