@@ -266,3 +266,25 @@ released handles are checked afterward. These cases do not establish
 supported-version startup, every corruption/recovery mode, power-loss
 durability or complete PF-11/W2 acceptance. No main database, WAL or Instance
 root is removed, and no host permissions change.
+
+### Inconsistent Windows side files
+
+`WV-PREFLIGHT-CONSISTENCY` constructs independent closed target and donor
+Instances with genuine committed page-1 WALs. The target has main version3
+and WAL version4; a distinct donor has WAL version5. It separately transplants
+the donor WAL or SHM, or truncates a fresh closed target main file to zero
+while leaving its WAL present. Pristine target/donor and altered target files
+are retained before each probe. Only closed owned target SHM is removed during
+foreign-WAL construction so SQLite must recover the index.
+
+Foreign WAL must refuse version5 and foreign SHM must refuse version4 through
+Stage-A read-only, without writable or raw-header fallback. Zero main with WAL
+must refuse before SQLite. Every non-SHM entry and byte stays unchanged; the
+zero-main case preserves the complete root. SHM effects, released handles,
+retained copies and unchanged donor roots are checked separately. A foreign
+SHM refusal does not by itself establish that SQLite rebuilt the SHM.
+
+These future-version fixtures do not establish supported-version foreign-file
+safety, later identity/integrity validation, all inconsistent layouts or full
+PF-12/W2 acceptance. No main database, WAL or Instance root is removed or
+repaired, and no host permissions change.
