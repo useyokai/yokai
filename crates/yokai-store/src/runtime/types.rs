@@ -44,7 +44,11 @@ impl fmt::Display for WriteFailure {
 }
 impl std::error::Error for WriteFailure {}
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct WriteSuccess { pub operation_id: u64 }
+pub struct WriteSuccess {
+    pub operation_id: u64,
+    /// Worker-confirmed command decision; health maintenance returns None.
+    pub command: Option<crate::AcceptOutcome>,
+}
 pub type WriteResult = Result<WriteSuccess, WriteFailure>;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Completion { pub operation_id: u64, pub phase: Phase, pub result: WriteResult }

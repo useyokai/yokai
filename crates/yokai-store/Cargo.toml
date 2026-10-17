@@ -50,3 +50,9 @@ name = "instance_migrations"
 path = "tests/instance_migrations.rs"
 harness = false
 required-features = ["test-api"]
+
+[[test]]
+name = "durable_primitives"
+path = "tests/durable_primitives.rs"
+harness = false
+required-features = ["test-api"]

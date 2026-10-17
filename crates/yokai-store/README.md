@@ -1,13 +1,15 @@
 # Instance schema migrations
 
-The current schema version is **1**. It adds only the STRICT singleton
+The current schema version is **2**. V1 contains the STRICT singleton
 `instance_meta` table and the owned runner's `yokai_schema_history` table.
-Commands, Runs, jobs, product workers and dispatch remain outside this crate API.
+V2 adds STRICT `runtime_epoch`, `runs`, `commands`, `jobs` and `events` tables.
+Jobs are records only. Admission, claim, execution and dispatch have no crate API.
 
 SQL lives in `migrations/V{n}__{name}.sql` and is embedded at compile time.
 Each migration ends with its matching `PRAGMA user_version = n;`. The
 conservative lint rejects transaction control, connection-changing statements
-and quoted identifiers. Migration SQL, its history row, version and the V1
+and quoted identifiers; only the exact command refusal trigger grammar is allowed.
+Migration SQL, its history row, version and the V1
 bound identity insert commit in one owned transaction. Checksums detect drift;
 they are not protection against a writer who can replace the database.
 
@@ -38,8 +40,8 @@ Free-space measurement is implemented for Windows and x86_64 glibc Linux;
 other targets fail closed before upgrade. Native Linux validation is separate
 from Windows validation.
 
-Tests require the explicit `test-api` feature. Synthetic V2/V3 plans and fault
-injection exist only behind that feature; production always selects V1. The
+Tests require the explicit `test-api` feature. Synthetic V3/V4 plans and fault
+injection exist only behind that feature; production selects V1 followed by V2. The
 low-level connection functions are exposed only through `test_api`; default builds expose no raw connection, transaction or SQL entry point.
 
 
@@ -49,7 +51,7 @@ Creation/opening completes all compatibility checks and migrations before moving
 its connection into one writer thread. Each Instance also owns one read-only
 reader and watchdog by default, configurable to two readers. All connections
 verify their hardening settings. Request queues default to64, configurable from
-1 through256. No dependency or schema version is added by this runtime.
+1 through256. The connection runtime uses the existing reviewed dependencies.
 
 `Instance::store()` returns a clonable `StoreHandle` with typed metadata reads
 and a health-check maintenance write. An operation deadline governs admission
@@ -72,7 +74,51 @@ unconfirmed rollback, corruption or writer panic fail it. Failed is terminal
 for this open. Degraded refuses ordinary writes until a typed health-check
 write commits for the same degradation generation. A new fault during or after
 that health transaction requires a subsequent health commit; a stale success
-cannot clear it. Application command identity/domain operations are a later API.
+cannot clear it. Typed command acceptance uses the same queue and failure engine.
+
+## Durable command acceptance and startup
+
+`CommandRequest::new(CommandId, kind, operation_version, payload)` accepts an ID
+of1..128 UTF8 bytes, a kind of1..64 UTF8 bytes, version1..65535 and at most65536
+payload bytes. Payloads are opaque caller-canonical bytes. The crate performs no
+JSON normalization. A changed encoding needs a new operation version. Clients
+persist an ID before sending and retain the identical kind, version and bytes
+when retrying that ID.
+
+The digest is SHA256 over `b"yokai.command.v1\0"`, big-endian u32 kind byte
+length, UTF8 kind bytes, big-endian u32 version, big-endian u64 payload length,
+then payload bytes. Command identity is excluded from the digest.
+
+`StoreHandle::accept_command(request, operation_deadline)` returns a
+`PendingCommand`; `wait(wait_deadline)` returns `Accepted`, `Duplicate` or
+`Conflict`, each carrying the original `run_id`. A new acceptance commits one
+Queued/Open run, one immutable command, Pending job1 and one `run.accepted`
+event atomically. Matching identity and digest returns Duplicate; a different
+digest returns Conflict. These decisions follow a confirmed rollback and add no
+records. UPDATE, DELETE and replacement writes to existing commands are refused
+by schema triggers, including REPLACE with recursive triggers disabled.
+
+A successful acceptance reply follows COMMIT. A timeout or ambiguous result
+does not cancel work; reopen if needed and retry the original request to resolve
+durable truth. A duplicate reply does not mean that its run is runnable: startup
+may already have placed that run on hold. Completion diagnostics retain the
+typed decision when the caller stops waiting; they contain no payload bytes.
+
+Creation initializes epoch1. Each subsequent successful open first commits an
+incremented epoch and `runtime.epoch` event, then holds each Open, non-Held run
+in its own transaction with one `run.held` event. RecoveryRequired takes
+precedence; WaitingApproval becomes ApprovalInvalidated; other eligible runs
+become StartupInterrupted. Terminal runs and existing holds remain unchanged.
+Partial startup can commit an epoch and some holds before failing; reopening
+continues safely without duplicating holds. Epoch overflow fails closed.
+`Instance::startup_report()` exposes the completed epoch and counts. No handle
+escapes before startup finishes. Successful opens therefore write durable state;
+compatibility refusals retain their separate preservation rules.
+
+V1 upgrades retain a verified pre-upgrade snapshot. V1 binaries refuse V2;
+automatic downgrade and database repair are unsupported. Current validation is
+native Windows MSVC. WSL processing of saved logs does not establish Linux
+runtime validation, power-loss durability or product acceptance.
 
 Reader cancellation has one guarded query ID. The watchdog interrupts only an
 expired matching ID while holding the mutex used to finish that query and

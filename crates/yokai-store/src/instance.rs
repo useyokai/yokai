@@ -150,7 +150,7 @@ pub fn create_instance_with_options(parent: &Path, options: crate::StoreOptions)
         .map_err(|e| InstanceError::Io(format!("flush Instance directory: {e}")))?;
     yokai_platform::location::flush_directory(&parent)
         .map_err(|e| InstanceError::Io(format!("flush parent directory: {e}")))?;
-    Instance::new(root, id, connection, lock, options)
+    Instance::new(root, id, connection, lock, options, Some(crate::StartupReport::created()))
 }
 
 pub fn open_instance(root: &Path) -> Result<Instance, InstanceError> {
@@ -217,7 +217,22 @@ fn open_with_options_plan(root: &Path, plan: crate::schema::Plan, options: crate
                 }
             }
             crate::schema::upgrade(&mut connection,&root,id,&created,plan)?;
-            Instance::new(root, id, connection, lock, options)
+            let startup=if plan.has_durable(){
+                match crate::startup::recover(&mut connection){
+                    Ok(report)=>Some(report),
+                    Err(error)=>{
+                        match connection.close(){
+                            Ok(())=>drop(lock),
+                            Err((connection,close_error))=>{
+                                std::mem::forget(connection);std::mem::forget(lock);
+                                return Err(InstanceError::Store(format!("{error}; SQLite close unconfirmed: {close_error}; ownership retained")));
+                            }
+                        }
+                        return Err(error);
+                    }
+                }
+            }else{None};
+            Instance::new(root, id, connection, lock, options, startup)
         }
         Err(cause) => {
             let after = preflight::capture_inventory(&root)
@@ -354,14 +369,18 @@ pub struct Instance {
     pub(crate) root: PathBuf,
     pub(crate) id: InstanceId,
     pub(crate) runtime: crate::runtime::Runtime,
+    startup: Option<crate::StartupReport>,
 }
 
 impl Instance {
-    pub(crate) fn new(root: PathBuf, id: InstanceId, connection: Connection, lock: InstanceLock, options: crate::StoreOptions) -> Result<Self, InstanceError> {
+    pub(crate) fn new(root: PathBuf, id: InstanceId, connection: Connection, lock: InstanceLock, options: crate::StoreOptions, startup:Option<crate::StartupReport>) -> Result<Self, InstanceError> {
         let runtime = crate::runtime::Runtime::start(connection, &root, id, lock, options)?;
-        Ok(Self { root, id, runtime })
+        Ok(Self { root, id, runtime, startup })
     }
     pub fn store(&self) -> crate::StoreHandle { self.runtime.handle() }
+    /// Creation initializes epoch1; later successful opens complete startup before returning.
+    /// None is reserved for diagnostic plans deliberately stopping at V1.
+    pub fn startup_report(&self)->Option<&crate::StartupReport>{self.startup.as_ref()}
     pub fn root(&self) -> &Path { &self.root }
     pub fn id(&self) -> InstanceId { self.id }
     pub fn is_locked(&self) -> bool { self.runtime.is_locked() }

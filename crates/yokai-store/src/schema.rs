@@ -5,14 +5,17 @@ use yokai_types::InstanceId;
 use crate::InstanceError;
 
 const V1: &str = include_str!("../migrations/V1__instance_meta.sql");
+const V2: &str = include_str!("../migrations/V2__durable_records.sql");
 const HISTORY: &str = "CREATE TABLE yokai_schema_history (version INTEGER PRIMARY KEY, name TEXT NOT NULL, checksum TEXT NOT NULL CHECK (length(checksum) = 64), applied_at TEXT NOT NULL) STRICT";
 #[derive(Clone,Copy)]
-struct Migration { version:u32,name:&'static str,sql:&'static str,creates:&'static str }
-const FIRST:Migration=Migration{version:1,name:"instance_meta",sql:V1,creates:"instance_meta"};
+struct Migration { version:u32,name:&'static str,sql:&'static str }
+const FIRST:Migration=Migration{version:1,name:"instance_meta",sql:V1};
+const SECOND:Migration=Migration{version:2,name:"durable_records",sql:V2};
 #[derive(Clone,Copy)]
 pub(crate) struct Plan(&'static [Migration]);
 impl Plan {
     pub(crate) fn latest(self)->u32 {self.0.last().map_or(0,|m|m.version)}
+    pub(crate) fn has_durable(self)->bool{self.0.iter().any(|m|m.version==2 && m.name=="durable_records")}
     fn validate(self)->Result<(),InstanceError>{
         for (i,m) in self.0.iter().enumerate(){
             if m.version as usize!=i+1{return Err(migration("non-contiguous embedded plan"));}
@@ -21,13 +24,13 @@ impl Plan {
         Ok(())
     }
 }
-pub(crate) fn production()->Plan{Plan(&[FIRST])}
+pub(crate) fn production()->Plan{Plan(&[FIRST,SECOND])}
 #[cfg(feature="test-api")]
 pub(crate) fn test_plan(latest:u32,fail:bool)->Result<Plan,InstanceError>{
-    const SECOND:Migration=Migration{version:2,name:"migration_probe",sql:"CREATE TABLE migration_probe (id INTEGER PRIMARY KEY, value TEXT NOT NULL) STRICT; PRAGMA user_version = 2;",creates:"migration_probe"};
-    const FAIL:Migration=Migration{version:2,name:"migration_probe",sql:"CREATE TABLE migration_probe (id INTEGER PRIMARY KEY, value TEXT NOT NULL) STRICT; INSERT INTO missing_table VALUES(1); PRAGMA user_version = 2;",creates:"migration_probe"};
-    const THIRD:Migration=Migration{version:3,name:"probe_data",sql:"INSERT INTO migration_probe VALUES(1,'retained'); PRAGMA user_version = 3;",creates:""};
-    match (latest,fail){(1,false)=>Ok(production()),(2,false)=>Ok(Plan(&[FIRST,SECOND])),(2,true)=>Ok(Plan(&[FIRST,FAIL])),(3,false)=>Ok(Plan(&[FIRST,SECOND,THIRD])),_=>Err(migration("invalid test-only plan"))}
+    const PROBE:Migration=Migration{version:3,name:"migration_probe",sql:"CREATE TABLE migration_probe (id INTEGER PRIMARY KEY, value TEXT NOT NULL) STRICT; PRAGMA user_version = 3;"};
+    const FAIL:Migration=Migration{version:3,name:"migration_probe",sql:"CREATE TABLE migration_probe (id INTEGER PRIMARY KEY, value TEXT NOT NULL) STRICT; INSERT INTO missing_table VALUES(1); PRAGMA user_version = 3;"};
+    const DATA:Migration=Migration{version:4,name:"probe_data",sql:"INSERT INTO migration_probe VALUES(1,'retained'); PRAGMA user_version = 4;"};
+    match (latest,fail){(1,false)=>Ok(Plan(&[FIRST])),(2,false)=>Ok(production()),(3,false)=>Ok(Plan(&[FIRST,SECOND,PROBE])),(3,true)=>Ok(Plan(&[FIRST,SECOND,FAIL])),(4,false)=>Ok(Plan(&[FIRST,SECOND,PROBE,DATA])),_=>Err(migration("invalid test-only plan"))}
 }
 
 fn inconsistent(e: impl ToString) -> InstanceError { InstanceError::SchemaInconsistent(e.to_string()) }
@@ -53,13 +56,18 @@ pub(crate) fn inspect(conn: &Connection, id: InstanceId, created: &str, plan:Pla
         if !objects.is_empty() { return Err(inconsistent(format!("{} schema objects at version 0", objects.len()))); }
         return Ok(0);
     }
-    let mut expected=vec![("yokai_schema_history",HISTORY)];
-    for m in plan.0.iter().filter(|m|i64::from(m.version)<=version && !m.creates.is_empty()) {
-        expected.push((m.creates,m.sql.split(';').next().ok_or_else(||inconsistent("missing embedded DDL"))?));
+    // SQLite itself determines statement/trigger boundaries in the reference schema.
+    // The reference is memory-only; the inspected database connection remains read-only.
+    let reference=Connection::open_in_memory().map_err(inconsistent)?;
+    reference.execute_batch(HISTORY).map_err(inconsistent)?;
+    for m in plan.0.iter().filter(|m|i64::from(m.version)<=version) {
+        reference.execute_batch(m.sql).map_err(inconsistent)?;
     }
-    expected.sort_by_key(|e|e.0);
-    if objects.len() != expected.len() || !objects.iter().zip(expected).all(|((kind,name,sql),(want,ddl))|
-        kind == "table" && name == want && normalized(sql) == normalized(ddl)) {
+    let mut expected_stmt=reference.prepare("SELECT type,name,sql FROM sqlite_schema WHERE lower(substr(name,1,7)) <> 'sqlite_' ORDER BY name").map_err(inconsistent)?;
+    let expected:Vec<(String,String,String)>=expected_stmt.query_map([],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?)))
+        .map_err(inconsistent)?.collect::<Result<_,_>>().map_err(inconsistent)?;
+    if objects.len() != expected.len() || !objects.iter().zip(expected).all(|((kind,name,sql),(want_kind,want_name,ddl))|
+        kind == &want_kind && name == &want_name && normalized(sql) == normalized(&ddl)) {
         return Err(inconsistent("schema objects differ from the embedded version"));
     }
     let mut stmt = conn.prepare("SELECT version,name,checksum,applied_at FROM yokai_schema_history ORDER BY version").map_err(inconsistent)?;
@@ -82,6 +90,11 @@ pub(crate) fn inspect(conn: &Connection, id: InstanceId, created: &str, plan:Pla
     }
     if meta[0].4.as_deref().is_some_and(|s| !crate::instance::valid_timestamp(s)) {
         return Err(inconsistent("invalid last_health_check"));
+    }
+    if version>=2 && plan.has_durable() {
+        let epochs:Vec<(i64,i64)>=conn.prepare("SELECT id,epoch FROM runtime_epoch").map_err(inconsistent)?
+            .query_map([],|r|Ok((r.get(0)?,r.get(1)?))).map_err(inconsistent)?.collect::<Result<_,_>>().map_err(inconsistent)?;
+        if epochs.len()!=1 || epochs[0].0!=1 || epochs[0].1<1{return Err(inconsistent("runtime epoch singleton missing or invalid"));}
     }
     Ok(version as u32)
 }
@@ -111,19 +124,40 @@ pub(crate) fn lint(sql: &str, version: u32) -> Result<(), String> {
     if !text.trim_end().ends_with(';') || statements.last().copied()!=Some(format!("pragma user_version = {version}").as_str()) {
         return Err("migration must end with its matching PRAGMA user_version".into());
     }
+    let mut trigger_end=false;
     for (index,statement) in statements.iter().enumerate() {
         let tokens: Vec<&str> = statement.split(|c:char| !c.is_ascii_alphanumeric() && c!='_').filter(|s| !s.is_empty()).collect();
+        if trigger_end {
+            if tokens!=["end"] {return Err("immutable trigger must end immediately".into());}
+            trigger_end=false;continue;
+        }
+        if tokens.starts_with(&["create","trigger"]) {
+            // Only the reviewed command refusal triggers need BEGIN/END in a migration.
+            // A trigger cannot smuggle a transaction/connection statement through lint.
+            let direct=tokens.len()==12 && ["commands_immutable","commands_append_only"].contains(&tokens[2])
+                && tokens[3]=="before" && ["update","delete"].contains(&tokens[4])
+                && tokens[5..]==["on","commands","begin","select","raise","abort","literal"];
+            let replacement=tokens==["create","trigger","commands_no_replace","before","insert","on","commands",
+                "when","exists","select","1","from","commands","where","command_id","new","command_id",
+                "or","run_id","new","run_id","begin","select","raise","abort","literal"];
+            if !direct && !replacement {
+                return Err("only immutable command refusal triggers are allowed".into());
+            }
+            trigger_end=true;continue;
+        }
         if tokens.iter().any(|s| ["begin","commit","end","rollback","savepoint","release","vacuum","attach","detach"].contains(s)) {
             return Err("forbidden transaction or connection statement".into());
         }
         if tokens.contains(&"pragma") && index+1!=statements.len() { return Err("only terminal user_version PRAGMA is allowed".into()); }
     }
+    if trigger_end {return Err("unterminated immutable trigger".into());}
     Ok(())
 }
 
 pub(crate) fn migrate_new(conn: &mut Connection, id: InstanceId, created: &str) -> Result<(), InstanceError> {
     let plan=production();plan.validate()?;
-    apply(conn,id,created,FIRST,plan)
+    for m in plan.0 {apply(conn,id,created,*m,plan)?;}
+    Ok(())
 }
 fn apply(conn:&mut Connection,id:InstanceId,created:&str,m:Migration,plan:Plan)->Result<(),InstanceError>{
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate).map_err(migration)?;

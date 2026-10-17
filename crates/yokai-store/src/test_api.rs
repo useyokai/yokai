@@ -57,6 +57,9 @@ pub fn read_error_probe(instance: &Instance, deadline: std::time::Instant, code:
 }
 #[derive(Clone, Debug)]
 pub struct WriteProbe { pub sql: String, pub fault: WriteFault }
+pub fn accept_command_fault(instance:&Instance,request:crate::CommandRequest,deadline:std::time::Instant,fault:WriteFault)->Result<crate::PendingCommand,crate::WriteFailure>{
+    instance.store().command_fault(request,deadline,fault)
+}
 pub fn write_probe(instance: &Instance, deadline: std::time::Instant, probe: WriteProbe) -> Result<crate::PendingWrite, crate::WriteFailure> {
     instance.store().write_probe(deadline, probe)
 }

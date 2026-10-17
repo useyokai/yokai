@@ -5,6 +5,10 @@ pub use connection::{StoreError, ConnectionSettings, SqliteRuntime, MIN_SQLITE_V
     ext_code, parse_version, require_min_version};
 pub(crate) use connection::{create_file, init_connection, foreign_key_violations};
 mod runtime;
+mod durable;
+pub use durable::{CommandRequest,InvalidCommand,AcceptOutcome,PendingCommand};
+mod startup;
+pub use startup::StartupReport;
 pub use runtime::{StoreHandle, StoreOptions, StoreState, Phase, Certainty, WriteReason,
     WriteEvidence, WriteFailure, WriteSuccess, WriteResult, Completion, PendingWrite,
     InstanceMetadata, ReadError, PendingRead, StoreMetrics};
