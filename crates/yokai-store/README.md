@@ -428,3 +428,27 @@ original scope. These fixtures do not establish every corruption/geometry,
 absence of transient writes, file identity/metadata/race safety, full PF6/W2,
 power-loss durability, security or product acceptance. An Integrity result row
 is not a SQLite extended error code.
+
+### Windows raw-header refusal witnesses
+
+`WV-RAW-HEADER` uses fifteen independent closed V2 roots without side files.
+Nine cases alter magic, page-size encoding1000/65535, format3/3, reserved8,
+payload fractions65/32/32, schema format5, text encoding2 or file length minus1.
+Each also contains max unsigned user_version; the exact `HeaderInvalid` field
+must take precedence over a newer-version refusal, with no SQLite connection.
+SQLite has a16-bit page-size field:1 denotes65536;131072 cannot be directly
+encoded. The actual malformed upper encoding tested here is65535.
+
+Six otherwise unchanged headers encode future versions3,255,256,65536,
+16777216 and4294967295. Each must return exact `SchemaTooNew` found/maximum2
+values before SQLite. Accepted0/1/2 behavior retains its separate migration
+and startup coverage. Connection hooks establish the observed route; they
+are not instrumentation of every internal version-decode operation.
+
+Pristine, altered, post-refusal and fresh-child copies retain180 ordinary files.
+Complete closed names/types/bytes and explicit absent WAL/SHM/journal entries
+must match after refusal and child repetition; exclusive data opens check
+released handles. No main/WAL/root is deleted or repaired. These selected
+encodings do not establish exhaustive valid headers, file identity/metadata,
+absence of transient writes, hostile-race safety, full PF16/PF17/W2, Linux
+parity, power-loss durability or broader product/security/release acceptance.
