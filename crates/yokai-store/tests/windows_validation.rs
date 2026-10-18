@@ -162,6 +162,16 @@ mod native {
             let mode=args.get(1).ok_or("child mode missing")?;let root=Path::new(args.get(2).ok_or("child root missing")?);
             match mode.as_str(){
                 "__busy"=>{if !matches!(store::open_instance(root),Err(InstanceError::Busy(_))){return Err("competing opener was not Busy".into());}},
+                "__junction_refusal"=>{junction_refusal(root)?;println!("INFO B3 junction_child mode=refusal outcome=PathInvalid sqlite_events=[]");},
+                "__junction_busy"=>{junction_busy(root)?;println!("INFO B3 junction_child mode=busy outcome=Busy sqlite_events=[]");},
+                "__junction_reopen"=>{
+                    let expected=Path::new(args.get(3).ok_or("missing expected canonical root")?);
+                    let i=store::open_instance(root).map_err(|e|e.to_string())?;
+                    if i.root()!=expected{return Err("child canonical root differs".into());}i.close().map_err(|e|e.to_string())?;
+                    let c=ro(expected)?;let integrity:String=c.query_row("PRAGMA integrity_check",[],|r|r.get(0)).map_err(|e|e.to_string())?;
+                    c.close().map_err(|(_,e)|e.to_string())?;if integrity!="ok"{return Err("junction child reopen integrity differs".into());}
+                    println!("INFO B3 junction_child mode=reopen canonical_binding=true integrity=ok");
+                },
                 "__truth"=>{
                     let c=ro(root)?;
                     for table in ["runs","commands","jobs","events WHERE kind='run.accepted'"]{
@@ -390,8 +400,157 @@ mod native {
         }
         println!("INFO WV UNC=syntax_only actual_loopback_share=not_checked subst=not_checked no host mappings/shares/privileges changed");
         drop(pause);i.close().map_err(|e|e.to_string())?;
-        Ok(format!("no second owner or protected-byte change for {exercised:?}; capability gaps explicit; only verified owned links unlinked, all targets/logs retained"))
+        junction_cases()?;
+        Ok(format!("no second owner or protected-byte change for {exercised:?}; six required-entry/direct-root junction refusals and canonical junction-ancestor ownership checked; host capability gaps explicit; only verified owned links unlinked, all targets/logs retained"))
     }
+    /// An inventory never follows a reparse entry. Target content is observed
+    /// separately, so redirecting a link cannot hide an outside-target change.
+    fn junction_inventory(root:&Path)->Result<String,String>{
+        use std::os::windows::fs::MetadataExt;
+        fn visit(root:&Path,path:&Path,depth:usize,rows:&mut BTreeMap<String,String>)->Result<(),String>{
+            use std::os::windows::fs::MetadataExt;
+            if depth>8{return Err("owned inventory nesting exceeds its fixture bound".into());}
+            for entry in fs::read_dir(path).map_err(|e|e.to_string())?{
+                let entry=entry.map_err(|e|e.to_string())?;let path=entry.path();
+                let name=path.strip_prefix(root).map_err(|e|e.to_string())?.to_str().ok_or("non-UTF8 fixture name")?.replace('\\',"/");
+                if name.contains(['\t','\n','\r']){return Err("ambiguous inventory name".into());}
+                let meta=fs::symlink_metadata(&path).map_err(|e|e.to_string())?;let attrs=meta.file_attributes();
+                let value=if attrs&0x400!=0{
+                    if attrs&0x10==0{return Err("unexpected non-directory reparse in junction fixture".into());}
+                    format!("junction\t{attrs}\t{:?}",fs::read_link(&path).map_err(|e|e.to_string())?)
+                }else if meta.is_file(){
+                    yokai_platform::location::validate_regular_single_link(&path,&meta).map_err(|e|e.to_string())?;
+                    let bytes=fs::read(&path).map_err(|e|e.to_string())?;
+                    if bytes.len() as u64!=meta.len(){return Err("inventory file length changed during read".into());}
+                    format!("file\t{attrs}\t{}\t{}",meta.len(),store::test_api::sha256_chunks_for_test(&[&bytes]))
+                }else if meta.is_dir(){
+                    visit(root,&path,depth+1,rows)?;format!("directory\t{attrs}")
+                }else{return Err("unknown junction-fixture entry kind".into());};
+                rows.insert(name,value);
+            }
+            Ok(())
+        }
+        let meta=fs::symlink_metadata(root).map_err(|e|e.to_string())?;
+        if !meta.is_dir() || meta.file_attributes()&0x400!=0{return Err("inventory root must be an ordinary directory".into());}
+        let mut rows=BTreeMap::new();visit(root,root,0,&mut rows)?;
+        Ok(rows.into_iter().map(|(name,value)|format!("{name}\t{value}\n")).collect())
+    }
+    fn keep_junction_record(path:&Path,bytes:&[u8])->Result<(),String>{
+        let mut file=File::create_new(path).map_err(|e|e.to_string())?;
+        file.write_all(bytes).map_err(|e|e.to_string())
+    }
+    struct OwnedJunction{alias:PathBuf,target:PathBuf,parent:PathBuf,armed:bool}
+    impl OwnedJunction{
+        fn new(alias:&Path,target:&Path,parent:&Path)->Result<Self,String>{
+            let data=fs::canonicalize(PathBuf::from(std::env::var_os("YOKAI_TEST_DATA_DIR").ok_or("missing test data root")?)).map_err(|e|e.to_string())?;
+            let owner=fs::canonicalize(parent).map_err(|e|e.to_string())?;
+            let canonical_target=fs::canonicalize(target).map_err(|e|e.to_string())?;
+            if alias.parent()!=Some(parent) || !owner.starts_with(&data) || !canonical_target.starts_with(&data)
+                || support::entry_exists(alias)? {return Err("junction paths are not fresh owned fixtures".into());}
+            let mut make=cmd()?;make.args(["/d","/q","/c"]).raw_arg("mklink /J \"%WV_ALIAS%\" \"%WV_TARGET%\"")
+                .env("WV_ALIAS",conventional(alias)).env("WV_TARGET",conventional(&canonical_target));
+            let (status,text)=run_cmd(make,"b3-junction-create")?;
+            if !status.success(){return Err(format!("owned junction creation failed {status}: {text}"));}
+            let mut link=Self{alias:alias.to_owned(),target:canonical_target,parent:parent.to_owned(),armed:true};
+            if fs::canonicalize(alias).map_err(|e|e.to_string())?!=link.target{link.remove()?;return Err("junction target identity differs".into());}
+            Ok(link)
+        }
+        fn remove(&mut self)->Result<(),String>{
+            if self.armed{remove_owned_link(&self.alias,&self.target,&self.parent)?;self.armed=false;}
+            if support::entry_exists(&self.alias)?{return Err("owned junction entry survived unlink".into());}
+            Ok(())
+        }
+    }
+    impl Drop for OwnedJunction{fn drop(&mut self){if self.armed{if let Err(error)=self.remove(){eprintln!("B3 owned junction cleanup failed: {error}");}}}}
+    fn junction_refusal(root:&Path)->Result<(),String>{
+        store::test_api::clear();let result=store::open_instance(root);let events=store::test_api::connection_events();
+        match result{
+            Err(InstanceError::PathInvalid(_)) if events.is_empty()=>Ok(()),
+            Ok(i)=>{i.close().map_err(|e|e.to_string())?;Err("junction acquired an Instance".into())},
+            Err(error)=>Err(format!("junction expected PathInvalid before SQLite, observed {error:?} events={events:?}")),
+        }
+    }
+    fn junction_busy(root:&Path)->Result<(),String>{
+        store::test_api::clear();let result=store::open_instance(root);let events=store::test_api::connection_events();
+        match result{
+            Err(InstanceError::Busy(_)) if events.is_empty()=>Ok(()),
+            Ok(i)=>{i.close().map_err(|e|e.to_string())?;Err("junction ancestor acquired a second owner".into())},
+            Err(error)=>Err(format!("junction ancestor expected Busy before SQLite, observed {error:?} events={events:?}")),
+        }
+    }
+    fn junction_child(mode:&str,root:&Path,expected:Option<&Path>)->Result<(),String>{
+        let mut c=command(mode,root)?;if let Some(expected)=expected{c.arg(expected);}
+        let (mut child,logs)=launch(c,"b3-junction-child")?;
+        if !wait(&mut child,Duration::from_secs(10))?.success(){return Err(format!("{mode} child failed; logs={}",logs.display()));}
+        let output=fs::read_to_string(logs.join("child.out")).map_err(|e|e.to_string())?;
+        if output.lines().filter(|line|line.starts_with("INFO B3 junction_child ")).count()!=1{return Err("junction child observation missing".into());}
+        println!("INFO B3 junction_child_observed mode={mode} logs={}",logs.display());Ok(())
+    }
+    fn junction_cases()->Result<(),String>{
+        // These literal same-length contents differ only in data. A size-only
+        // inventory would miss this negative control.
+        let controls=parent("b3-inventory-controls")?;let left=controls.join("left");let right=controls.join("right");
+        fs::create_dir(&left).and_then(|_|fs::create_dir(&right)).map_err(|e|e.to_string())?;
+        keep_junction_record(&left.join("sentinel"),b"B3-before")?;keep_junction_record(&right.join("sentinel"),b"B3-after!")?;
+        let a=junction_inventory(&left)?;let b=junction_inventory(&right)?;
+        keep_junction_record(&controls.join("before.inventory"),a.as_bytes())?;keep_junction_record(&controls.join("changed.inventory"),b.as_bytes())?;
+        if a==b{return Err("junction inventory hid an equal-length content change".into());}
+        println!("INFO B3 inventory_sensitivity root={} equal_length=9 changed_content_detected=true",controls.display());
+        for name in ["instance.lock","instance.id","instance.db","instance.db-wal","instance.db-shm","instance.db-journal"]{
+            let i=instance("b3-inside")?;let root=i.root().to_owned();i.close().map_err(|e|e.to_string())?;
+            let evidence=parent("b3-inside-evidence")?;let target=evidence.join("outside-target");fs::create_dir(&target).map_err(|e|e.to_string())?;
+            keep_junction_record(&target.join("sentinel"),b"B3 outside target remains unchanged\n")?;
+            let alias=root.join(name);let original=evidence.join(format!("original-{name}"));
+            let prior=match fs::symlink_metadata(&alias){
+                Ok(meta)=>{yokai_platform::location::validate_regular_single_link(&alias,&meta).map_err(|e|e.to_string())?;
+                    let bytes=fs::read(&alias).map_err(|e|e.to_string())?;
+                    fs::rename(&alias,&original).map_err(|e|e.to_string())?;Some(bytes)},
+                Err(e) if e.kind()==std::io::ErrorKind::NotFound=>None,Err(e)=>return Err(e.to_string()),
+            };
+            let mut link=OwnedJunction::new(&alias,&target,&root)?;
+            let before=junction_inventory(&root)?;let outside=junction_inventory(&target)?;
+            keep_junction_record(&evidence.join("root-before.inventory"),before.as_bytes())?;
+            keep_junction_record(&evidence.join("target-before.inventory"),outside.as_bytes())?;
+            junction_refusal(&root)?;junction_child("__junction_refusal",&root,None)?;
+            let after=junction_inventory(&root)?;let target_after=junction_inventory(&target)?;
+            keep_junction_record(&evidence.join("root-after.inventory"),after.as_bytes())?;
+            keep_junction_record(&evidence.join("target-after.inventory"),target_after.as_bytes())?;
+            if before!=after || outside!=target_after{return Err(format!("junction {name} refusal mutated root/target"));}
+            if let Some(bytes)=&prior{if fs::read(&original).map_err(|e|e.to_string())?!=*bytes{return Err("retained original entry changed".into());}}
+            if name!="instance.lock"{drop(OpenOptions::new().read(true).write(true).share_mode(0).open(root.join("instance.lock")).map_err(|e|format!("junction refusal retained ownership: {e}"))?);}
+            link.remove()?;
+            if junction_inventory(&target)?!=outside{return Err("junction unlink changed target".into());}
+            keep_junction_record(&evidence.join("root-after-unlink.inventory"),junction_inventory(&root)?.as_bytes())?;
+            println!("INFO B3 junction_inside entry={name} root={} target={} evidence={} parent=PathInvalid child=PathInvalid sqlite_events=[] root_unchanged=true target_unchanged=true original_preserved={} owned_link_removed=true",root.display(),target.display(),evidence.display(),prior.is_some());
+        }
+        let i=instance("b3-direct-root")?;let direct_root=i.root().to_owned();i.close().map_err(|e|e.to_string())?;
+        let links=parent("b3-direct-link")?;let alias=links.join("junction-root");let before=junction_inventory(&direct_root)?;
+        keep_junction_record(&links.join("target-before.inventory"),before.as_bytes())?;
+        let mut link=OwnedJunction::new(&alias,&direct_root,&links)?;
+        junction_refusal(&alias)?;junction_child("__junction_refusal",&alias,None)?;
+        let after=junction_inventory(&direct_root)?;keep_junction_record(&links.join("target-after.inventory"),after.as_bytes())?;
+        if before!=after{return Err("direct junction-root refusal changed its target".into());}link.remove()?;
+        println!("INFO B3 junction_root root={} alias={} parent=PathInvalid child=PathInvalid target_unchanged=true owned_link_removed=true",direct_root.display(),alias.display());
+
+        let real=parent("b3-ancestor-target")?;let real_parent=real.join("ordinary-parent");fs::create_dir(&real_parent).map_err(|e|e.to_string())?;
+        keep_junction_record(&real.join("sentinel"),b"B3 ancestor target preserved\n")?;
+        let i=store::create_instance(&real_parent).map_err(|e|e.to_string())?;let root=i.root().to_owned();i.close().map_err(|e|e.to_string())?;
+        let links=parent("b3-ancestor-link")?;let alias=links.join("redirected-ancestor");let mut link=OwnedJunction::new(&alias,&real,&links)?;
+        let through=alias.join("ordinary-parent").join(root.file_name().ok_or("missing Instance leaf")?);
+        let i=store::open_instance(&through).map_err(|e|e.to_string())?;
+        if i.root()!=root || fs::canonicalize(&through).map_err(|e|e.to_string())?!=root{return Err("junction ancestor did not bind the canonical Instance".into());}i.close().map_err(|e|e.to_string())?;
+        let owner=store::open_instance(&root).map_err(|e|e.to_string())?;let pause=store::test_api::block_writer(&owner).map_err(|e|e.to_string())?;
+        let before=protected(&root)?;junction_busy(&through)?;junction_child("__junction_busy",&through,None)?;
+        if protected(&root)?!=before{return Err("junction ancestor contender changed protected bytes".into());}
+        drop(pause);owner.close().map_err(|e|e.to_string())?;
+        junction_child("__junction_reopen",&through,Some(&root))?;
+        if fs::read(real.join("sentinel")).map_err(|e|e.to_string())?!=b"B3 ancestor target preserved\n"{return Err("ancestor target sentinel changed".into());}
+        link.remove()?;
+        keep_junction_record(&links.join("closed-target.inventory"),junction_inventory(&real)?.as_bytes())?;
+        println!("INFO B3 junction_ancestor root={} alias={} target={} canonical_binding=true unowned_open=ok parent=Busy child=Busy protected_bytes_unchanged=true fresh_child_reopen=ok integrity=ok owned_link_removed=true",root.display(),through.display(),real.display());
+        Ok(())
+    }
+
     fn sharing_violation(result:std::io::Result<()>,label:&str)->Result<(),String>{
         match result {
             Err(e) if e.raw_os_error()==Some(32)=>{println!("INFO WV open_file_operation={label} refused_os=32");Ok(())},
