@@ -1,6 +1,6 @@
 //! Test-only fault injection and observations at fixed lifecycle boundaries.
 use std::fs::OpenOptions;
-use std::io::Write;
+use std::io::{BufRead, Read, Write};
 use std::path::Path;
 use std::sync::{Mutex, OnceLock};
 use yokai_types::InstanceId;
@@ -73,12 +73,23 @@ pub fn hit(boundary: &str) -> Result<(), String> {
     match mode {
         "error" => Err(format!("test failpoint at {boundary}")),
         "exit" => std::process::exit(86),
-        "wait" => {
+        "wait" | "pause" => {
             let path=std::env::var_os("YOKAI_TEST_READY_FILE").ok_or("readiness marker missing")?;
             let mut file=OpenOptions::new().write(true).create_new(true).open(path).map_err(|e|e.to_string())?;
             file.write_all(boundary.as_bytes()).map_err(|e|e.to_string())?;
             file.sync_all().map_err(|e|e.to_string())?;
-            loop {std::thread::park_timeout(std::time::Duration::from_secs(1));}
+            if mode == "pause" {
+                let input = std::io::stdin();
+                let mut bounded = input.lock().take(10);
+                let mut command = String::new();
+                bounded.read_line(&mut command).map_err(|e| e.to_string())?;
+                if command != "continue\n" && command != "continue\r\n" {
+                    return Err("test close pause requires an explicit continue command".into());
+                }
+                Ok(())
+            } else {
+                loop {std::thread::park_timeout(std::time::Duration::from_secs(1));}
+            }
         }
         _ => Ok(()),
     }
