@@ -10,7 +10,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitCode, Stdio};
 use std::sync::{Arc, Barrier, atomic::{AtomicUsize, Ordering}};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 #[cfg(windows)]
 #[path = "support/windows_process.rs"]
@@ -44,6 +44,58 @@ impl Checks {
 }
 
 static NEXT_DIR: AtomicUsize = AtomicUsize::new(0);
+
+/// A failed oracle still owns its child and reaps it before leaving the case.
+struct OwnedChild(Child);
+impl Drop for OwnedChild {
+    fn drop(&mut self) {
+        if !matches!(self.0.try_wait(), Ok(Some(_))) { let _ = self.0.kill(); }
+        let _ = self.0.wait();
+    }
+}
+fn finish_child(child: &mut OwnedChild, label: &str) -> Result<std::process::ExitStatus, String> {
+    let until = Instant::now() + Duration::from_secs(10);
+    loop {
+        if let Some(status) = child.0.try_wait().map_err(|e| e.to_string())? {
+            println!("INFO B2 child={label} pid={} status={status} reaped=true", child.0.id());
+            return Ok(status);
+        }
+        if Instant::now() >= until { return Err(format!("{label}: child exit deadline")); }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+fn kill_child(child: &mut OwnedChild, label: &str) -> Result<(), String> {
+    if child.0.try_wait().map_err(|e| e.to_string())?.is_some() { return Err(format!("{label}: child exited before parent kill")); }
+    child.0.kill().map_err(|e| e.to_string())?;
+    let status = finish_child(child, label)?;
+    if status.success() { return Err(format!("{label}: kill reported success exit")); }
+    println!("INFO B2 parent_kill child={label} pid={} platform={} reaped=true", child.0.id(), std::env::consts::OS);
+    Ok(())
+}
+fn wait_owned_marker(child: &mut OwnedChild, path: &Path, expected: &[u8]) -> Result<(), String> {
+    let until = Instant::now() + Duration::from_secs(10);
+    loop {
+        if let Some(bytes) = read_optional_file(path)? {
+            if bytes == expected { return Ok(()); }
+            if !expected.starts_with(&bytes) { return Err(format!("wrong readiness marker {}: {bytes:?}", path.display())); }
+        }
+        if let Some(status) = child.0.try_wait().map_err(|e| e.to_string())? {
+            return Err(format!("child exited before close/crash marker {}: {status}", path.display()));
+        }
+        if Instant::now() >= until { return Err(format!("readiness deadline: {}", path.display())); }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+fn retain_file(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    let mut file = OpenOptions::new().write(true).create_new(true).open(path).map_err(|e| e.to_string())?;
+    file.write_all(bytes).map_err(|e| e.to_string())
+}
+fn probe_owned(root: &Path) -> Result<std::process::ExitStatus, String> {
+    let mut command = child_command("probe", &[root])?;
+    command.stdin(Stdio::null());
+    let mut child = OwnedChild(command.spawn().map_err(|e| e.to_string())?);
+    finish_child(&mut child, "contender")
+}
 
 fn main() -> ExitCode {
     let dumpable = yokai_testsupport::make_non_dumpable();
@@ -110,18 +162,42 @@ fn child_main(args: &[String]) -> Option<u8> {
                 None => Some(0),
             }
         }
+        "close-order" => {
+            let root = PathBuf::from(args.get(3)?);
+            let instance = match store::open_instance(&root) { Ok(i) => i, Err(e) => { eprintln!("{e}"); return Some(4); } };
+            store::test_api::clear();
+            if let Err(e) = instance.close() { eprintln!("{e}"); return Some(4); }
+            let events = store::test_api::connection_events();
+            println!("INFO B2 close_order_child closed_events={events:?}");
+            if events == ["connection-closed", "lock-released"] { Some(0) } else { Some(7) }
+        }
+        "close-incomplete" => {
+            let root = PathBuf::from(args.get(3)?);
+            let marker = PathBuf::from(args.get(4)?);
+            let instance = match store::open_instance_with_options(&root, store::StoreOptions {
+                close_timeout: Duration::from_millis(25), ..Default::default()
+            }) { Ok(i) => i, Err(e) => { eprintln!("{e}"); return Some(4); } };
+            let (pause, _pending) = match store::test_api::hold_reader(&instance, true) { Ok(v) => v, Err(e) => { eprintln!("{e:?}"); return Some(4); } };
+            std::mem::forget(pause);
+            if args.get(5).map(String::as_str) == Some("drop") { drop(instance); }
+            else if !matches!(instance.close(), Err(InstanceError::CloseIncomplete)) { return Some(7); }
+            if retain_file(&marker, b"CloseIncomplete").is_err() { return Some(6); }
+            loop { std::thread::park_timeout(Duration::from_secs(1)); }
+        }
         "cycles" => {
             let root = PathBuf::from(args.get(3)?);
             match child_cycles(&root) { Ok(()) => Some(0), Err(error) => { eprintln!("IL8_CHILD_FAIL {error}"); Some(15) } }
         }
         "wal-version" => {
             let path = PathBuf::from(args.get(3)?);
+            let marker = PathBuf::from(args.get(4)?);
             let Ok(connection) = Connection::open(path) else { return Some(11) };
             if connection.execute_batch(
                 "PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0; PRAGMA user_version=3;"
             ).is_err() { return Some(12); }
-            // Leave the committed WAL files for the parent to inspect.
-            std::process::exit(0);
+            if retain_file(&marker, b"committed-wal-version3").is_err() { return Some(6); }
+            // The live connection stays owned until the parent kills and reaps us.
+            loop { std::thread::park_timeout(Duration::from_secs(1)); }
         }
         _ => Some(89),
     }
@@ -141,9 +217,10 @@ fn run(checks: &mut Checks) -> Result<(), String> {
     checks.record("IC-3", case_existing_roots(&run_dir));
     checks.record("IC-4", case_concurrent_creators(&run_dir));
     checks.record("IC-5", case_same_identity_creators(&run_dir));
-    checks.record("IC-6", case_creation_process_exits(&run_dir));
+    let mut incomplete = Vec::new();
+    checks.record("IC-6", case_creation_crashes(&run_dir, &mut incomplete));
     checks.record("IC-8", case_directory_flushes(&run_dir));
-    checks.record("IC-9", case_incomplete_untouched(&run_dir));
+    checks.record("IC-9", case_incomplete_untouched(&incomplete));
     checks.record("IC-F", case_fixture_instance(&run_dir));
     checks.record("IL-1", case_same_process_busy(&run_dir));
     checks.record("IL-2", case_other_process_busy(&run_dir));
@@ -307,11 +384,6 @@ fn child_instance_roots(parent: &Path, before: &[PathBuf]) -> Result<Vec<PathBuf
     Ok(roots)
 }
 
-fn child_dirs(parent: &Path) -> Result<Vec<PathBuf>, String> {
-    Ok(fs::read_dir(parent).map_err(|e| e.to_string())?
-        .filter_map(Result::ok).map(|item| item.path()).collect())
-}
-
 fn case_create_shape(base: &Path) -> Result<String, String> {
     let parent = fresh_dir(base, "ic1")?;
     let instance = store::create_instance(&parent).map_err(|e| e.to_string())?;
@@ -453,33 +525,78 @@ fn case_same_identity_creators(base: &Path) -> Result<String, String> {
     else { Err(format!("outcomes={outcomes:?} reopened={opens}")) }
 }
 
-fn case_creation_process_exits(base: &Path) -> Result<String, String> {
+
+struct IncompleteFixture {
+    root: PathBuf,
+    evidence: PathBuf,
+    boundary: &'static str,
+    mode: &'static str,
+    round: usize,
+}
+fn incomplete_reason(boundary: &str) -> IncompleteReason {
+    match boundary {
+        "after-root" => IncompleteReason::NoLockFile,
+        "during-identity" => IncompleteReason::BadIdentityFile,
+        _ => IncompleteReason::NoIdentityFile,
+    }
+}
+/// Creation states contain only ordinary files. Reject unknown kinds instead of
+/// silently treating a directory/link/read failure as empty or absent data.
+fn incomplete_inventory(root: &Path) -> Result<String, String> {
+    let root_meta = fs::symlink_metadata(root).map_err(|e| e.to_string())?;
+    if !root_meta.is_dir() || root_meta.file_type().is_symlink() { return Err("incomplete root is not an ordinary directory".into()); }
+    #[cfg(windows)] {
+        use std::os::windows::fs::MetadataExt;
+        if root_meta.file_attributes() & 0x400 != 0 { return Err("reparse incomplete root".into()); }
+    }
+    let mut entries = BTreeMap::new();
+    for entry in fs::read_dir(root).map_err(|e| e.to_string())? {
+        let entry = entry.map_err(|e| e.to_string())?;
+        let meta = fs::symlink_metadata(entry.path()).map_err(|e| e.to_string())?;
+        if !meta.is_file() || meta.file_type().is_symlink() { return Err("unexpected incomplete-root entry kind".into()); }
+        #[cfg(windows)] {
+            use std::os::windows::fs::MetadataExt;
+            if meta.file_attributes() & 0x400 != 0 { return Err("reparse entry in incomplete root".into()); }
+        }
+        let name = entry.file_name().into_string().map_err(|_| "non-UTF8 fixture entry")?;
+        let bytes = fs::read(entry.path()).map_err(|e| e.to_string())?;
+        if bytes.len() as u64 != meta.len() { return Err("fixture size changed during inventory".into()); }
+        entries.insert(name, (meta.len(), store::test_api::sha256_chunks_for_test(&[&bytes])));
+    }
+    Ok(entries.into_iter().map(|(name, (size, hash))| format!("{name}\tfile\t{size}\t{hash}\n")).collect())
+}
+fn case_creation_crashes(base: &Path, fixtures: &mut Vec<IncompleteFixture>) -> Result<String, String> {
     for boundary in ["after-root", "after-lock", "after-db", "after-migration", "during-identity"] {
-        for round in 0..3 {
-            let parent = fresh_dir(base, "ic6")?;
-            let before_dirs = child_dirs(&parent)?;
-            let mut command = child_command("failpoint", &[&parent])?;
-            command.env("YOKAI_TEST_FAILPOINT", format!("{boundary}:exit"));
-            let status = command.status().map_err(|e| e.to_string())?;
-            if status.code() != Some(86) {
-                return Err(format!("{boundary} exit round {round}: {status}"));
-            }
-            let roots = child_instance_roots(&parent, &before_dirs)?;
-            if roots.len() != 1 { return Err(format!("{boundary} produced {} roots", roots.len())); }
-            let root = &roots[0];
-            let before = root_snapshot(root)?;
-            let reason = match boundary {
-                "after-root" => IncompleteReason::NoLockFile,
-                "during-identity" => IncompleteReason::BadIdentityFile,
-                _ => IncompleteReason::NoIdentityFile,
-            };
-            expect_incomplete(root, reason)?;
-            if before != root_snapshot(root)? {
-                return Err(format!("open changed incomplete root at {boundary}"));
+        for mode in ["exit", "kill"] {
+            for round in 0..3 {
+                let parent = fresh_dir(base, &format!("ic6-{boundary}-{mode}-{round}"))?;
+                let marker = parent.join("ready");
+                let mut command = child_command("failpoint", &[&parent])?;
+                command.stdin(Stdio::null()).env("YOKAI_TEST_FAILPOINT", format!("{boundary}:{}", if mode == "kill" { "wait" } else { "exit" }))
+                    .env("YOKAI_TEST_READY_FILE", &marker);
+                let mut child = OwnedChild(command.spawn().map_err(|e| e.to_string())?);
+                if mode == "kill" {
+                    wait_owned_marker(&mut child, &marker, boundary.as_bytes())?;
+                    kill_child(&mut child, boundary)?;
+                } else if finish_child(&mut child, boundary)?.code() != Some(86) {
+                    return Err(format!("{boundary}: expected exit86"));
+                }
+                let roots = child_instance_roots(&parent, &[])?;
+                if roots.len() != 1 { return Err(format!("{boundary}: expected one incomplete root")); }
+                let root = roots[0].clone();
+                let before = incomplete_inventory(&root)?;
+                retain_file(&parent.join("before.inventory"), before.as_bytes())?;
+                expect_incomplete(&root, incomplete_reason(boundary))?;
+                let after = incomplete_inventory(&root)?;
+                retain_file(&parent.join("after-ic6.inventory"), after.as_bytes())?;
+                if before != after { return Err(format!("open changed {boundary}/{mode}/{round}")); }
+                println!("INFO B2 incomplete boundary={boundary} mode={mode} round={round} root={} inventory_sha256={} typed={:?} unchanged=true", root.display(), store::test_api::sha256_chunks_for_test(&[before.as_bytes()]), incomplete_reason(boundary));
+                fixtures.push(IncompleteFixture { root, evidence: parent, boundary, mode, round });
             }
         }
     }
-    Ok("process exited at five creation boundaries, including committed V1 before identity, three rounds each".into())
+    if fixtures.len() != 30 { return Err("creation matrix did not retain30 states".into()); }
+    Ok("five creation boundaries x exit/parent-kill x3;30 typed refusals, exact ordinary-file inventories and owned kill/reap records retained".into())
 }
 
 fn case_directory_flushes(base: &Path) -> Result<String, String> {
@@ -497,24 +614,23 @@ fn case_directory_flushes(base: &Path) -> Result<String, String> {
     } else { Err(format!("flush observations={events:?}")) }
 }
 
-fn case_incomplete_untouched(base: &Path) -> Result<String, String> {
-    let parent = fresh_dir(base, "ic9")?;
-    let before_dirs = child_dirs(&parent)?;
-    let mut command = child_command("failpoint", &[&parent])?;
-    command.env("YOKAI_TEST_FAILPOINT", "after-root:exit");
-    let status = command.status().map_err(|e| e.to_string())?;
-    let roots = child_instance_roots(&parent, &before_dirs)?;
-    if status.code() != Some(86) || roots.len() != 1 { return Err("failed to construct incomplete root".into()); }
-    let before = root_snapshot(&roots[0])?;
-    for _ in 0..5 { expect_incomplete(&roots[0], IncompleteReason::NoLockFile)?; }
-    if before == root_snapshot(&roots[0])? {
-        let instance_source = include_str!("../src/instance.rs");
-        let platform_source = include_str!("../../yokai-platform/src/location.rs");
-        if ["remove_file(", "remove_dir(", "rename("].iter().any(|word| instance_source.contains(word) || platform_source.contains(word)) {
-            return Err("a discard-like path operation appeared in reviewed source".into());
+
+fn case_incomplete_untouched(fixtures: &[IncompleteFixture]) -> Result<String, String> {
+    if fixtures.len() != 30 { return Err("IC9 requires all30 original IC6 states".into()); }
+    for fixture in fixtures {
+        let before = fs::read_to_string(fixture.evidence.join("before.inventory")).map_err(|e| e.to_string())?;
+        if incomplete_inventory(&fixture.root)? != before { return Err("IC6 state changed before IC9".into()); }
+        for attempt in 1..=5 {
+            expect_incomplete(&fixture.root, incomplete_reason(fixture.boundary))?;
+            let after = incomplete_inventory(&fixture.root)?;
+            retain_file(&fixture.evidence.join(format!("after-ic9-{attempt}.inventory")), after.as_bytes())?;
+            if before != after { return Err(format!("IC9 changed {}/{}/{} on attempt{attempt}", fixture.boundary, fixture.mode, fixture.round)); }
         }
-        Ok("five repeated opens preserved the incomplete root; source scan found no discard calls".into())
-    } else { Err("repeated opens changed the incomplete root".into()) }
+        println!("INFO B2 incomplete_repeat boundary={} mode={} round={} root={} unchanged_opens=5", fixture.boundary, fixture.mode, fixture.round, fixture.root.display());
+    }
+    let source = [include_str!("../src/instance.rs"), include_str!("../../yokai-platform/src/location.rs")];
+    if ["remove_file(", "remove_dir(", "rename("].iter().any(|word| source.iter().any(|s| s.contains(word))) { return Err("discard-like path operation appeared".into()); }
+    Ok("all30 original IC6 states each preserved across five further typed refusals;150 inventories retained; supplementary no-discard source scan".into())
 }
 
 fn case_fixture_instance(base: &Path) -> Result<String, String> {
@@ -621,17 +737,27 @@ fn case_lock_file_removal_limit(base: &Path) -> Result<String, String> {
     }
 }
 
+
 fn case_close_order(base: &Path) -> Result<String, String> {
-    let root = new_root(base, "il7")?;
-    let owner = store::open_instance(&root).map_err(|e| e.to_string())?;
-    let busy = matches!(store::open_instance(&root), Err(InstanceError::Busy(_)));
-    store::test_api::clear();
-    owner.close().map_err(|e| e.to_string())?;
-    let events = store::test_api::connection_events();
-    let reopened = store::open_instance(&root).and_then(Instance::close).is_ok();
-    if busy && events == ["connection-closed", "lock-released"] && reopened {
-        Ok("SQLite close precedes lock release; Busy while held and reopen after release".into())
-    } else { Err(format!("busy={busy} close_events={events:?} reopened={reopened}")) }
+    for phase in ["close-before-workers-join", "close-after-workers-join"] {
+        let root = new_root(base, phase)?;
+        let evidence = fresh_dir(base, "il7-phase")?;
+        let marker = evidence.join("ready");
+        let mut command = child_command("close-order", &[&root])?;
+        command.stdin(Stdio::piped()).env("YOKAI_TEST_FAILPOINT", format!("{phase}:pause"))
+            .env("YOKAI_TEST_READY_FILE", &marker);
+        let mut child = OwnedChild(command.spawn().map_err(|e| e.to_string())?);
+        let mut control = child.0.stdin.take().ok_or("close control pipe missing")?;
+        wait_owned_marker(&mut child, &marker, phase.as_bytes())?;
+        if probe_owned(&root)?.code() != Some(20) { return Err(format!("contender was not Busy during {phase}")); }
+        println!("INFO B2 close_phase phase={phase} root={} pid={} contender=Busy marker={}", root.display(), child.0.id(), marker.display());
+        control.write_all(b"continue\n").and_then(|_| control.flush()).map_err(|e| e.to_string())?;
+        drop(control);
+        if !finish_child(&mut child, phase)?.success() { return Err(format!("{phase}: orderly close failed")); }
+        store::open_instance(&root).map_err(|e| e.to_string())?.close().map_err(|e| e.to_string())?;
+        println!("INFO B2 close_released phase={phase} fresh_reopen=ok");
+    }
+    Ok("contender Busy at shutdown-before-join and confirmed-joined/closed-before-unlock pauses; controlled resume, original close/release events and fresh reopen; physical connection close precedes join completion".into())
 }
 
 #[cfg(unix)]
@@ -791,19 +917,43 @@ fn file_identity(path: &Path) -> Result<(u64, u64, u64), String> {
     Ok((0, meta.len(), meta.len()))
 }
 
+
 fn case_lock_file_persists(base: &Path) -> Result<String, String> {
     let root = new_root(base, "il10")?;
     let lock = root.join("instance.lock");
     let original = file_identity(&lock)?;
-    let instance = store::open_instance(&root).map_err(|e| e.to_string())?;
-    instance.close().map_err(|e| e.to_string())?;
+    if original.2 != 0 { return Err("original lock is not empty".into()); }
+    store::open_instance(&root).map_err(|e| e.to_string())?.close().map_err(|e| e.to_string())?;
     if file_identity(&lock)? != original { return Err("lock identity changed after orderly close".into()); }
     let marker = fresh_dir(base, "il10-owner")?.join("owner-locked");
     let (mut child, control) = start_owner_process(&root, &marker)?;
     end_owner_process(&mut child, control)?;
-    if file_identity(&lock)? == original && fs::metadata(&lock).map_err(|e| e.to_string())?.len() == 0 {
-        Ok("persistent zero-length lock kept its file identity after close and owner death".into())
-    } else { Err("lock file identity or size changed".into()) }
+    if file_identity(&lock)? != original { return Err("lock identity changed after owner exit".into()); }
+    for mode in ["close", "drop"] {
+        let root = new_root(base, &format!("il10-incomplete-{mode}"))?;
+        let lock = root.join("instance.lock");
+        let original = file_identity(&lock)?;
+        let evidence = fresh_dir(base, "il10-incomplete-owner")?;
+        let marker = evidence.join("ready");
+        let mut command = child_command("close-incomplete", &[&root, &marker, Path::new(mode)])?;
+        command.stdin(Stdio::null());
+        let mut child = OwnedChild(command.spawn().map_err(|e| e.to_string())?);
+        wait_owned_marker(&mut child, &marker, b"CloseIncomplete")?;
+        if probe_owned(&root)?.code() != Some(20) { return Err(format!("ownership escaped incomplete {mode}")); }
+        kill_child(&mut child, &format!("CloseIncomplete-{mode}"))?;
+        let after_death = file_identity(&lock)?;
+        if original.2 != 0 || after_death != original { return Err(format!("{mode}: lock ID/size changed {original:?}->{after_death:?}")); }
+        store::open_instance(&root).map_err(|e| e.to_string())?.close().map_err(|e| e.to_string())?;
+        let reopened = file_identity(&lock)?;
+        let c = Connection::open_with_flags(db_path(&root), rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).map_err(|e| e.to_string())?;
+        let integrity: String = c.query_row("PRAGMA integrity_check", [], |r| r.get(0)).map_err(|e| e.to_string())?;
+        c.close().map_err(|(_,e)| e.to_string())?;
+        if reopened != original || integrity != "ok" { return Err(format!("{mode}: reopen lock/integrity differs")); }
+        let record = format!("mode={mode}\noriginal={original:?}\nafter_death={after_death:?}\nafter_reopen={reopened:?}\nintegrity={integrity}\n");
+        retain_file(&evidence.join("lock-identity.txt"), record.as_bytes())?;
+        println!("INFO B2 lock_identity mode={mode} root={} original={original:?} after_death={after_death:?} after_reopen={reopened:?} size=0 integrity=ok contender=Busy", root.display());
+    }
+    Ok("persistent file ID/size0 preserved after orderly close, owner exit, and CloseIncomplete close/Drop plus parent kill/reap and integrity-checked reopen".into())
 }
 
 fn case_root_symlink(base: &Path) -> Result<String, String> {
@@ -968,11 +1118,21 @@ fn case_pf2b(base: &Path) -> Result<String, String> {
     } else { Err(format!("result={} events={events:?}", describe_instance_result(&result))) }
 }
 
+
 fn make_wal_future(root: &Path) -> Result<(), String> {
-    let mut command = child_command("wal-version", &[&db_path(root)])?;
-    let status = command.status().map_err(|e| e.to_string())?;
-    if status.success() && side_path(root, "wal").exists() { Ok(()) }
-    else { Err(format!("WAL fixture child status={status}")) }
+    let prior_main = fs::read(db_path(root)).map_err(|e| e.to_string())?;
+    let prior_version = prior_main.get(60..64).ok_or("short WAL fixture main")?.to_vec();
+    let marker = root.parent().ok_or("WAL fixture parent missing")?.join("wal-producer-ready");
+    let mut command = child_command("wal-version", &[&db_path(root), &marker])?;
+    command.stdin(Stdio::null());
+    let mut child = OwnedChild(command.spawn().map_err(|e| e.to_string())?);
+    wait_owned_marker(&mut child, &marker, b"committed-wal-version3")?;
+    kill_child(&mut child, "committed-wal-version3")?;
+    let main = fs::read(db_path(root)).map_err(|e| e.to_string())?;
+    if main.get(60..64) != Some(prior_version.as_slice()) || !side_path(root, "wal").is_file() {
+        return Err("killed producer did not leave the original main version and committed future WAL".into());
+    }
+    Ok(())
 }
 
 fn case_pf3(base: &Path, keep_shm: bool) -> Result<String, String> {

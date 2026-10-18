@@ -19,9 +19,11 @@ Recorded Windows runs use fixed NTFS:
 | `store_runtime` | 31 | None |
 | `windows_validation` | 25 | `YOKAI_TEST_V0_FIXTURE`, `YOKAI_TEST_V1_FIXTURE`, `YOKAI_TEST_V2_FIXTURE`, `YOKAI_TEST_V2_BINARY`, `YOKAI_TEST_POWERSHELL` |
 
-These 153 records include explicitly qualified platform branches; R12's
-dangling-file-symlink subcheck remains Unix-only and reports `not_checked` on
-Windows. The Windows-only target reports `RESULT NOT_CHECKED` on other platforms.
+These 153 records include explicitly qualified platform branches. R12 attempts
+the dangling-file-symlink subcheck on Windows and records `checked_windows`
+when the host supports it, or `not_checked` when that capability is unavailable.
+Earlier runs retain their original limits. The Windows-only target reports
+`RESULT NOT_CHECKED` on other platforms.
 The checkpoint's WSL gate parsed saved Windows output; it ran no Linux candidate
 tests. Counts describe this checkpoint, not a complete acceptance catalogue.
 
@@ -493,3 +495,42 @@ supported PF10(b) and upgrade observations do not establish full PF10/W2,
 non-mutating startup, transient-write absence, metadata/object identity,
 hostile-race safety, crash recovery, power-loss durability, Linux runtime or
 product/security/release acceptance.
+
+### Creation, close and forward-snapshot checks
+
+The lifecycle target keeps the existing CHECK IDs while expanding their
+subcases. IC-6 covers five creation boundaries, both exit and parent-kill
+modes, and three rounds of each. IC-9 reopens those same 30 incomplete roots
+five further times each. Every typed refusal compares a retained inventory
+of ordinary-file names, types, sizes and SHA-256 values. Inventories live
+beside each root; unexpected entry kinds and metadata/read errors fail the
+observation. The incomplete roots are not repaired or removed.
+
+IL-7 pauses an owned child's close at shutdown before worker joins and after
+successful joins with connection closure confirmed, before ownership release.
+Another process must observe `Busy` at both boundaries. An explicit stdin
+command resumes the child, which verifies the existing aggregate
+`connection-closed`, then `lock-released` events; a fresh open must succeed.
+The post-join marker confirms completed shutdown. Worker-owned connections
+physically close during worker shutdown, before those joins complete.
+The pause points and bounded resume command exist only with `test-api`.
+
+IL-10 compares actual persistent lock file identity and size zero after
+orderly close, owner exit, and both explicit CloseIncomplete and Drop with an
+unjoinable reader followed by parent kill/reap. The latter cases also require
+a contender's `Busy` while the owner lives and an integrity-checked reopen
+after death. PF-3a/b now kill and reap a live SQLite WAL producer after its
+committed-version readiness marker; the original main-header version must
+remain visible while the future version is read through the retained WAL.
+
+MG-7 compares every typed schema/table value in the new pre-V2 snapshot with
+the retained prior database, using canonical row order. Two distinct command
+payloads provide nonempty data; a same-cardinality changed-value comparison
+must differ. Two earlier backups remain byte-identical, command values
+survive the forward test-only V3 migration, and logical images, the prior
+main file and backup hashes are retained outside the Instance root.
+
+These are synthetic native Windows witnesses. Parent kill uses Windows
+process termination; it does not establish Linux runtime or power-loss
+behavior. The checks add no directory-flush, physical NTFS-full, hostile-race,
+full Windows qualification, security or product acceptance claim.

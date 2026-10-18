@@ -370,6 +370,11 @@ impl Runtime {
         if self.ownership.is_none() { return Ok(()); }
         lock(&self.handle.shared.state).status = StoreState::ShuttingDown;
         self.handle.shared.closing.store(true, Ordering::Release);
+        #[cfg(feature = "test-api")]
+        if crate::failpoint::hit("close-before-workers-join").is_err() {
+            if let Some(ownership) = self.ownership.take() { std::mem::forget(ownership); }
+            return Err(InstanceError::CloseIncomplete);
+        }
         let deadline = Instant::now() + self.close_timeout;
         while self.threads.iter().any(|handle| !handle.is_finished()) && Instant::now() < deadline {
             thread::sleep(Duration::from_millis(1));
@@ -381,6 +386,13 @@ impl Runtime {
         let mut failed = self.handle.shared.close_failed.load(Ordering::Acquire);
         for handle in self.threads.drain(..) { failed |= handle.join().is_err(); }
         if failed {
+            if let Some(ownership) = self.ownership.take() { std::mem::forget(ownership); }
+            return Err(InstanceError::CloseIncomplete);
+        }
+        // Workers have closed their connections and all joins succeeded. This
+        // diagnostic boundary does not claim connections physically close after join.
+        #[cfg(feature = "test-api")]
+        if crate::failpoint::hit("close-after-workers-join").is_err() {
             if let Some(ownership) = self.ownership.take() { std::mem::forget(ownership); }
             return Err(InstanceError::CloseIncomplete);
         }

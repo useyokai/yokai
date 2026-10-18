@@ -182,13 +182,115 @@ fn check_failed_migration()->Result<String,String>{
     if !e.contains("migration failed") || state(&root)?!=before || snapshots(&root)?.len()!=1{return Err(format!("failure={e}; version/history or snapshots incorrect"));}
     Ok("SQL failure rolled back test-only V3 schema/history/version; verified pre-V3 snapshot retained".into())
 }
-fn check_forward()->Result<String,String>{
-    let root=root("forward-v2")?;
-    let i=store::test_api::open_test_versions(&root,3,false).map_err(|e|e.to_string())?;
-    i.close().map_err(|e|e.to_string())?;
-    if state(&root)?!=(3,3) || snapshots(&root)?.len()!=1{return Err("forward migration/history/snapshot missing".into());}
-    Ok("test-only V3 migrated prior version with retained snapshot".into())
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct LogicalDatabase {
+    version: i64,
+    schema: Vec<Vec<Vec<u8>>>,
+    tables: std::collections::BTreeMap<String, Vec<Vec<Vec<u8>>>>,
 }
+fn typed_rows(connection: &Connection, sql: &str) -> Result<Vec<Vec<Vec<u8>>>, String> {
+    use rusqlite::types::ValueRef;
+    let mut statement = connection.prepare(sql).map_err(|e| e.to_string())?;
+    let columns = statement.column_count();
+    let mut rows = statement.query([]).map_err(|e| e.to_string())?;
+    let mut result = Vec::new();
+    while let Some(row) = rows.next().map_err(|e| e.to_string())? {
+        let mut values = Vec::new();
+        for column in 0..columns {
+            let (tag, bytes) = match row.get_ref(column).map_err(|e| e.to_string())? {
+                ValueRef::Null => (0, Vec::new()),
+                ValueRef::Integer(v) => (1, v.to_be_bytes().to_vec()),
+                ValueRef::Real(v) => (2, v.to_bits().to_be_bytes().to_vec()),
+                ValueRef::Text(v) => (3, v.to_vec()),
+                ValueRef::Blob(v) => (4, v.to_vec()),
+            };
+            let mut value = vec![tag];
+            value.extend_from_slice(&bytes);
+            values.push(value);
+        }
+        result.push(values);
+    }
+    result.sort();
+    Ok(result)
+}
+fn logical_database(path: &Path) -> Result<LogicalDatabase, String> {
+    let c = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).map_err(|e| e.to_string())?;
+    c.set_db_config(DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE, true).map_err(|e| e.to_string())?;
+    c.execute_batch("BEGIN").map_err(|e| e.to_string())?;
+    let version = c.query_row("PRAGMA user_version", [], |r| r.get(0)).map_err(|e| e.to_string())?;
+    let integrity: String = c.query_row("PRAGMA integrity_check", [], |r| r.get(0)).map_err(|e| e.to_string())?;
+    if integrity != "ok" { return Err(format!("logical input integrity={integrity}")); }
+    let schema = typed_rows(&c, "SELECT type,name,tbl_name,sql FROM sqlite_schema")?;
+    let names = c.prepare("SELECT name FROM sqlite_schema WHERE type='table' ORDER BY name").map_err(|e| e.to_string())?
+        .query_map([], |r| r.get::<_, String>(0)).map_err(|e| e.to_string())?
+        .collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())?;
+    let mut tables = std::collections::BTreeMap::new();
+    for name in names {
+        let sql = format!("SELECT * FROM \"{}\"", name.replace('"', "\"\""));
+        tables.insert(name, typed_rows(&c, &sql)?);
+    }
+    c.execute_batch("ROLLBACK").map_err(|e| e.to_string())?;
+    c.close().map_err(|(_,e)| e.to_string())?;
+    Ok(LogicalDatabase { version, schema, tables })
+}
+fn keep_logical(path: &Path, image: &LogicalDatabase) -> Result<(), String> {
+    keep_bytes(path, format!("{image:?}\n").as_bytes())
+}
+fn keep_bytes(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    use std::io::Write;
+    let mut file = fs::OpenOptions::new().write(true).create_new(true).open(path).map_err(|e| e.to_string())?;
+    file.write_all(bytes).map_err(|e| e.to_string())
+}
+fn check_forward() -> Result<String, String> {
+    // Upgrading a real V0 fixture through V2 gives earlier snapshots to preserve.
+    let root = legacy("forward-v2")?;
+    let instance = store::open_instance(&root).map_err(|e| e.to_string())?;
+    for (id, payload) in [("mg7-z", vec![0, 1, 255, 0]), ("mg7-a", "snapshot O'Brien λ".as_bytes().to_vec())] {
+        let request = store::CommandRequest::new(yokai_types::CommandId::new(id).map_err(|e| e.to_string())?, "mg7", 1, &payload).map_err(|e| e.to_string())?;
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let outcome = instance.store().accept_command(request, deadline).map_err(|e| e.to_string())?.wait(deadline).map_err(|e| e.to_string())?;
+        if !matches!(outcome, store::AcceptOutcome::Accepted { .. }) { return Err("MG7 seed was not Accepted".into()); }
+    }
+    instance.close().map_err(|e| e.to_string())?;
+    let earlier = snapshots(&root)?;
+    if earlier.len() != 2 { return Err("MG7 needs two retained earlier snapshots".into()); }
+    let before = logical_database(&root.join("instance.db"))?;
+    if before.version != 2 || before.tables.get("commands").map(Vec::len) != Some(2) { return Err("MG7 nontrivial V2 source missing".into()); }
+    let evidence = root.parent().ok_or("MG7 parent missing")?;
+    let prior_main = fs::read(root.join("instance.db")).map_err(|e| e.to_string())?;
+    keep_bytes(&evidence.join("mg7-source-before.db"), &prior_main)?;
+    let prior_backup_hashes: String = earlier.iter().map(|(path, bytes)| {
+        format!("{}  {}\n", store::test_api::sha256_chunks_for_test(&[bytes]), path.file_name().unwrap_or_default().to_string_lossy())
+    }).collect();
+    keep_bytes(&evidence.join("mg7-earlier-backups.sha256"), prior_backup_hashes.as_bytes())?;
+    keep_logical(&evidence.join("mg7-source-before.logical"), &before)?;
+    // Equality is typed and canonical. A changed value at the same row count
+    // differs; merely changing traversal order does not.
+    let mut changed = before.clone();
+    changed.tables.get_mut("commands").ok_or("commands missing")?[0][0].push(0x5a);
+    if changed == before { return Err("MG7 oracle hid a same-cardinality change".into()); }
+    let mut reordered = before.clone();
+    for rows in reordered.tables.values_mut() { rows.reverse(); rows.sort(); }
+    if reordered != before { return Err("MG7 oracle depends on traversal order".into()); }
+    keep_logical(&evidence.join("mg7-oracle-same-count-change.logical"), &changed)?;
+    let i = store::test_api::open_test_versions(&root, 3, false).map_err(|e| e.to_string())?;
+    i.close().map_err(|e| e.to_string())?;
+    let after = snapshots(&root)?;
+    let added: Vec<_> = after.iter().filter(|(path, _)| !earlier.iter().any(|(old, _)| old == path)).collect();
+    if state(&root)? != (3, 3) || after.len() != 3 || added.len() != 1 { return Err("MG7 forward version/history/snapshot count differs".into()); }
+    for (path, bytes) in &earlier {
+        if !after.iter().any(|(retained, data)| retained == path && data == bytes) { return Err("MG7 earlier snapshot changed or disappeared".into()); }
+    }
+    let snapshot = logical_database(&added[0].0)?;
+    keep_logical(&evidence.join("mg7-pre-v2-snapshot.logical"), &snapshot)?;
+    if snapshot != before { return Err("MG7 snapshot differs logically from the complete prior schema/data".into()); }
+    let current = logical_database(&root.join("instance.db"))?;
+    if current.tables.get("commands") != before.tables.get("commands") { return Err("MG7 changed prior command values".into()); }
+    keep_logical(&evidence.join("mg7-source-after.logical"), &current)?;
+    println!("INFO B2 migration_forward root={} snapshot={} prior_version=2 current_version=3 full_logical_equal=true prior_commands=2 earlier_snapshots_unchanged=2 same_count_change_detected=true row_order_canonical=true integrity=ok", root.display(), added[0].0.display());
+    Ok("forward V2-to-testV3 snapshot equals every prior typed schema/table value; two earlier backups unchanged, both command payloads retained, canonical/same-count negative oracle and logical records preserved".into())
+}
+
 fn check_headroom()->Result<String,String>{
     let root=legacy("low-headroom")?;let before=protected(&root)?;
     let out=command(&root,1,false)?.env("YOKAI_TEST_HEADROOM_BYTES","0").output().map_err(|e|e.to_string())?;
