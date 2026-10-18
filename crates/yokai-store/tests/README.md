@@ -17,9 +17,9 @@ Recorded Windows runs use fixed NTFS:
 | `instance_migrations` | 18 | `YOKAI_TEST_V0_FIXTURE`, `YOKAI_TEST_V0_BINARY` |
 | `sqlite_runtime` | 12 | None |
 | `store_runtime` | 31 | None |
-| `windows_validation` | 24 | `YOKAI_TEST_V0_FIXTURE`, `YOKAI_TEST_V1_FIXTURE`, `YOKAI_TEST_V2_FIXTURE`, `YOKAI_TEST_V2_BINARY`, `YOKAI_TEST_POWERSHELL` |
+| `windows_validation` | 25 | `YOKAI_TEST_V0_FIXTURE`, `YOKAI_TEST_V1_FIXTURE`, `YOKAI_TEST_V2_FIXTURE`, `YOKAI_TEST_V2_BINARY`, `YOKAI_TEST_POWERSHELL` |
 
-These 152 records include explicitly qualified platform branches; R12's
+These 153 records include explicitly qualified platform branches; R12's
 dangling-file-symlink subcheck remains Unix-only and reports `not_checked` on
 Windows. The Windows-only target reports `RESULT NOT_CHECKED` on other platforms.
 The checkpoint's WSL gate parsed saved Windows output; it ran no Linux candidate
@@ -466,3 +466,30 @@ data, backups and lock files. These are selected PF10(c) and upgrade witnesses,
 not a non-mutating startup claim or full PF10/W2, historical-binary, transient
 write, metadata/ADS/object-identity, hostile-race, power-loss/OS-crash, Linux
 runtime or product/security/release acceptance.
+
+### Supported opens with an empty WAL
+
+`WV-SUPPORTED-WAL` copies genuine pinned V0, V1 and V2 fixtures into separate
+owned roots and adds a zero-byte ordinary WAL, with SHM and journal absent.
+The original main, identity and lock bytes are preserved without header edits.
+Production `open_instance` records the original header once and drains the
+observation, then records Stage-A read-only followed by Stage-B read/write.
+The production Stage-A inventory guard remains active; retained snapshots
+cover the whole open/close boundaries rather than a separate intermediate
+Stage-A capture. Close records connection release before lock release.
+
+V0 and V1 upgrade to V2 and retain two and one pre-migration backups; V2
+creates none. All report startup epoch 2 with no examined or changed runs.
+A fresh bounded child reopens the closed current-V2 root at epoch 3 through
+the raw-header/Stage-B path, preserving migration history and backup bytes.
+All final closed states have WAL, SHM and journal absent.
+
+Before, parent-after and child-after snapshots retain 36 ordinary files,
+including each initially empty WAL and all backups, plus backup-directory
+markers. Source, identity and lock bytes remain equal; main changes and WAL
+removal during successful writable startup/close are expected. Exclusive
+opens check released data, identity, backup and lock handles. These selected
+supported PF10(b) and upgrade observations do not establish full PF10/W2,
+non-mutating startup, transient-write absence, metadata/object identity,
+hostile-race safety, crash recovery, power-loss durability, Linux runtime or
+product/security/release acceptance.
