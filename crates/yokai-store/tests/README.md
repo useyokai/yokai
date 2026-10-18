@@ -534,3 +534,29 @@ These are synthetic native Windows witnesses. Parent kill uses Windows
 process termination; it does not establish Linux runtime or power-loss
 behavior. The checks add no directory-flush, physical NTFS-full, hostile-race,
 full Windows qualification, security or product acceptance claim.
+
+
+### Owned junction paths
+
+WV-ALIAS retains its earlier cases and adds directory junctions at each of
+the six required Instance entry names: lock, identity, database, WAL, SHM and
+journal. Parent and separate child must return `PathInvalid` before any SQLite
+connection event. Any original ordinary file is retained outside the root.
+Complete before/after inventories record ordinary files and directory reparses
+without following links; a separate target inventory protects outside bytes.
+An equal-length changed-content control must produce a different inventory.
+
+A direct junction root is also refused as `PathInvalid`. A junction in an
+ancestor of an ordinary Instance leaf is allowed through canonicalization:
+an unowned open binds the real root, parent and child contenders are `Busy`
+while the real owner holds it, and a fresh child reopen after close succeeds
+with integrity intact. Only verified owned reparse entries are unlinked;
+targets, original bytes, inventories and child logs are retained.
+
+These owned-fixture checks do not qualify hostile reparse races. They create
+no drive mappings or shares and enable no host features. Distinct 8.3, subst,
+actual accessible UNC/mapped-network and removable-volume cases still need
+their own recorded host capabilities and scoped cleanup. Syntax-only UNC or
+fixed-drive success does not satisfy a negative-volume criterion. The CHECK
+catalogue remains 153; unavailable mandatory host cases keep B3 and full
+Windows qualification open.
