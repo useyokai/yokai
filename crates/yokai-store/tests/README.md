@@ -557,6 +557,37 @@ These owned-fixture checks do not qualify hostile reparse races. They create
 no drive mappings or shares and enable no host features. Distinct 8.3, subst,
 actual accessible UNC/mapped-network and removable-volume cases still need
 their own recorded host capabilities and scoped cleanup. Syntax-only UNC or
-fixed-drive success does not satisfy a negative-volume criterion. The CHECK
-catalogue remains 153; unavailable mandatory host cases keep B3 and full
-Windows qualification open.
+fixed-drive success does not satisfy a negative-volume criterion. The
+operator-provided host check below adds those actual observations; unavailable
+mandatory host cases keep B3 and full Windows qualification open.
+
+### Operator-provided host paths and negative volumes
+
+WV-HOST-PATHS requires an explicitly bounded Windows operator wrapper. Missing
+inputs fail the check; a USB label or syntax-only UNC string cannot pass it.
+The operator owns fresh short-name, subst, actual accessible UNC/mapped share
+and removable-NTFS fixtures, pins their identities and keeps them available
+through the batch. The harness creates no mapping or share and changes no
+host filesystem feature. Host paths and private execution records stay outside
+this repository.
+
+Distinct short-name and subst paths must bind the same native file identity.
+Both owner directions require parent and child `Busy` before SQLite events,
+unchanged protected bytes/lock identity, then fresh-child reopen and integrity.
+The persistent lock identity spans owner close and child reopen; the observed
+startup report and persisted epoch must each advance by exactly one per open.
+UNC, mapped remote and actual `DRIVE_REMOVABLE` paths each require parent and
+child create/open `UnsupportedLocation` before SQLite, complete refusal
+inventory equality (including native file IDs) and released lock handles.
+The removable fixture is a raw copy of a closed synthetic fixed-drive Instance;
+the application is never used to create a successful Instance on that medium.
+
+The owned C:/removable fixture budget is 64 MiB, 128 ordinary files and 16 MiB
+per file, checked without following reparses. Wrapper monitoring is sampled,
+not OS confinement or a quota. All fixtures and failures remain available.
+The added check makes the catalogue 154. Results apply only to the observed
+source/tool/host binding; hostile alias races, full Windows qualification,
+directory-entry and power-loss durability, full-disk qualification and
+promotion remain separate.
+The Windows harness stops at its first failed mandatory check and retains the
+failure output; later checks do not create more fixtures after that failure.
