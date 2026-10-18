@@ -45,6 +45,7 @@ mod native {
             ("WV-V2-COMPAT",v2_compat),
             ("WV-SQLITE-OPTIONS",sqlite_options),
             ("WV-ALIAS",aliases),
+            ("WV-HOST-PATHS",host_paths),
             ("WV-OPEN-FILES",open_files),
             ("WV-SQLITE-FILES",sqlite_files),
             ("WV-PREFLIGHT-ACCESS",preflight_access),
@@ -71,7 +72,7 @@ mod native {
             _=>{eprintln!("expected no arguments or --only <known check ID>");return ExitCode::from(2);}
         };
         let mut failed=0;
-        for (id,check) in &selected {match check(){Ok(detail)=>println!("CHECK {id} PASS {detail}"),Err(error)=>{println!("CHECK {id} FAIL {error}");failed+=1;}}}
+        for (id,check) in &selected {match check(){Ok(detail)=>println!("CHECK {id} PASS {detail}"),Err(error)=>{println!("CHECK {id} FAIL {error}");failed+=1;break;}}}
         if failed==0 {println!("RESULT PASS {}/{}",selected.len(),selected.len());ExitCode::SUCCESS}
         else {println!("RESULT FAIL {failed}/{}",selected.len());ExitCode::FAILURE}
     }
@@ -161,6 +162,17 @@ mod native {
         let result=(||->Result<(),String>{
             let mode=args.get(1).ok_or("child mode missing")?;let root=Path::new(args.get(2).ok_or("child root missing")?);
             match mode.as_str(){
+                "__host_create"|"__host_open"=>{host_refuse(root,mode=="__host_create")?;println!("INFO B3 host_child mode={mode} outcome=UnsupportedLocation sqlite_events=[]");},
+                "__host_busy"=>{junction_busy(root)?;println!("INFO B3 host_child mode={mode} outcome=Busy sqlite_events=[]");},
+                "__host_reopen"=>{
+                    let expected=Path::new(args.get(3).ok_or("missing physical root")?);
+                    let volume=args.get(4).ok_or("missing lock volume")?.parse::<u32>().map_err(|e|e.to_string())?;
+                    let index=args.get(5).ok_or("missing lock index")?.parse::<u64>().map_err(|e|e.to_string())?;
+                    let size=args.get(6).ok_or("missing lock size")?.parse::<u64>().map_err(|e|e.to_string())?;
+                    let epoch=args.get(7).ok_or("missing expected epoch")?.parse::<i64>().map_err(|e|e.to_string())?;
+                    host_reopen(root,expected,(volume,index,size),epoch)?;
+                    println!("INFO B3 host_child mode={mode} same_identity=true integrity=ok expected_epoch={epoch} observed_epoch={epoch} persistent_lock_id={:?}",(volume,index,size));
+                },
                 "__busy"=>{if !matches!(store::open_instance(root),Err(InstanceError::Busy(_))){return Err("competing opener was not Busy".into());}},
                 "__junction_refusal"=>{junction_refusal(root)?;println!("INFO B3 junction_child mode=refusal outcome=PathInvalid sqlite_events=[]");},
                 "__junction_busy"=>{junction_busy(root)?;println!("INFO B3 junction_child mode=busy outcome=Busy sqlite_events=[]");},
@@ -403,6 +415,178 @@ mod native {
         junction_cases()?;
         Ok(format!("no second owner or protected-byte change for {exercised:?}; six required-entry/direct-root junction refusals and canonical junction-ancestor ownership checked; host capability gaps explicit; only verified owned links unlinked, all targets/logs retained"))
     }
+    // A regression admitting remote/removable paths must fail before any SQLite
+    // event; a regression splitting alias ownership must fail the exact Busy
+    // oracle. These tests exercise existing policy, not a new production API.
+    #[allow(unsafe_code)]
+    mod host_api {
+        use super::*;
+        use std::ffi::c_void;
+        use std::os::windows::ffi::OsStrExt;
+        use std::os::windows::io::AsRawHandle;
+        #[repr(C)]
+        #[derive(Default)]
+        struct Info{attributes:u32,times:[u32;6],volume:u32,size_high:u32,size_low:u32,links:u32,index_high:u32,index_low:u32}
+        #[link(name="kernel32")]
+        unsafe extern "system"{
+            fn GetShortPathNameW(path:*const u16,out:*mut u16,len:u32)->u32;
+            fn GetDriveTypeW(path:*const u16)->u32;
+            fn GetVolumePathNameW(path:*const u16,out:*mut u16,len:u32)->i32;
+            fn GetVolumeNameForVolumeMountPointW(path:*const u16,out:*mut u16,len:u32)->i32;
+            fn GetVolumeInformationW(path:*const u16,label:*mut u16,label_len:u32,serial:*mut u32,component:*mut u32,flags:*mut u32,fs:*mut u16,fs_len:u32)->i32;
+            fn GetFileInformationByHandle(handle:*mut c_void,out:*mut Info)->i32;
+        }
+        fn wide(p:&Path)->Vec<u16>{p.as_os_str().encode_wide().chain(Some(0)).collect()}
+        fn text(b:&[u16])->Result<String,String>{String::from_utf16(&b[..b.iter().position(|v|*v==0).ok_or("unterminated native path")?]).map_err(|e|e.to_string())}
+        pub fn short(p:&Path)->Result<PathBuf,String>{
+            let input=wide(p);let mut out=vec![0u16;32768];
+            // SAFETY: live nul-terminated input and writable UTF-16 output.
+            let n=unsafe{GetShortPathNameW(input.as_ptr(),out.as_mut_ptr(),out.len() as u32)};
+            if n==0 || n as usize>=out.len(){return Err("distinct short-path query failed".into());}Ok(PathBuf::from(text(&out)?))
+        }
+        pub fn drive_type(p:&Path)->u32{
+            let input=wide(p);
+            // SAFETY: live nul-terminated drive/share root supplied by the wrapper.
+            unsafe{GetDriveTypeW(input.as_ptr())}
+        }
+        pub fn volume(p:&Path)->Result<(u32,String,u32,String),String>{
+            let input=wide(p);let mut root=vec![0u16;32768];let mut guid=vec![0u16;128];
+            let(mut label,mut fs)=(vec![0u16;261],vec![0u16;261]);let(mut serial,mut component,mut flags)=(0,0,0);
+            // SAFETY: all input/output buffers live through these synchronous APIs.
+            let ok=unsafe{GetVolumePathNameW(input.as_ptr(),root.as_mut_ptr(),root.len() as u32)!=0
+                && GetVolumeNameForVolumeMountPointW(root.as_ptr(),guid.as_mut_ptr(),guid.len() as u32)!=0
+                && GetVolumeInformationW(root.as_ptr(),label.as_mut_ptr(),261,&mut serial,&mut component,&mut flags,fs.as_mut_ptr(),261)!=0};
+            if !ok{return Err(std::io::Error::last_os_error().to_string());}
+            // SAFETY: successful volume-path query provided a nul-terminated root.
+            Ok((unsafe{GetDriveTypeW(root.as_ptr())},text(&guid)?,serial,text(&fs)?))
+        }
+        pub fn id(p:&Path)->Result<(u32,u64,u64),String>{
+            let file=OpenOptions::new().access_mode(0).share_mode(3).open(p).map_err(|e|e.to_string())?;let mut out=Info::default();
+            if std::mem::size_of::<Info>()!=52{return Err("native file information ABI differs".into());}
+            // SAFETY: valid owned handle and correctly sized initialized output.
+            if unsafe{GetFileInformationByHandle(file.as_raw_handle(),&mut out)}==0{return Err(std::io::Error::last_os_error().to_string());}
+            Ok((out.volume,((out.index_high as u64)<<32)|out.index_low as u64,((out.size_high as u64)<<32)|out.size_low as u64))
+        }
+    }
+    fn host_env(name:&str)->Result<PathBuf,String>{
+        let p=PathBuf::from(std::env::var_os(name).ok_or_else(||format!("missing bounded host input {name}"))?);
+        if !p.is_absolute(){return Err("host fixture must be absolute".into());}Ok(p)
+    }
+    fn host_budget(root:&Path)->Result<(),String>{
+        use std::os::windows::fs::MetadataExt;
+        fn walk(p:&Path,depth:usize,count:&mut usize,total:&mut u64)->Result<(),String>{
+            let m=fs::symlink_metadata(p).map_err(|e|e.to_string())?;
+            if depth>8 || m.file_attributes()&0x400!=0{return Err("host budget encountered nesting/reparse".into());}
+            if m.is_dir(){for e in fs::read_dir(p).map_err(|e|e.to_string())?{walk(&e.map_err(|e|e.to_string())?.path(),depth+1,count,total)?;}}
+            else if m.is_file(){*count+=1;*total+=m.len();if m.len()>16*1024*1024{return Err("host file budget exceeded".into());}}
+            else{return Err("unknown host fixture entry".into());}
+            if *count>128 || *total>64*1024*1024{return Err("host subtree budget exceeded".into());}Ok(())
+        }
+        walk(root,0,&mut 0,&mut 0)
+    }
+    fn host_removable()->Result<PathBuf,String>{
+        let p=host_env("YOKAI_B3_REMOVABLE")?;let observed=host_api::volume(&p)?;
+        let guid=std::env::var("YOKAI_B3_VOLUME_GUID").map_err(|e|e.to_string())?;
+        let serial=u32::from_str_radix(&std::env::var("YOKAI_B3_VOLUME_SERIAL").map_err(|e|e.to_string())?,16).map_err(|e|e.to_string())?;
+        if observed!=(2,guid,serial,"NTFS".into()){return Err(format!("removable identity/type changed {observed:?}"));}
+        host_budget(&p)?;Ok(p)
+    }
+    fn host_inventory(root:&Path)->Result<String,String>{
+        fn files(root:&Path,p:&Path,rows:&mut BTreeMap<String,String>)->Result<(),String>{
+            for e in fs::read_dir(p).map_err(|e|e.to_string())?{let p=e.map_err(|e|e.to_string())?.path();
+                let m=fs::symlink_metadata(&p).map_err(|e|e.to_string())?;
+                if m.is_dir(){files(root,&p,rows)?;}else{rows.insert(p.strip_prefix(root).map_err(|e|e.to_string())?.to_string_lossy().into_owned(),format!("{:?}",host_api::id(&p)?));}}
+            Ok(())
+        }
+        host_budget(root)?;let inventory=junction_inventory(root)?;let mut rows=BTreeMap::new();files(root,root,&mut rows)?;
+        Ok(format!("{inventory}native_file_ids={rows:?}\n"))
+    }
+    fn host_refuse(path:&Path,create:bool)->Result<(),String>{
+        store::test_api::clear();let result=if create{store::create_instance(path)}else{store::open_instance(path)};
+        let events=store::test_api::connection_events();
+        match result{Err(InstanceError::UnsupportedLocation(_)) if events.is_empty()=>Ok(()),
+            Ok(i)=>{i.close().map_err(|e|e.to_string())?;Err("negative volume unexpectedly acquired Instance".into())},
+            Err(e)=>Err(format!("expected UnsupportedLocation before SQLite, observed {e:?} events={events:?}"))}
+    }
+    fn host_child(mode:&str,path:&Path,expected:Option<(&Path,(u32,u64,u64),i64)>)->Result<(),String>{
+        let mut c=command(mode,path)?;
+        if let Some((root,(volume,index,size),epoch))=expected{c.arg(root).arg(volume.to_string()).arg(index.to_string()).arg(size.to_string()).arg(epoch.to_string());}
+        let(mut child,logs)=launch(c,"host-path-child")?;
+        if !wait(&mut child,Duration::from_secs(15))?.success(){return Err(format!("{mode} failed: {}",logs.display()));}
+        let output=fs::read_to_string(logs.join("child.out")).map_err(|e|e.to_string())?;
+        if output.lines().filter(|l|l.starts_with("INFO B3 host_child ")).count()!=1{return Err("missing host child observation".into());}
+        println!("INFO B3 host_child_observed mode={mode} logs={}",logs.display());Ok(())
+    }
+    fn host_epoch(root:&Path)->Result<i64,String>{
+        let c=ro(root)?;let epoch=c.query_row("SELECT epoch FROM runtime_epoch WHERE id=1",[],|r|r.get(0)).map_err(|e|e.to_string())?;
+        c.close().map_err(|(_,e)|e.to_string())?;Ok(epoch)
+    }
+    fn host_reopen(alias:&Path,real:&Path,lock:(u32,u64,u64),epoch:i64)->Result<(),String>{
+        if host_api::id(&alias.join("instance.id"))?!=host_api::id(&real.join("instance.id"))?{return Err("alias identity differs".into());}
+        if host_api::id(&real.join("instance.lock"))?!=lock || host_epoch(real)?!=epoch-1{return Err("pre-reopen persistent lock/epoch differs".into());}
+        let before=fs::read(real.join("instance.id")).map_err(|e|e.to_string())?;
+        let i=store::open_instance(alias).map_err(|e|e.to_string())?;
+        if host_api::id(&i.root().join("instance.id"))?!=host_api::id(&real.join("instance.id"))?{return Err("opened physical identity differs".into());}
+        if !i.startup_report().is_some_and(|r|r.epoch==epoch && r.runs_examined==0 && r.runs_changed==0){return Err("alias startup epoch transition differs".into());}
+        i.close().map_err(|e|e.to_string())?;let c=ro(real)?;
+        let integrity:String=c.query_row("PRAGMA integrity_check",[],|r|r.get(0)).map_err(|e|e.to_string())?;c.close().map_err(|(_,e)|e.to_string())?;
+        if integrity!="ok" || fs::read(real.join("instance.id")).map_err(|e|e.to_string())?!=before
+            || host_api::id(&real.join("instance.lock"))?!=lock || host_epoch(real)?!=epoch{return Err("reopen changed identity/lock/epoch/integrity".into());}Ok(())
+    }
+    fn host_alias_case(label:&str,parent:&Path,mapped:Option<&Path>)->Result<(),String>{
+        let i=store::create_instance(parent).map_err(|e|e.to_string())?;let real=i.root().to_owned();i.close().map_err(|e|e.to_string())?;
+        let alias=if let Some(mapped)=mapped{mapped.join(real.file_name().ok_or("Instance leaf absent")?)}else{host_api::short(&real)?};
+        if label=="short" && (alias==real || !alias.to_string_lossy().contains('~')){return Err("short alias is not distinct".into());}
+        if host_api::id(&alias.join("instance.id"))?!=host_api::id(&real.join("instance.id"))?{return Err("alias native file identity differs".into());}
+        let persistent_lock=host_api::id(&real.join("instance.lock"))?;
+        for (owner_path,contender) in [(&real,&alias),(&alias,&real)]{
+            let previous=host_epoch(&real)?;
+            let owner=store::open_instance(owner_path).map_err(|e|e.to_string())?;
+            let owner_epoch=owner.startup_report().ok_or("missing alias owner startup report")?.epoch;
+            if owner_epoch!=previous+1 || host_api::id(&real.join("instance.lock"))?!=persistent_lock{return Err("alias owner epoch/lock transition differs".into());}
+            let pause=store::test_api::block_writer(&owner).map_err(|e|e.to_string())?;let before=protected(&real)?;
+            let lock_before=host_api::id(&real.join("instance.lock"))?;
+            junction_busy(contender)?;host_child("__host_busy",contender,None)?;
+            if protected(&real)?!=before || host_api::id(&real.join("instance.lock"))?!=lock_before{return Err("alias contender changed protected bytes/lock ID".into());}
+            drop(pause);owner.close().map_err(|e|e.to_string())?;
+            if host_api::id(&real.join("instance.lock"))?!=persistent_lock || host_epoch(&real)?!=owner_epoch{return Err("owner close changed persistent lock/epoch".into());}
+            host_child("__host_reopen",contender,Some((&real,persistent_lock,owner_epoch+1)))?;
+        }
+        println!("INFO B3 host_alias case={label} real={} alias={} same_native_identity=true both_owner_directions=true parent_child=Busy sqlite_events=[] fresh_reopen=ok exact_epoch_increment=true persistent_lock_id={persistent_lock:?} integrity=ok",real.display(),alias.display());Ok(())
+    }
+    fn host_negative_case(label:&str,base:&Path,source:&Path)->Result<(),String>{
+        let scoped=base.join(format!("negative-{label}-{}",std::process::id()));fs::create_dir(&scoped).map_err(|e|e.to_string())?;
+        let empty=scoped.join("create-parent");fs::create_dir(&empty).map_err(|e|e.to_string())?;keep_junction_record(&empty.join("sentinel"),b"negative volume sentinel\n")?;
+        let fixture=scoped.join(source.file_name().ok_or("synthetic Instance leaf absent")?);fs::create_dir(&fixture).map_err(|e|e.to_string())?;
+        for name in ["instance.id","instance.lock","instance.db"]{let bytes=fs::read(source.join(name)).map_err(|e|e.to_string())?;keep_junction_record(&fixture.join(name),&bytes)?;}
+        let evidence=parent("host-negative-evidence")?;let before=host_inventory(&scoped)?;keep_junction_record(&evidence.join("before.inventory"),before.as_bytes())?;
+        for (path,create,mode) in [(&empty,true,"__host_create"),(&fixture,false,"__host_open")]{host_refuse(path,create)?;host_child(mode,path,None)?;}
+        let after=host_inventory(&scoped)?;keep_junction_record(&evidence.join("after.inventory"),after.as_bytes())?;
+        if before!=after{return Err("negative-volume refusal changed full bytes/names/types/native IDs".into());}
+        drop(OpenOptions::new().read(true).write(true).share_mode(0).open(fixture.join("instance.lock")).map_err(|e|e.to_string())?);
+        println!("INFO B3 host_negative case={label} root={} parent_child_create_open=UnsupportedLocation sqlite_events=[] full_inventory_unchanged=true lock_released=true evidence={}",scoped.display(),evidence.display());Ok(())
+    }
+    fn host_paths()->Result<String,String>{
+        let removable=host_removable()?;let short=host_env("YOKAI_B3_SHORT_PARENT")?;
+        host_budget(&short)?;host_alias_case("short",&short,None)?;host_budget(&short)?;
+        let real=host_env("YOKAI_B3_SUBST_REAL")?;let alias=host_env("YOKAI_B3_SUBST_ALIAS")?;
+        if host_api::drive_type(&alias)!=3{return Err("subst is not fixed".into());}
+        host_alias_case("subst",&real,Some(&alias))?;
+        let i=instance("host-negative-source")?;let source=i.root().to_owned();i.close().map_err(|e|e.to_string())?;
+        let source_before=host_inventory(&source)?;
+        for (label,name) in [("unc","YOKAI_B3_UNC"),("mapped","YOKAI_B3_MAPPED")]{
+            let p=host_env(name)?;
+            let volume=if label=="unc"{host_env("YOKAI_B3_UNC_SHARE")?}else{p.clone()};
+            if host_api::drive_type(&volume)!=4{return Err("actual remote drive type differs".into());}
+            // Remote marker identity was checked by the bounded native controller.
+            if fs::read(p.join("marker")).map_err(|e|e.to_string())?!=fs::read(host_env("YOKAI_B3_NETWORK_REAL")?.join("marker")).map_err(|e|e.to_string())?{return Err("remote marker binding differs".into());}
+            host_negative_case(label,&p,&source)?;
+        }
+        host_removable()?;host_negative_case("removable",&removable,&source)?;host_removable()?;
+        if host_inventory(&source)?!=source_before{return Err("fixed synthetic source changed".into());}
+        Ok("actual distinct8.3/subst owner/Busy/reopen; actual UNC/mapped/removable create/open parent+child UnsupportedLocation before SQLite; immutable refusal inventories; no full Windows/durability/promotion acceptance".into())
+    }
+
     /// An inventory never follows a reparse entry. Target content is observed
     /// separately, so redirecting a link cannot hide an outside-target change.
     fn junction_inventory(root:&Path)->Result<String,String>{
