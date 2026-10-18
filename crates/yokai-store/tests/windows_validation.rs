@@ -63,6 +63,7 @@ mod native {
             ("WV-STALE-SHM",stale_shm),
             ("WV-EMPTY-WAL",empty_wal),
             ("WV-SUPPORTED-OPEN",supported_open),
+            ("WV-SUPPORTED-WAL",wal_open),
         ];
         let selected:Vec<_>=match args.as_slice(){
             [_]=>checks.iter().collect(),
@@ -221,6 +222,16 @@ mod native {
                     if before.keys().ne(after.keys()) || before.get("instance.db")==after.get("instance.db"){return Err("supported child closed layout/main change differs".into());}
                     supported_released(root,&after)?;
                     println!("INFO WV supported_open_child case={case} header=2 epoch=3 backups_unchanged=true identity_lock_unchanged=true exclusive_opens=allowed inventory_before={:?} inventory_after={:?}",stageb_inventory(&before)?,stageb_inventory(&after)?);
+                },
+                "__wal_open"=>{
+                    let case=args.get(3).ok_or("missing supported case")?;
+                    let initial=SUPPORTED_OPEN_CASES.iter().find(|(name,_,_)|*name==case).map(|(_,_,v)|*v).ok_or("unknown supported case")?;
+                    let before=supported_snapshot(root)?;supported_closed(&before,initial)?;supported_open_once(root,case,2,3)?;
+                    let after=supported_snapshot(root)?;supported_closed(&after,initial)?;
+                    for (name,bytes) in &before{if name!="instance.db" && after.get(name)!=Some(bytes){return Err("supported child changed protected bytes".into());}}
+                    if before.keys().ne(after.keys()) || before.get("instance.db")==after.get("instance.db"){return Err("supported child closed layout/main change differs".into());}
+                    supported_released(root,&after)?;
+                    println!("INFO WV wal_open_child case={case} header=2 epoch=3 backups_unchanged=true identity_lock_unchanged=true exclusive_opens=allowed inventory_before={:?} inventory_after={:?}",stageb_inventory(&before)?,stageb_inventory(&after)?);
                 },
                 "__close_error"=>{
                     store::test_api::fail_startup_close_once();
@@ -1546,6 +1557,55 @@ mod native {
         }
         if retained_files!=33{return Err(format!("supported retained file count={retained_files}"));}
         Ok("genuine V0/V1/V2 no-side-file production opens decode raw headers then Stage B; V0/V1 upgrade and V2 reopens, child epoch2-to3 without repeated migration;33 retained files including backups,6 traces and measured inventories; no non-mutating/durability/fullPF10/W2/product acceptance".into())
+    }
+
+    fn wal_open_once(root:&Path,case:&str,header:u32,epoch:i64)->Result<(),String>{
+        store::test_api::clear();
+        let i=match store::open_instance(root){Ok(i)=>i,Err(error)=>{
+            let events=store::test_api::connection_events();let decoded=store::test_api::header_versions()?;
+            return Err(format!("wal-open {case} open failed {error:?}; events={events:?}; decoded={decoded:?}"));
+        }};
+        let version=store::test_api::user_version(&i);let report=i.startup_report().copied();let open_events=store::test_api::connection_events();
+        let decoded=store::test_api::header_versions();let second_take=store::test_api::header_versions();
+        let closed=i.close();let close_events=store::test_api::connection_events();closed.map_err(|e|e.to_string())?;
+        let version=version.map_err(|e|e.to_string())?;let decoded=decoded?;let second_take=second_take?;
+        if version!=2 || !report.is_some_and(|r|r.epoch==epoch && r.runs_examined==0 && r.runs_changed==0)
+            || open_events!=["stage-a-read-only","stage-b-read-write"] || close_events!=["connection-closed","lock-released"] || decoded!=[header] || !second_take.is_empty(){
+            return Err(format!("wal-open {case} oracle header={decoded:?} second_take={second_take:?} open_events={open_events:?} close_events={close_events:?} version={version} report={report:?} expected_epoch={epoch}"));
+        }
+        println!("INFO WV wal_open_trace case={case} decoded={decoded:?} second_take={second_take:?} open_events={open_events:?} close_events={close_events:?} version={version} epoch={epoch} runs_examined=0 runs_changed=0");Ok(())
+    }
+    fn wal_open()->Result<String,String>{
+        let mut retained_files=0;
+        for &(case,input,version) in &SUPPORTED_OPEN_CASES {
+            let source=PathBuf::from(std::env::var_os(input).ok_or("missing pinned supported fixture")?);let original=supported_snapshot(&source)?;
+            if original.keys().map(String::as_str).collect::<Vec<_>>()!=["instance.db","instance.id","instance.lock"]
+                || original.get("instance.lock")!=Some(&Some(Vec::new())) || supported_header(&original,"instance.db")?!=version{return Err("supported source layout/version differs".into());}
+            let name=source.file_name().and_then(|n|n.to_str()).ok_or("supported source identity missing")?;
+            if name.len()!=32 || !name.bytes().all(|b|b.is_ascii_digit() || (b'a'..=b'f').contains(&b)){return Err("supported source name invalid".into());}
+            let root=parent("wal-open")?.join(name);fs::create_dir(&root).map_err(|e|e.to_string())?;
+            for (name,bytes) in &original{let mut file=File::create_new(root.join(name)).map_err(|e|e.to_string())?;file.write_all(bytes.as_ref().ok_or("supported source directory")?).map_err(|e|e.to_string())?;file.sync_all().map_err(|e|e.to_string())?;}
+            let copied=supported_snapshot(&root)?;if copied!=original{return Err("WAL-open source copy differs".into());}
+            File::create_new(root.join("instance.db-wal")).map_err(|e|e.to_string())?.sync_all().map_err(|e|e.to_string())?;
+            let before=supported_snapshot(&root)?;let mut expected=original.clone();expected.insert("instance.db-wal".into(),Some(Vec::new()));
+            if before!=expected{return Err("WAL-open initial empty-WAL layout differs".into());}
+            let baseline=supported_retain(&root,"retained-wo-before",&before)?;
+            wal_open_once(&root,case,version,2)?;let after=supported_snapshot(&root)?;supported_closed(&after,version)?;
+            for name in ["instance.id","instance.lock"]{if before.get(name)!=after.get(name){return Err("supported parent changed identity/lock bytes".into());}}
+            if before.get("instance.db")==after.get("instance.db"){return Err("supported startup did not change main bytes".into());}
+            let final_copy=supported_retain(&root,"retained-wo-after",&after)?;supported_released(&root,&after)?;
+            let mut probe=command("__wal_open",&root)?;probe.arg(case);let (mut child,logs)=launch(probe,"wal-open-probe")?;
+            if !wait(&mut child,Duration::from_secs(15))?.success(){return Err(format!("supported child failed; logs={}",logs.display()));}
+            let repeated=supported_snapshot(&root)?;supported_closed(&repeated,version)?;
+            for (name,bytes) in &after{if name!="instance.db" && repeated.get(name)!=Some(bytes){return Err("supported child changed identity/lock/backups".into());}}
+            if after.keys().ne(repeated.keys()) || after.get("instance.db")==repeated.get("instance.db"){return Err("supported child layout or startup main change differs".into());}
+            supported_released(&root,&repeated)?;let child_copy=supported_retain(&root,"retained-wo-child-after",&repeated)?;
+            for (snapshot,path) in [(&before,&baseline),(&after,&final_copy),(&repeated,&child_copy)]{if supported_snapshot(path)?!=*snapshot{return Err("supported retained copy changed".into());}retained_files+=snapshot.values().filter(|b|b.is_some()).count();}
+            if supported_snapshot(&source)?!=original{return Err("supported original fixture changed".into());}
+            println!("INFO WV wal_open source={} fixture={} case={case} original_version={version} baseline={} after={} child_after={} child_logs={} final_version=2 parent_epoch=2 child_epoch=3 original_unchanged=true copies_verified=true identity_lock_unchanged=true backups_retained=true exclusive_opens=allowed inventory_before={:?} inventory_after={:?} inventory_child_after={:?}",source.display(),root.display(),baseline.display(),final_copy.display(),child_copy.display(),logs.display(),stageb_inventory(&before)?,stageb_inventory(&after)?,stageb_inventory(&repeated)?);
+        }
+        if retained_files!=36{return Err(format!("supported retained file count={retained_files}"));}
+        Ok("genuine V0/V1/V2 empty-WAL production opens decode raw headers then Stage-A read-only and Stage B; V0/V1 upgrade and V2 reopens, child epoch2-to3 without repeated migration;36 retained files including backups,6 traces and measured inventories; no non-mutating/durability/fullPF10/W2/product acceptance".into())
     }
 
     fn lock_soak()->Result<String,String>{
