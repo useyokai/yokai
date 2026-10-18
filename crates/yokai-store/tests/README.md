@@ -591,3 +591,37 @@ directory-entry and power-loss durability, full-disk qualification and
 promotion remain separate.
 The Windows harness stops at its first failed mandatory check and retains the
 failure output; later checks do not create more fixtures after that failure.
+
+### Controlled Defender and indexer profile
+
+`windows_validation --only WV-INTERFERENCE` is a separate operator profile.
+It requires `YOKAI_B4_FIXTURE_ROOT`, `YOKAI_B4_CONTROL_ROOT` and a fresh
+alphanumeric `YOKAI_B4_NONCE` from a bounded reviewed native wrapper. The
+ordinary 154-check catalogue is unchanged; this additional profile must be
+included when qualifying controlled interference. A running service or the
+natural lock soak cannot satisfy it.
+
+Four synchronized phases hold a real uncommitted command/owner, pause close
+before worker joins and after confirmed joins but before unlock, and hold an
+acknowledged writer before parent kill/reap and fresh-process recovery.
+Each phase checks parent/fresh-child `Busy` before SQLite. The oracle checks
+ordered close/release events, persistent lock identity, exact reopen epochs,
+the complete 26-command ID/kind/version/payload set, dependent record counts,
+absence of the killed uncommitted command, integrity and foreign keys.
+Minimum held intervals are 15/10/10/15 seconds, each bounded at 120 seconds.
+
+The wrapper must separately prove actual scoped Defender scan callbacks and
+fresh unique-content indexing observations inside each held interval. Control
+release markers only coordinate the storage harness; they are not independent
+proof of service activity. Pin tool versions/hashes, source, command scope,
+request counts, bytes, time/resource limits and final evidence custody. After
+fresh recovery and all closed-state reads, the harness emits a complete ordinary
+entry inventory with file hashes, sizes and native identities. The wrapper must
+match it, retain closed bytes in its sealed package, and recheck the original
+fixture before acceptance. Check free space on both fixture and evidence volumes;
+these controls are sampled and do not provide a filesystem quota.
+The harness changes no security/indexing settings and creates no service or
+mapping. Existing services are outside the test Job; unknown completion remains
+failure with fixtures retained. No global scan cancellation is implied.
+Neither this profile nor its source CHECK alone establishes full Windows,
+directory-entry/power-loss durability, hostile-race freedom or promotion.

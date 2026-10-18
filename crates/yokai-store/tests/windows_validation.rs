@@ -32,6 +32,7 @@ mod native {
     use yokai_types::CommandId;
     type Check=fn()->Result<String,String>;
     static NEXT:AtomicUsize=AtomicUsize::new(0);
+    mod interference { include!("support/windows_interference.rs"); }
 
     pub fn run()->ExitCode {
         let dump=yokai_testsupport::make_non_dumpable();println!("{}",dump.line());
@@ -66,8 +67,10 @@ mod native {
             ("WV-SUPPORTED-OPEN",supported_open),
             ("WV-SUPPORTED-WAL",wal_open),
         ];
+        let controlled=("WV-INTERFERENCE",interference::run as Check);
         let selected:Vec<_>=match args.as_slice(){
             [_]=>checks.iter().collect(),
+            [_,flag,id] if flag=="--only" && id=="WV-INTERFERENCE"=>vec![&controlled],
             [_,flag,id] if flag=="--only" && checks.iter().any(|(known,_)|known==id)=>checks.iter().filter(|(known,_)|known==id).collect(),
             _=>{eprintln!("expected no arguments or --only <known check ID>");return ExitCode::from(2);}
         };
@@ -162,6 +165,7 @@ mod native {
         let result=(||->Result<(),String>{
             let mode=args.get(1).ok_or("child mode missing")?;let root=Path::new(args.get(2).ok_or("child root missing")?);
             match mode.as_str(){
+                "__b4_busy"|"__b4_close"|"__b4_crash"|"__b4_recover"=>interference::child(mode,root,args)?,
                 "__host_create"|"__host_open"=>{host_refuse(root,mode=="__host_create")?;println!("INFO B3 host_child mode={mode} outcome=UnsupportedLocation sqlite_events=[]");},
                 "__host_busy"=>{junction_busy(root)?;println!("INFO B3 host_child mode={mode} outcome=Busy sqlite_events=[]");},
                 "__host_reopen"=>{
