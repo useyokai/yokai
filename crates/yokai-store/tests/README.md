@@ -17,15 +17,23 @@ Recorded Windows runs use fixed NTFS:
 | `instance_migrations` | 18 | `YOKAI_TEST_V0_FIXTURE`, `YOKAI_TEST_V0_BINARY` |
 | `sqlite_runtime` | 12 | None |
 | `store_runtime` | 31 | None |
-| `windows_validation` | 25 | `YOKAI_TEST_V0_FIXTURE`, `YOKAI_TEST_V1_FIXTURE`, `YOKAI_TEST_V2_FIXTURE`, `YOKAI_TEST_V2_BINARY`, `YOKAI_TEST_POWERSHELL` |
+| `windows_validation` | 26 | `YOKAI_TEST_V0_FIXTURE`, `YOKAI_TEST_V1_FIXTURE`, `YOKAI_TEST_V2_FIXTURE`, `YOKAI_TEST_V2_BINARY`, `YOKAI_TEST_POWERSHELL`, plus the [operator-provided host paths](#operator-provided-host-paths-and-negative-volumes) |
 
-These 153 records include explicitly qualified platform branches. R12 attempts
+These 154 records describe the ordinary configured catalogue, including
+`WV-HOST-PATHS` and explicitly qualified platform branches. The separate
+[`WV-INTERFERENCE` profile](#controlled-defender-and-indexer-profile) requires
+an explicit selection and operator wrapper; it is not included in that count.
+The [host-path batch](https://github.com/useyokai/yokai/pull/31) passed 154/154.
+The later [controlled-interference batch](https://github.com/useyokai/yokai/pull/32)
+passed five baseline targets 128/128 plus its focused 1/1; it did not
+rerun the ordinary 154-check profile. R12 attempts
 the dangling-file-symlink subcheck on Windows and records `checked_windows`
 when the host supports it, or `not_checked` when that capability is unavailable.
 Earlier runs retain their original limits. The Windows-only target reports
 `RESULT NOT_CHECKED` on other platforms.
-The checkpoint's WSL gate parsed saved Windows output; it ran no Linux candidate
-tests. Counts describe this checkpoint, not a complete acceptance catalogue.
+Those Windows checkpoints' WSL gates parsed saved Windows output; they ran no
+Linux candidate tests. Counts retain their source/profile binding and do not
+establish complete Windows qualification.
 
 `YOKAI_TEST_DATA_DIR` must name an existing absolute directory reserved for
 synthetic test data. The other fixture variables name preserved, closed owned
@@ -75,10 +83,14 @@ faults are synthetic; the real transaction/ownership paths are still exercised.
 Alias checks record available junction, symbolic-link and short-name cases.
 Unavailable privileges or short names remain explicit gaps. Only an owned,
 identity-verified link is unlinked after observation; its target and logs remain.
-UNC classification is tested without opening a share. No drive mapping, share,
-privilege, Defender or indexer configuration is changed. The short contention
-observation does not establish controlled antivirus/indexer interference or a
-performance guarantee.
+The basic UNC classification case does not open a share. The separate
+[host-path profile](#operator-provided-host-paths-and-negative-volumes) requires
+actual accessible UNC/mapped-network and removable-volume inputs from its
+operator wrapper. The harness creates no mapping or share and changes no
+privilege, Defender or indexer configuration. The short contention observation
+does not establish controlled antivirus/indexer interference or a performance
+guarantee; controlled activity has its own
+[profile](#controlled-defender-and-indexer-profile).
 
 These checks are partial Windows qualification. Physical NTFS exhaustion,
 power loss/OS crash, directory-entry durability, Windows dumpability and
@@ -98,8 +110,10 @@ share-zero/share-delete file observations. These
 experiments preserve original synthetic bytes and never delete an Instance
 database or root. The earlier share-read/write implementation and its recorded
 observations are superseded by this contract correction; they are not evidence
-that the older code used share mode zero. Controlled Defender/indexer
-interference remains untested.
+that the older code used share mode zero. Controlled Defender/indexer activity
+is covered separately by the bounded
+[interference profile](#controlled-defender-and-indexer-profile); these
+open-file observations alone do not establish it.
 Persistent lock bytes are compared before ownership and after confirmed close,
 when an ordinary read is permitted. The observations inform future filesystem
 work; they do not implement a discard operation or prove every SQLite/open-file
