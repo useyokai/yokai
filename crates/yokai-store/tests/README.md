@@ -139,7 +139,7 @@ and the main file with the retained reader. The rollback mode is diagnostic;
 the production store still uses WAL.
 
 Readable bytes are retained before probes and compared afterward, alongside
-file metadata. An exact Windows byte-range error33 while reading SHM is
+file metadata. An exact Windows byte-range error 33 while reading SHM is
 reported as byte-unverified; metadata equality does not prove stable object
 identity. Other observation errors fail the check. The harness verifies real
 rollback, the literal committed row, handle release and a fresh integrity
@@ -157,7 +157,7 @@ typed `PreflightUnavailable`, and no SQLite connection or fallback.
 
 Readable baseline files are retained before denial. After releasing the guard,
 the complete root listing and file bytes must match; an exclusive handle can
-be reacquired, and a read-only Stage-A control must still refuse the future
+be reacquired, and a read-only Stage A control must still refuse the future
 WAL version without reaching Stage B. That read-only control may change SHM;
 all other entries and bytes must remain unchanged. These sharing-denial cases
 do not establish ACL denial, non-writable-directory behavior, or complete
@@ -167,14 +167,14 @@ root is renamed or deleted.
 ### Damaged Windows WAL frames and shared memory
 
 `WV-PREFLIGHT-DAMAGE` uses fresh synthetic future-version Instances with one
-committed page-1 WAL frame. A pristine read-only control must see WAL version4
-over main version3. The check then truncates a frame inside its payload, flips
+committed page-1 WAL frame. A pristine read-only control must see WAL version 4
+over main version 3. The check then truncates a frame inside its payload, flips
 one stored frame-checksum byte, or fills SHM with deterministic nonzero bytes.
 For the two WAL cases, only the closed owned SHM fixture is removed before the
 probe baseline so SQLite must recover its index rather than reuse stale SHM.
 
-The WAL cases must refuse main version3; the SHM case must recover WAL version4.
-Each refusal must use Stage-A read-only with no writable fallback. Every
+The WAL cases must refuse main version 3; the SHM case must recover WAL version 4.
+Each refusal must use Stage A read-only with no writable fallback. Every
 non-SHM entry and byte must remain unchanged; SHM creation/rebuild is recorded
 separately. Pristine and damaged copies are retained before the probe, and
 released handles are checked afterward. These cases do not establish
@@ -185,15 +185,15 @@ root is removed, and no host permissions change.
 ### Inconsistent Windows side files
 
 `WV-PREFLIGHT-CONSISTENCY` constructs independent closed target and donor
-Instances with genuine committed page-1 WALs. The target has main version3
-and WAL version4; a distinct donor has WAL version5. It separately transplants
+Instances with genuine committed page-1 WALs. The target has main version 3
+and WAL version 4; a distinct donor has WAL version 5. It separately transplants
 the donor WAL or SHM, or truncates a fresh closed target main file to zero
 while leaving its WAL present. Pristine target/donor and altered target files
 are retained before each probe. Only closed owned target SHM is removed during
 foreign-WAL construction so SQLite must recover the index.
 
-Foreign WAL must refuse version5 and foreign SHM must refuse version4 through
-Stage-A read-only, without writable or raw-header fallback. Zero main with WAL
+Foreign WAL must refuse version 5 and foreign SHM must refuse version 4 through
+Stage A read-only, without writable or raw-header fallback. Zero main with WAL
 must refuse before SQLite. Every non-SHM entry and byte stays unchanged; the
 zero-main case preserves the complete root. SHM effects, released handles,
 retained copies and unchanged donor roots are checked separately. A foreign
@@ -206,7 +206,8 @@ repaired, and no host permissions change.
 
 ### Owned Windows ACL-denial fixtures
 
-`WV-PREFLIGHT-ACL` uses three fresh closed synthetic main3/WAL4 Instances.
+`WV-PREFLIGHT-ACL` uses three fresh, closed synthetic Instances, each with
+main version 3 and WAL version 4.
 The test-only Windows PowerShell helper journals each original DACL before
 adding a non-inheriting deny for the current SID: ReadData on the database or
 SHM, or CreateFiles/CreateDirectories on the root with SHM absent. Only these
@@ -216,12 +217,13 @@ be installed; the bounded runner pins the executable and supplies
 `YOKAI_TEST_POWERSHELL`. The reviewed script is supplied over stdin without a
 profile or execution-policy override.
 
-Each raw access probe must fail with Windows access-denied5. File denials must
-return `PreflightUnavailable` before SQLite; directory creation denial must
-return it through Stage-A read-only. No writable or raw-header fallback is
-allowed. Original permission ACE bytes and protection bits, and complete
-refusal-window names/types/bytes, are restored and verified, along with retained pristine/baseline files and released
-data handles. A post-restoration read-only control must still see WAL4; its SHM
+Each raw access probe must fail with Windows error 5 (access denied). File
+denials must return `PreflightUnavailable` before SQLite; directory creation denial must
+return it through Stage A read-only. No writable or raw-header fallback is
+allowed. Original permission ACE bytes and protection bits are restored and
+verified. The complete refusal-window names/types/bytes are compared with
+retained pristine/baseline files, and data handles are checked for release. A
+post-restoration read-only control must still see WAL version 4; its SHM
 creation is recorded separately. Only closed owned SHM is removed during that
 fixture's construction; no main database, WAL or Instance root is removed.
 
@@ -232,20 +234,20 @@ auto-inheritance control flag on these new fixtures; original, applied and
 restored descriptors are retained. Exact full-descriptor restoration is not
 claimed. A separate OS-only injected-controller
 failure checks the shared cleanup path. This does not prove every kill/crash
-window, Unix mode000 equivalence, arbitrary ACL/token/inheritance behavior,
+window, Unix mode `000` equivalence, arbitrary ACL/token/inheritance behavior,
 hostile-race safety, supported-version startup or complete PF-13/W2 acceptance.
 
-Stage-A read-only inspection classifies SQLite CANTOPEN and READONLY errors as
+Stage A read-only inspection classifies SQLite CANTOPEN and READONLY errors as
 `PreflightUnavailable`, preserving their diagnostic codes. These access failures
 do not establish schema inconsistency. Other inspection callers and semantic
 schema/identity/integrity refusals retain their existing classifications.
 
-### Windows Stage-B inventories and legacy control
+### Windows Stage B inventories and legacy control
 
 `WV-STAGEB-REFUSALS` constructs four independent closed owned fixtures with
 valid supported raw headers and no side files: a V2 foreign-key orphan, V2
-metadata identity mismatch, version0 with a planted schema object, and a damaged
-non-header table page. Each must reach exactly Stage-B read/write and return
+metadata identity mismatch, version 0 with a planted schema object, and a damaged
+non-header table page. Each must reach exactly Stage B read/write and return
 the existing `StageB` envelope with its expected cause. Its `observed_effects`
 must equal the measured before/after inventory. Complete pristine, altered and
 post-refusal files are retained; main/identity/lock bytes, side-file existence,
@@ -253,14 +255,14 @@ exclusive data opens and a fresh child repeating the refusal are checked.
 The recorded closed snapshots establish only the effects they show; they do
 not prove that SQLite made no transient filesystem writes while opening.
 
-`WV-STAGEB-LEGACY` copies the pinned accepted version0 fixture into a fresh
+`WV-STAGEB-LEGACY` copies the pinned accepted version 0 fixture into a fresh
 owned root. The existing diagnostic `open_test_versions` interface now accepts
-an empty version0 plan only under `test-api`; production still selects V2.
-This control requires version0, zero schema objects and no startup report,
+an empty version 0 plan only under `test-api`; production still selects V2.
+This control requires version 0, zero schema objects and no startup report,
 then explicitly checks close success. Before/open/after files and inventories
 are retained, including any active WAL/SHM and their later removal. Complete
 closed bytes and the original source fixture must remain unchanged. Active
-root names/types are checked, but the owned lock must deny reads with Windows32;
+root names/types are checked, but the owned lock must deny reads with Windows error 32;
 its content is compared only in the complete closed snapshots. Active retained
 files exclude that unreadable lock rather than substituting its earlier bytes.
 
@@ -270,49 +272,50 @@ startup is non-mutating: V2 startup commits an epoch and event. Other malformed
 layouts, close/crash windows, metadata/ADS/identity guarantees and complete
 PF-14/PF-15/W2 or product acceptance remain separate qualification work.
 
-### Windows Stage-A semantic and integrity refusals
+### Windows Stage A semantic and integrity refusals
 
 `WV-PREFLIGHT-SEMANTIC` commits an FK orphan, metadata identity mismatch or
-version0 planted object into a genuine WAL over an unchanged pristine V2 main
+version 0 planted object into a genuine WAL over an unchanged pristine V2 main
 file. Each fresh owned fixture must return its exact existing typed refusal
-through Stage-A read-only only. Pristine, baseline, post-refusal and child-repeat
+through Stage A read-only only. Pristine, baseline, post-refusal and child-repeat
 files and inventories are retained. All non-SHM entries and bytes must remain
 unchanged; SHM existence/content effects are recorded separately. Exclusive
 data opens and a fresh child repeating the refusal check handle and lock release.
 
 `WV-PREFLIGHT-INTEGRITY` changes only the fragmented-free-byte count of an
-empty non-header runs-table leaf from0 to1. The exact integrity-result row must
-be returned through the existing StageB envelope with no WAL, and as typed
-`Integrity` through Stage-A read-only with an empty WAL. Both paths retain
+empty non-header runs-table leaf from 0 to 1. The exact integrity-result row must
+be returned through the existing `StageB` envelope with no WAL, and as typed
+`Integrity` through Stage A read-only with an empty WAL. Both paths retain
 complete copies/inventories and verify released handles and child ownership.
 The raw-header path requires complete closed-byte equality and measured effects;
 the read-only path permits only the recorded SHM differences.
 
 These are current-code synthetic Windows observations. They do not establish
 every malformed page, all PF6/PF7/PF8/PF14/W2 requirements, absence of transient
-writes, nonempty StageB difference formatting, power-loss durability, broader
+writes, nonempty `StageB` difference formatting, power-loss durability, broader
 security or product acceptance. An integrity-result row is not an extended
 SQLite error code. No Instance main/WAL/root is removed or repaired.
 
 ### Measured Windows resource counters
 
-IL-8 now samples real native process handle counts and PID-filtered Toolhelp
+`IL-8` now samples real native process handle counts and PID-filtered Toolhelp
 thread snapshots in both parent and child. Each process completes one explicit
-open/close warmup, then100 measured cycles, alternating between processes.
+open/close warmup, then 100 measured cycles, alternating between processes.
 Bookend counts must be positive and equal after confirmed close and owned
 process/pipe cleanup. Counter, enumeration, protocol and close errors fail.
 Unix `/proc` counter errors also fail; these edits have no new Linux runtime
 qualification.
 
-`WV-RESOURCE-COUNTS` checks32 repeated samples, null-query native error6,
-eight held ordinary file handles, four ready blocked threads, and return to
-baseline after join/close. Synthetic files are retained outside Instance roots.
-The test-only shared helper counts handles before opening its snapshot, closes
-that snapshot, initializes the28-byte native entry, checks its returned length,
-and accepts only ERROR_NO_MORE_FILES after Thread32Next as normal completion.
+`WV-RESOURCE-COUNTS` checks 32 repeated samples, verifies that a null query
+returns native error 6, checks for eight held ordinary file handles and four
+ready blocked threads, and verifies a return to baseline after join/close.
+Synthetic files are retained outside Instance roots. The test-only shared helper
+counts handles before opening its snapshot, closes that snapshot, initializes
+the 28-byte native entry, and checks its returned length,
+and accepts only `ERROR_NO_MORE_FILES` after `Thread32Next` as normal completion.
 No dependency, privilege or host setting is added.
 
-Older Windows IL-8 runs used placeholder zero counters: their200 completed
+Older Windows `IL-8` runs used placeholder zero counters: their 200 completed
 cycles remain historical evidence, but their resource-stability text was
 unsupported. New counts are non-atomic samples on one host. They do not establish
 absence of transient leaks, all-time resource stability, other platform/host
@@ -322,16 +325,16 @@ behavior, performance bounds, full IL-8/W2, or product/release acceptance.
 
 `WV-PREFLIGHT-CORRUPTION` retains three independent closed V2 fixtures and
 commits a literal health marker into a genuine WAL without checkpointing.
-A read-only control must see that marker, version2 and integrity `ok` while
+A read-only control must see that marker, version 2 and integrity `ok` while
 leaving main/WAL bytes unchanged. WAL frames must affect only the metadata
-page, excluding page1 and the runs leaf, so replay cannot mask the main fault.
+page, excluding page 1 and the runs leaf, so replay cannot mask the main fault.
 
-The cases overwrite exactly16 magic bytes, change one empty non-header runs
-leaf fragmentation byte from0 to1, or truncate the13-page main to exactly half
-its length. The pinned fixture uses4096-byte pages. Exact `HeaderInvalid`
+The cases overwrite exactly 16 magic bytes, change one empty non-header runs
+leaf fragmentation byte from 0 to 1, or truncate the 13-page main to exactly half
+its length. The pinned fixture uses 4096-byte pages. Exact `HeaderInvalid`
 magic/length refusals must happen before SQLite; the leaf must return the
-exact collected free-space `Integrity` result row through Stage-A read-only.
-Generic access/store errors or Stage-B fallback fail these observations.
+exact collected free-space `Integrity` result row through Stage A read-only.
+Generic access/store errors or Stage B fallback fail these observations.
 
 Pristine, healthy-WAL, damaged, post-refusal and child-repeat copies/inventories
 are retained. Main/WAL/id/lock and all protected names/types/bytes must remain
@@ -347,20 +350,21 @@ is not a SQLite extended error code.
 ### Windows raw-header refusal witnesses
 
 `WV-RAW-HEADER` uses fifteen independent closed V2 roots without side files.
-Nine cases alter magic, page-size encoding1000/65535, format3/3, reserved8,
-payload fractions65/32/32, schema format5, text encoding2 or file length minus1.
+Nine cases alter magic, page-size encodings 1000/65535, format 3/3, reserved 8,
+payload fractions 65/32/32, schema format 5, text encoding 2, or file length minus 1.
 Each also contains max unsigned user_version; the exact `HeaderInvalid` field
 must take precedence over a newer-version refusal, with no SQLite connection.
-SQLite has a16-bit page-size field:1 denotes65536;131072 cannot be directly
-encoded. The actual malformed upper encoding tested here is65535.
+SQLite has a 16-bit page-size field: 1 denotes 65536; 131072 cannot be directly
+encoded. The actual malformed upper encoding tested here is 65535.
 
-Six otherwise unchanged headers encode future versions3,255,256,65536,
-16777216 and4294967295. Each must return exact `SchemaTooNew` found/maximum2
-values before SQLite. Accepted0/1/2 behavior retains its separate migration
-and startup coverage. Connection hooks establish the observed route; they
+Six otherwise unchanged headers encode future versions 3, 255, 256, 65536,
+16777216 and 4294967295. Each must return the exact `SchemaTooNew` error with
+the found header version and maximum supported version 2 before SQLite.
+Supported versions 0/1/2 retain separate migration and startup coverage.
+Connection hooks establish the observed route; they
 are not instrumentation of every internal version-decode operation.
 
-Pristine, altered, post-refusal and fresh-child copies retain180 ordinary files.
+Pristine, altered, post-refusal and fresh-child copies retain 180 ordinary files.
 Complete closed names/types/bytes and explicit absent WAL/SHM/journal entries
 must match after refusal and child repetition; exclusive data opens check
 released handles. No main/WAL/root is deleted or repaired. These selected
@@ -399,15 +403,15 @@ power-loss durability and release acceptance remain separate work.
 
 ### Windows journal and zero-length database refusal witnesses
 
-`WV-JOURNAL-EMPTY` retains nine owned fixtures: rollback format bytes1/1;
+`WV-JOURNAL-EMPTY` retains nine owned fixtures: rollback format bytes 1/1;
 journal presence with no WAL and with a genuine committed WAL; and zero-length
 main with empty or nonempty WAL, SHM or journal. Refusals must match the exact
 existing typed errors before any SQLite connection. Valid main headers are
 decoded before journal presence is checked: max unsigned version without WAL,
-and main2 with committed WAL4. Rollback headers and empty-main shortcuts produce
+and main version 2 with committed WAL version 4. Rollback headers and empty-main shortcuts produce
 no decoded-header observation. Every observation drains on read.
 
-Pristine, altered, post-refusal and fresh-child files retain140 ordinary files,
+Pristine, altered, post-refusal and fresh-child files retain 140 ordinary files,
 including empty side files as present entries. Parent and child repeat the same
 strict oracle, compare complete closed roots and all four fixed SQLite inventory
 entries, and verify released data handles. This distinguishes empty side files
@@ -422,14 +426,14 @@ Linux parity, full W2/workspace/security/release or power-loss durability.
 ### Stale SHM without WAL
 
 `WV-STALE-SHM` uses ten independent closed owned V2 fixtures. Each has a
-validated main header at version0,1,2,3 or4294967295 and an empty or nonempty
+validated main header at version 0, 1, 2, 3 or 4294967295 and an empty or nonempty
 SHM, with WAL and journal absent. Exact `SideFileStateUnverified` with that
 unsigned header version must take precedence over newer-version and schema
 work, with one decoded-header observation, a drained second take, and no
 SQLite connection. The legacy header values are synthetic; they do not
 establish a legacy schema upgrade.
 
-Pristine, altered, parent-after and fresh-child-after copies retain150 ordinary
+Pristine, altered, parent-after and fresh-child-after copies retain 150 ordinary
 files. Both processes enforce the same exact refusal, complete closed-root
 byte equality, fixed SQLite entry inventories and released data handles.
 Empty-present SHM is distinct from absence. These selected PF2b/PF10(a) checks
@@ -465,8 +469,8 @@ power-loss durability or product/security/release acceptance.
 V1 and V2 fixtures into separate owned roots. It preserves the originals and
 uses production `open_instance`, with no altered header values or diagnostic
 migration plans. Each raw-header path records its original version once,
-drains the observation, and proceeds through exactly one Stage-B read/write
-connection, with no Stage-A read-only event. Close records connection release
+drains the observation, and proceeds through exactly one Stage B read/write
+connection, with no Stage A read-only event. Close records connection release
 before lock release.
 
 V0 and V1 upgrade to V2 and retain their two and one pre-migration backups;
@@ -489,15 +493,15 @@ runtime or product/security/release acceptance.
 owned roots and adds a zero-byte ordinary WAL, with SHM and journal absent.
 The original main, identity and lock bytes are preserved without header edits.
 Production `open_instance` records the original header once and drains the
-observation, then records Stage-A read-only followed by Stage-B read/write.
-The production Stage-A inventory guard remains active; retained snapshots
+observation, then records Stage A read-only followed by Stage B read/write.
+The production Stage A inventory guard remains active; retained snapshots
 cover the whole open/close boundaries rather than a separate intermediate
-Stage-A capture. Close records connection release before lock release.
+Stage A capture. Close records connection release before lock release.
 
 V0 and V1 upgrade to V2 and retain two and one pre-migration backups; V2
 creates none. All report startup epoch 2 with no examined or changed runs.
 A fresh bounded child reopens the closed current-V2 root at epoch 3 through
-the raw-header/Stage-B path, preserving migration history and backup bytes.
+the raw-header/Stage B path, preserving migration history and backup bytes.
 All final closed states have WAL, SHM and journal absent.
 
 Before, parent-after and child-after snapshots retain 36 ordinary files,

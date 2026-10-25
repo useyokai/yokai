@@ -24,11 +24,11 @@ New databases need no recovery snapshot. Every migration of an existing
 database first creates `backups/pre-v{old}-to-v{latest}-{utc}-{nonce}.db` using
 exclusive creation and `VACUUM INTO`, syncs the file and checks it read-only for
 integrity, foreign keys and its original version. Before snapshot creation,
-available volume space must reach twice the logical database size plus 16MiB.
+available volume space must reach twice the logical database size plus 16 MiB.
 That sample is not a reservation and cannot guarantee against ENOSPC.
 
 Snapshots, including partial failed attempts, are never automatically deleted.
-`Instance::backup_usage()` reports their total bytes and a provisional 1GiB
+`Instance::backup_usage()` reports their total bytes and a provisional 1 GiB
 warning threshold. Removal is a manual maintenance decision.
 An INFO maintenance record reports total bytes after every verified snapshot;
 a WARN record is emitted above the threshold, before migration starts. A report
@@ -50,8 +50,8 @@ low-level connection functions are exposed only through `test_api`; default buil
 Creation/opening completes all compatibility checks and migrations before moving
 its connection into one writer thread. Each Instance also owns one read-only
 reader and watchdog by default, configurable to two readers. All connections
-verify their hardening settings. Request queues default to64, configurable from
-1 through256. The connection runtime uses the existing reviewed dependencies.
+verify their hardening settings. Request queues default to 64, configurable from
+1 through 256. The connection runtime uses the existing reviewed dependencies.
 
 `Instance::store()` returns a clonable `StoreHandle` with typed metadata reads
 and a health-check maintenance write. An operation deadline governs admission
@@ -60,7 +60,7 @@ use one `BEGIN IMMEDIATE` / `COMMIT`. Full queues refuse immediately. A queued
 write whose operation deadline has expired never begins. Once handed off,
 stopping or dropping the waiter never cancels the writer. A wait timeout is
 `OutcomeUnknown`, even if the writer subsequently commits. The writer emits an
-Instance-ID/operation-ID completion diagnostic and retains the latest256 true
+Instance-ID/operation-ID completion diagnostic and retains the latest 256 true
 outcomes; this memory history is not a durable idempotency ledger. IDs belong
 to one open Instance runtime and are never reused within it.
 
@@ -79,20 +79,22 @@ cannot clear it. Typed command acceptance uses the same queue and failure engine
 ## Durable command acceptance and startup
 
 `CommandRequest::new(CommandId, kind, operation_version, payload)` accepts an ID
-of1..128 UTF8 bytes, a kind of1..64 UTF8 bytes, version1..65535 and at most65536
-payload bytes. Payloads are opaque caller-canonical bytes. The crate performs no
-JSON normalization. A changed encoding needs a new operation version. Clients
+from 1 to 128 UTF-8 bytes, a kind from 1 to 64 UTF-8 bytes, an operation version
+from 1 through 65535, and a payload of at most 65536 bytes. Payloads are opaque
+caller-canonical bytes.
+The crate performs no JSON normalization. A changed encoding needs a new
+operation version. Clients
 persist an ID before sending and retain the identical kind, version and bytes
 when retrying that ID.
 
-The digest is SHA256 over `b"yokai.command.v1\0"`, big-endian u32 kind byte
-length, UTF8 kind bytes, big-endian u32 version, big-endian u64 payload length,
+The digest is SHA-256 over `b"yokai.command.v1\0"`, big-endian `u32` kind byte
+length, UTF-8 kind bytes, big-endian `u32` version, big-endian `u64` payload length,
 then payload bytes. Command identity is excluded from the digest.
 
 `StoreHandle::accept_command(request, operation_deadline)` returns a
 `PendingCommand`; `wait(wait_deadline)` returns `Accepted`, `Duplicate` or
 `Conflict`, each carrying the original `run_id`. A new acceptance commits one
-Queued/Open run, one immutable command, Pending job1 and one `run.accepted`
+Queued/Open run, one immutable command, one pending job and one `run.accepted`
 event atomically. Matching identity and digest returns Duplicate; a different
 digest returns Conflict. These decisions follow a confirmed rollback and add no
 records. UPDATE, DELETE and replacement writes to existing commands are refused
@@ -104,7 +106,7 @@ durable truth. A duplicate reply does not mean that its run is runnable: startup
 may already have placed that run on hold. Completion diagnostics retain the
 typed decision when the caller stops waiting; they contain no payload bytes.
 
-Creation initializes epoch1. Each subsequent successful open first commits an
+Creation initializes epoch 1. Each subsequent successful open first commits an
 incremented epoch and `runtime.epoch` event, then holds each Open, non-Held run
 in its own transaction with one `run.held` event. RecoveryRequired takes
 precedence; WaitingApproval becomes ApprovalInvalidated; other eligible runs
@@ -122,23 +124,23 @@ runtime validation, power-loss durability or product acceptance.
 
 Reader cancellation has one guarded query ID. The watchdog interrupts only an
 expired matching ID while holding the mutex used to finish that query and
-start the next; it repeats every10ms across statement gaps. All statements
+start the next; it repeats every 10 ms across statement gaps. All statements
 are finalized before the ID is cleared. Shutdown uses the same scoped path. Reader corruption also fails the store;
 reader I/O faults degrade it until a health write commits.
 A caller read wait timeout is distinct from the worker's `Interrupted` result.
 
-Only the writer attempts TRUNCATE checkpoints when idle (a1s interval) and at
-close. Readers disable checkpoints on close. Busy snapshots leave the
+Only the writer attempts TRUNCATE checkpoints when idle (at one-second intervals)
+and at close. Readers disable checkpoints on close. Busy snapshots leave the
 checkpoint pending. WAL metrics include a sample time and verification flag;
 no hard WAL size bound is promised. Busy handling for explicit checkpoints is
-nonblocking and restores the ordinary5000ms timeout afterward.
+nonblocking and restores the ordinary 5,000 ms timeout afterward.
 
 Explicit close and Drop reject new/queued requests, interrupt active readers,
 finish current writer work, close every connection and join every worker
 before releasing the persistent lock. Partial startup closes all connections
 not transferred to workers before ownership can be released, including when
-the first writer thread cannot start. The default close deadline is10s,
-configurable from1ms through30s. If worker shutdown/connection close cannot be
+the first writer thread cannot start. The default close deadline is 10 s,
+configurable from 1 ms through 30 s. If worker shutdown/connection close cannot be
 confirmed, ownership is deliberately retained for the rest of the process:
 `close` reports `CloseIncomplete`. The lock file is never removed or replaced.
 Holding a cloned StoreHandle does not extend Instance ownership after close.
