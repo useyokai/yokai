@@ -204,14 +204,17 @@ fn completion_capacity() {
     }).collect();
     let completions: Vec<_> = permits.into_iter().enumerate().map(|(n, permit)| {
         let ticket = permit.ticket();
-        let pending = permit.submit(completion(ticket, 10 + n as u8, "fake: hello").outcome, deadline()).unwrap();
-        (ticket, pending)
+        let assistant = 10 + n as u8;
+        let pending = permit.submit(completion(ticket, assistant, "fake: hello").outcome, deadline()).unwrap();
+        (ticket, mid(assistant), pending)
     }).collect();
     let excess = handle.submit_health_check(deadline()).err().unwrap();
     assert_eq!((excess.certainty, excess.reason), (Certainty::NotApplied, WriteReason::Overloaded));
     drop(blocker);
-    for (ticket, pending) in completions {
+    let mut completed_runs = Vec::new();
+    for (ticket, assistant, pending) in completions {
         assert_eq!(pending.wait(deadline()).unwrap(), Decision::Completed { run_id: ticket.run_id });
+        completed_runs.push((ticket.run_id, assistant));
     }
     for retry in retries {
         assert_eq!(retry.wait(deadline()).unwrap(), Decision::Duplicate { run_id: retired.run_id, state: RunState::Completed });
@@ -222,7 +225,19 @@ fn completion_capacity() {
     assert_eq!(permit.submit(collision, deadline()).unwrap().wait(deadline()).unwrap(),
         Decision::Failed { run_id: ticket.run_id, reason: yokai_types::FakeFailure::InvalidResponse });
     accepted(submit(&handle, request(id(5), 7, "after-collision", "hi")));
+    let root = instance.root().to_owned();
     instance.close().unwrap();
+    let conn = rusqlite::Connection::open_with_flags(root.join("instance.db"), rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+    for (run_id, assistant) in completed_runs {
+        let (status, active, message_id, reply): (String, i64, Vec<u8>, String) = conn.query_row(
+            "SELECT r.status, cr.active, m.message_id, m.body FROM runs r
+             JOIN conversation_runs cr USING (run_id) JOIN conversation_messages m USING (run_id)
+             WHERE r.run_id = ?1 AND m.role = 'assistant'",
+            [run_id], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        ).unwrap_or_else(|error| panic!("read durable completion for run {run_id}: {error}"));
+        assert_eq!((status.as_str(), active, message_id.as_slice(), reply.as_str()),
+            ("Completed", 0, assistant.as_bytes().as_slice(), "fake: hello"), "durable completion for run {run_id}");
+    }
 }
 
 fn writer_wakes_for_both_queues() {
