@@ -68,9 +68,22 @@ fn sqlite_error(shared: &Shared, error: rusqlite::Error) -> ReadError {
         _ => { shared.change(StoreState::Failed); ReadError::StorageError }
     }
 }
-fn work(conn: &Connection, request: &ReadRequest, scope: &Scope, shared: &Shared) -> Result<InstanceMetadata, ReadError> {
+fn work(conn: &Connection, request: &ReadRequest, scope: &Scope, shared: &Shared) -> Result<ReadValue, ReadError> {
     match &request.work {
         ReadWork::Metadata => {},
+        ReadWork::Conversation(id) => {
+            scope.check(request.id)?;
+            return crate::conversation::read_state(conn, *id).map(ReadValue::Conversation)
+                .map_err(|error| sqlite_error(shared, error));
+        }
+        ReadWork::Replay(cursor, limit) => {
+            scope.check(request.id)?;
+            return match crate::conversation::replay(conn, *cursor, *limit).map_err(|error| sqlite_error(shared, error))? {
+                crate::conversation::ReplayRead::Page(page) => Ok(ReadValue::Replay(page)),
+                crate::conversation::ReplayRead::NotFound => Err(ReadError::NotFound),
+                crate::conversation::ReplayRead::InvalidCursor => Err(ReadError::InvalidCursor),
+            };
+        }
         #[cfg(feature = "test-api")]
         ReadWork::Error(code) => {
             let error = rusqlite::Error::SqliteFailure(rusqlite::ffi::Error::new(*code), Some("explicit read test-api fault".into()));
@@ -95,11 +108,11 @@ fn work(conn: &Connection, request: &ReadRequest, scope: &Scope, shared: &Shared
                 thread::sleep(Duration::from_millis(1));
             }
             conn.execute_batch("ROLLBACK").map_err(|e| sqlite_error(shared, e))?;
-            return Ok(snapshot);
+            return Ok(ReadValue::Metadata(snapshot));
         }
     }
     scope.check(request.id)?;
-    metadata(conn, shared)
+    metadata(conn, shared).map(ReadValue::Metadata)
 }
 fn metadata(conn: &Connection, shared: &Shared) -> Result<InstanceMetadata, ReadError> {
     conn.query_row("SELECT instance_id,format,created_at,last_health_check FROM instance_meta WHERE id=1", [], |r| {

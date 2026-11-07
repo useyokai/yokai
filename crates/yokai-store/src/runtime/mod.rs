@@ -15,6 +15,8 @@ use rusqlite::{Connection, OpenFlags};
 use rusqlite::config::DbConfig;
 use yokai_platform::InstanceLock;
 use crate::InstanceError;
+use crate::conversation::ConversationWrite;
+use yokai_types::{CompleteFakeRun, ConversationId, ConversationState, CreateConversation, MAX_REPLAY_EVENTS, ReplayCursor, ReplayPage, SubmitMessage};
 
 pub(crate) fn lock<T>(value: &Mutex<T>) -> MutexGuard<'_, T> {
     value.lock().unwrap_or_else(|poison| poison.into_inner())
@@ -68,12 +70,13 @@ struct WriteRequest {
     id: u64,
     deadline: Instant,
     progress: Arc<Mutex<WriteEvidence>>,
-    reply: mpsc::SyncSender<WriteResult>,
+    reply: mpsc::SyncSender<Result<WriteValue, WriteFailure>>,
     work: WriteWork,
 }
 enum WriteWork {
     Health,
     Accept{command:crate::CommandRequest,#[cfg(feature="test-api")] fault:crate::test_api::WriteFault},
+    Conversation { request: ConversationWrite, #[cfg(feature="test-api")] fault: crate::test_api::WriteFault },
     #[cfg(feature = "test-api")]
     HealthPaused { ready: mpsc::SyncSender<()>, released: Arc<AtomicBool> },
     #[cfg(feature = "test-api")]
@@ -82,12 +85,12 @@ enum WriteWork {
 impl WriteWork {
     #[cfg(feature="test-api")]
     fn fault(&self)->Option<&crate::test_api::WriteFault>{match self{
-        Self::Probe(probe)=>Some(&probe.fault),Self::Accept{fault,..}=>Some(fault),_=>None,
+        Self::Probe(probe)=>Some(&probe.fault),Self::Accept{fault,..}|Self::Conversation{fault,..}=>Some(fault),_=>None,
     }}
     fn is_health(&self) -> bool {
         match self {
             Self::Health => true,
-            Self::Accept{..} => false,
+            Self::Accept{..} | Self::Conversation{..} => false,
             #[cfg(feature = "test-api")]
             Self::HealthPaused { .. } => true,
             #[cfg(feature = "test-api")]
@@ -109,10 +112,12 @@ struct ReadRequest {
     id: u64,
     deadline: Instant,
     work: ReadWork,
-    reply: mpsc::SyncSender<Result<InstanceMetadata, ReadError>>,
+    reply: mpsc::SyncSender<Result<ReadValue, ReadError>>,
 }
 enum ReadWork {
     Metadata,
+    Conversation(ConversationId),
+    Replay(ReplayCursor, usize),
     #[cfg(feature = "test-api")]
     Compute { steps: u32, rows: u32, gap: Duration },
     #[cfg(feature = "test-api")]
@@ -143,6 +148,49 @@ fn write_refusal(status: StoreState) -> Option<WriteReason> {
     }
 }
 impl StoreHandle {
+    pub fn create_conversation(&self, request: CreateConversation, deadline: Instant) -> Result<crate::PendingConversation, WriteFailure> {
+        self.submit_conversation(ConversationWrite::Create(request), deadline)
+    }
+
+    pub fn submit_message(&self, request: SubmitMessage, deadline: Instant) -> Result<crate::PendingConversation, WriteFailure> {
+        self.submit_conversation(ConversationWrite::Submit(request), deadline)
+    }
+
+    pub fn complete_fake_run(&self, request: CompleteFakeRun, deadline: Instant) -> Result<crate::PendingConversation, WriteFailure> {
+        self.submit_conversation(ConversationWrite::Complete(request), deadline)
+    }
+
+    fn submit_conversation(&self, request: ConversationWrite, deadline: Instant) -> Result<crate::PendingConversation, WriteFailure> {
+        let inner = self.submit_write(deadline, WriteWork::Conversation {
+            request, #[cfg(feature="test-api")] fault: crate::test_api::WriteFault::None,
+        })?;
+        Ok(crate::PendingConversation { inner })
+    }
+
+    #[cfg(feature="test-api")]
+    pub(crate) fn conversation_fault(&self, request: ConversationWrite, deadline: Instant, fault: crate::test_api::WriteFault) -> Result<crate::PendingConversation, WriteFailure> {
+        let inner = self.submit_write(deadline, WriteWork::Conversation { request, fault })?;
+        Ok(crate::PendingConversation { inner })
+    }
+
+    pub fn read_conversation(&self, id: ConversationId, deadline: Instant) -> Result<PendingRead<Option<ConversationState>>, ReadError> {
+        self.submit_read_as(deadline, ReadWork::Conversation(id), |value| match value {
+            ReadValue::Conversation(state) => Some(state), _ => None,
+        })
+    }
+
+    pub fn replay_events(&self, id: ConversationId, cursor: ReplayCursor, limit: usize, deadline: Instant) -> Result<PendingRead<ReplayPage>, ReadError> {
+        if cursor.instance_id != self.shared.instance_id || cursor.conversation_id != id || cursor.after < 0 {
+            return Err(ReadError::InvalidCursor);
+        }
+        if !(1..=MAX_REPLAY_EVENTS).contains(&limit) {
+            return Err(ReadError::Invalid);
+        }
+        self.submit_read_as(deadline, ReadWork::Replay(cursor, limit), |value| match value {
+            ReadValue::Replay(page) => Some(page), _ => None,
+        })
+    }
+
     pub fn accept_command(&self,request:crate::CommandRequest,deadline:Instant)->Result<crate::PendingCommand,WriteFailure>{
         self.submit_write(deadline,WriteWork::Accept{command:request,#[cfg(feature="test-api")] fault:crate::test_api::WriteFault::None}).map(|inner|crate::PendingCommand{inner})
     }
@@ -205,6 +253,11 @@ impl StoreHandle {
         Ok((pause, pending))
     }
     fn submit_read(&self, deadline: Instant, work: ReadWork) -> Result<PendingRead, ReadError> {
+        self.submit_read_as(deadline, work, |value| match value {
+            ReadValue::Metadata(metadata) => Some(metadata), _ => None,
+        })
+    }
+    fn submit_read_as<T>(&self, deadline: Instant, work: ReadWork, extract: fn(ReadValue) -> Option<T>) -> Result<PendingRead<T>, ReadError> {
         let mut state = lock(&self.shared.state);
         match state.status {
             StoreState::Failed => return Err(ReadError::Failed),
@@ -219,7 +272,7 @@ impl StoreHandle {
         state.next_reader = (start + 1) % self.readers.len();
         for offset in 0..self.readers.len() {
             match self.readers[(start + offset) % self.readers.len()].try_send(request) {
-                Ok(()) => return Ok(PendingRead { id, reply: rx }),
+                Ok(()) => return Ok(PendingRead { id, reply: rx, extract }),
                 Err(mpsc::TrySendError::Full(unsent)) => request = unsent,
                 Err(mpsc::TrySendError::Disconnected(_)) => { state.status = StoreState::Failed; return Err(ReadError::Failed); }
             }
@@ -367,6 +420,10 @@ impl Runtime {
     pub(crate) fn is_locked(&self) -> bool { self.ownership.as_ref().is_some_and(InstanceLock::is_locked) }
 
     pub(crate) fn close(&mut self) -> Result<(), InstanceError> {
+        self.close_before(Instant::now() + self.close_timeout)
+    }
+
+    pub(crate) fn close_before(&mut self, deadline: Instant) -> Result<(), InstanceError> {
         if self.ownership.is_none() { return Ok(()); }
         lock(&self.handle.shared.state).status = StoreState::ShuttingDown;
         self.handle.shared.closing.store(true, Ordering::Release);
@@ -375,7 +432,7 @@ impl Runtime {
             if let Some(ownership) = self.ownership.take() { std::mem::forget(ownership); }
             return Err(InstanceError::CloseIncomplete);
         }
-        let deadline = Instant::now() + self.close_timeout;
+        let deadline = deadline.min(Instant::now() + self.close_timeout);
         while self.threads.iter().any(|handle| !handle.is_finished()) && Instant::now() < deadline {
             thread::sleep(Duration::from_millis(1));
         }

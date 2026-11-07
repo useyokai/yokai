@@ -41,18 +41,22 @@ fn root(label:&str)->Result<PathBuf,String> {
     let instance=store::create_instance(&parent(label)?).map_err(|e|e.to_string())?;
     let root=instance.root().to_owned();instance.close().map_err(|e|e.to_string())?;Ok(root)
 }
+fn v2_fixture_root(label:&str)->Result<PathBuf,String> {
+    let instance=store::test_api::create_test_v2(&parent(label)?).map_err(|e|e.to_string())?;
+    let root=instance.root().to_owned();instance.close().map_err(|e|e.to_string())?;Ok(root)
+}
 fn edit(root:&Path,sql:&str,wal:bool)->Result<(),String> {
     let conn=Connection::open(root.join("instance.db")).map_err(|e|e.to_string())?;
     if wal {conn.set_db_config(DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE,true).map_err(|e|e.to_string())?;}
     conn.execute_batch(sql).map_err(|e|e.to_string())
 }
 fn legacy(label:&str)->Result<PathBuf,String> {
-    let root=root(label)?;
+    let root=v2_fixture_root(label)?;
     edit(&root,"DROP TABLE events; DROP TABLE jobs; DROP TABLE commands; DROP TABLE runs; DROP TABLE runtime_epoch; DROP TABLE instance_meta; DROP TABLE yokai_schema_history; PRAGMA user_version=0;",false)?;
     Ok(root)
 }
 fn v1_root(label:&str)->Result<PathBuf,String> {
-    let root=root(label)?;
+    let root=v2_fixture_root(label)?;
     edit(&root,"DROP TABLE events; DROP TABLE jobs; DROP TABLE commands; DROP TABLE runs; DROP TABLE runtime_epoch; DELETE FROM yokai_schema_history WHERE version=2; PRAGMA user_version=1;",false)?;
     Ok(root)
 }
@@ -83,7 +87,7 @@ fn check_reopen()->Result<String,String> {
     Ok("current main/WAL migration history unchanged; epoch advanced exactly once; no migration/snapshot repeated".into())
 }
 fn check_future()->Result<String,String> {
-    for wal in [false,true] {let root=root(if wal{"future-wal"}else{"future-main"})?;edit(&root,"PRAGMA user_version=3;",wal)?;refused(&root,"schema 3 is newer than supported maximum 2")?;}
+    for wal in [false,true] {let root=root(if wal{"future-wal"}else{"future-main"})?;edit(&root,"PRAGMA user_version=4;",wal)?;refused(&root,"schema 4 is newer than supported maximum 3")?;}
     Ok("newer main and WAL states refused; protected bytes unchanged".into())
 }
 fn check_divergence()->Result<String,String> {
@@ -109,16 +113,16 @@ fn check_identity()->Result<String,String> {
 fn check_upgrade()->Result<String,String> {
     let root=legacy("legacy")?;
     let instance=store::open_instance(&root).map_err(|e|e.to_string())?;
-    if store::test_api::user_version(&instance).map_err(|e|e.to_string())?!=2{return Err("legacy not upgraded".into());}
+    if store::test_api::user_version(&instance).map_err(|e|e.to_string())?!=3{return Err("legacy not upgraded".into());}
     instance.close().map_err(|e|e.to_string())?;
     let backups=fs::read_dir(root.join("backups")).map_err(|e|e.to_string())?.collect::<Result<Vec<_>,_>>().map_err(|e|e.to_string())?;
-    if backups.len()!=2{return Err(format!("expected two snapshots, got {}",backups.len()));}
+    if backups.len()!=3{return Err(format!("expected three snapshots, got {}",backups.len()));}
     let c=Connection::open_with_flags(backups.iter().find(|e| e.file_name().to_string_lossy().starts_with("pre-v0-")).ok_or("version0 snapshot missing")?.path(),rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).map_err(|e|e.to_string())?;
     let v:i64=c.query_row("PRAGMA user_version",[],|r|r.get(0)).map_err(|e|e.to_string())?;
     let integrity:String=c.query_row("PRAGMA integrity_check",[],|r|r.get(0)).map_err(|e|e.to_string())?;
     if v!=0 || integrity!="ok"{return Err("invalid pre-migration snapshot".into());}
     store::open_instance(&root).map_err(|e|e.to_string())?.close().map_err(|e|e.to_string())?;
-    if fs::read_dir(root.join("backups")).map_err(|e|e.to_string())?.count()!=2{return Err("reopen repeated migration".into());}
+    if fs::read_dir(root.join("backups")).map_err(|e|e.to_string())?.count()!=3{return Err("reopen repeated migration".into());}
     let old=PathBuf::from(std::env::var_os("YOKAI_TEST_V0_FIXTURE").ok_or("missing pinned old fixture input")?);
     let before=fs::read(old.join("instance.db")).map_err(|e|e.to_string())?;
     if store::test_api::sha256_chunks_for_test(&[&before])!="da63a52bdf62b3fc863995d79f497584be3ba97c1de4c55d1d301afbafab6cfc"{return Err("old fixture hash differs".into());}
@@ -126,7 +130,7 @@ fn check_upgrade()->Result<String,String> {
     fs::create_dir(&copy).map_err(|e|e.to_string())?;
     for name in ["instance.db","instance.id","instance.lock"] {fs::copy(old.join(name),copy.join(name)).map_err(|e|e.to_string())?;}
     let instance=store::open_instance(&copy).map_err(|e|e.to_string())?;
-    if store::test_api::user_version(&instance).map_err(|e|e.to_string())?!=2{return Err("accepted fixture not upgraded".into());}
+    if store::test_api::user_version(&instance).map_err(|e|e.to_string())?!=3{return Err("accepted fixture not upgraded".into());}
     instance.close().map_err(|e|e.to_string())?;
     if before!=fs::read(old.join("instance.db")).map_err(|e|e.to_string())?{return Err("preserved original fixture changed".into());}
     Ok("synthetic and preserved accepted version0 fixtures upgraded once; retained snapshots passed integrity".into())
@@ -176,11 +180,11 @@ fn snapshots(root:&Path)->Result<Vec<(PathBuf,Vec<u8>)>,String>{
     result.sort_by(|a,b|a.0.cmp(&b.0));Ok(result)
 }
 fn check_failed_migration()->Result<String,String>{
-    let root=root("failed-v2")?;let before=state(&root)?;
-    let result=store::test_api::open_test_versions(&root,3,true);
+    let root=root("failed-v4")?;let before=state(&root)?;
+    let result=store::test_api::open_test_versions(&root,4,true);
     let e=match result{Ok(i)=>{i.close().map_err(|e|e.to_string())?;return Err("failing test migration unexpectedly succeeded".into());},Err(e)=>e.to_string()};
     if !e.contains("migration failed") || state(&root)?!=before || snapshots(&root)?.len()!=1{return Err(format!("failure={e}; version/history or snapshots incorrect"));}
-    Ok("SQL failure rolled back test-only V3 schema/history/version; verified pre-V3 snapshot retained".into())
+    Ok("SQL failure rolled back test-only V4 schema/history/version; verified pre-V4 snapshot retained".into())
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct LogicalDatabase {
@@ -244,7 +248,7 @@ fn keep_bytes(path: &Path, bytes: &[u8]) -> Result<(), String> {
 fn check_forward() -> Result<String, String> {
     // Upgrading a real V0 fixture through V2 gives earlier snapshots to preserve.
     let root = legacy("forward-v2")?;
-    let instance = store::open_instance(&root).map_err(|e| e.to_string())?;
+    let instance = store::test_api::open_test_versions(&root, 2, false).map_err(|e| e.to_string())?;
     for (id, payload) in [("mg7-z", vec![0, 1, 255, 0]), ("mg7-a", "snapshot O'Brien λ".as_bytes().to_vec())] {
         let request = store::CommandRequest::new(yokai_types::CommandId::new(id).map_err(|e| e.to_string())?, "mg7", 1, &payload).map_err(|e| e.to_string())?;
         let deadline = Instant::now() + Duration::from_secs(10);
@@ -273,22 +277,23 @@ fn check_forward() -> Result<String, String> {
     for rows in reordered.tables.values_mut() { rows.reverse(); rows.sort(); }
     if reordered != before { return Err("MG7 oracle depends on traversal order".into()); }
     keep_logical(&evidence.join("mg7-oracle-same-count-change.logical"), &changed)?;
-    let i = store::test_api::open_test_versions(&root, 3, false).map_err(|e| e.to_string())?;
+    let i = store::test_api::open_test_versions(&root, 4, false).map_err(|e| e.to_string())?;
     i.close().map_err(|e| e.to_string())?;
     let after = snapshots(&root)?;
     let added: Vec<_> = after.iter().filter(|(path, _)| !earlier.iter().any(|(old, _)| old == path)).collect();
-    if state(&root)? != (3, 3) || after.len() != 3 || added.len() != 1 { return Err("MG7 forward version/history/snapshot count differs".into()); }
+    if state(&root)? != (4, 4) || after.len() != 4 || added.len() != 2 { return Err("MG7 forward version/history/snapshot count differs".into()); }
     for (path, bytes) in &earlier {
         if !after.iter().any(|(retained, data)| retained == path && data == bytes) { return Err("MG7 earlier snapshot changed or disappeared".into()); }
     }
-    let snapshot = logical_database(&added[0].0)?;
+    let v2_snapshot = added.iter().find(|(path, _)| path.file_name().is_some_and(|name| name.to_string_lossy().starts_with("pre-v2-"))).ok_or("MG7 V2 snapshot missing")?;
+    let snapshot = logical_database(&v2_snapshot.0)?;
     keep_logical(&evidence.join("mg7-pre-v2-snapshot.logical"), &snapshot)?;
     if snapshot != before { return Err("MG7 snapshot differs logically from the complete prior schema/data".into()); }
     let current = logical_database(&root.join("instance.db"))?;
     if current.tables.get("commands") != before.tables.get("commands") { return Err("MG7 changed prior command values".into()); }
     keep_logical(&evidence.join("mg7-source-after.logical"), &current)?;
-    println!("INFO B2 migration_forward root={} snapshot={} prior_version=2 current_version=3 full_logical_equal=true prior_commands=2 earlier_snapshots_unchanged=2 same_count_change_detected=true row_order_canonical=true integrity=ok", root.display(), added[0].0.display());
-    Ok("forward V2-to-testV3 snapshot equals every prior typed schema/table value; two earlier backups unchanged, both command payloads retained, canonical/same-count negative oracle and logical records preserved".into())
+    println!("INFO B2 migration_forward root={} snapshot={} prior_version=2 current_version=4 full_logical_equal=true prior_commands=2 earlier_snapshots_unchanged=2 same_count_change_detected=true row_order_canonical=true integrity=ok", root.display(), v2_snapshot.0.display());
+    Ok("forward V2-to-testV4 snapshot equals every prior typed schema/table value; two earlier backups unchanged, both command payloads retained, canonical/same-count negative oracle and logical records preserved".into())
 }
 
 fn check_headroom()->Result<String,String>{
@@ -324,7 +329,7 @@ fn check_lint()->Result<String,String>{
 }
 fn check_retention()->Result<String,String>{
     let root=legacy("retention")?;let mut previous=Vec::new();let mut gaps=Vec::new();
-    for version in 1..=4 {
+    for version in 1..=5 {
         let out=command(&root,version,false)?.env("YOKAI_TEST_BACKUP_WARNING_BYTES","1").output().map_err(|e|e.to_string())?;
         if !out.status.success(){return Err(format!("upgrade {version}: {}",String::from_utf8_lossy(&out.stderr)));}
         let text=String::from_utf8_lossy(&out.stderr);
@@ -336,28 +341,28 @@ fn check_retention()->Result<String,String>{
         if next.len()!=version as usize || previous.iter().any(|p|!next.contains(p)){return Err("snapshot removed/changed or count incorrect".into());}
         previous=next;
     }
-    let i=store::test_api::open_test_versions(&root,4,false).map_err(|e|e.to_string())?;
+    let i=store::test_api::open_test_versions(&root,5,false).map_err(|e|e.to_string())?;
     let usage=i.backup_usage().map_err(|e|e.to_string())?;i.close().map_err(|e|e.to_string())?;
     let total=previous.iter().map(|(_,b)|b.len() as u64).sum::<u64>();
     if usage.total_bytes!=total || usage.warning{return Err("normal threshold byte report incorrect".into());}
     let c=Connection::open(root.join("instance.db")).map_err(|e|e.to_string())?;
     let value:String=c.query_row("SELECT value FROM migration_probe WHERE id=1",[],|r|r.get(0)).map_err(|e|e.to_string())?;
-    if value!="retained" || state(&root)?!=(4,4){return Err("successive logical data/history mismatch".into());}
+    if value!="retained" || state(&root)?!=(5,5){return Err("successive logical data/history mismatch".into());}
     let failed=root_for_notification_failure()?;
-    let out=command(&failed,3,true)?.env("YOKAI_TEST_BACKUP_WARNING_BYTES","1").output().map_err(|e|e.to_string())?;
+    let out=command(&failed,4,true)?.env("YOKAI_TEST_BACKUP_WARNING_BYTES","1").output().map_err(|e|e.to_string())?;
     let text=String::from_utf8_lossy(&out.stderr);
-    if out.status.code()!=Some(4) || !text.contains("INFO retained_backups total_bytes=") || !text.contains("WARN retained_backups total_bytes=") || !text.contains("migration failed") || state(&failed)?!=(2,2){gaps.push("snapshot notification missing before later SQL migration failure".into());}
+    if out.status.code()!=Some(4) || !text.contains("INFO retained_backups total_bytes=") || !text.contains("WARN retained_backups total_bytes=") || !text.contains("migration failed") || state(&failed)?!=(3,3){gaps.push("snapshot notification missing before later SQL migration failure".into());}
     let threshold=1024*1024*1024;
     if store::test_api::backup_warning_for_test(threshold,threshold) || !store::test_api::backup_warning_for_test(threshold+1,threshold){gaps.push("warning must be above the threshold, with no warning at equality".into());}
     if !gaps.is_empty(){return Err(gaps.join("; "));}
-    Ok(format!("four snapshots retained byte-identically; total_bytes={total}; actual size report/warning emitted after each snapshot and before later migration failure; warning only above threshold"))
+    Ok(format!("five snapshots retained byte-identically; total_bytes={total}; actual size report/warning emitted after each snapshot and before later migration failure; warning only above threshold"))
 }
 fn root_for_notification_failure()->Result<PathBuf,String>{root("notification-before-failure")}
 fn check_old_refusal()->Result<String,String>{
     let old=PathBuf::from(std::env::var_os("YOKAI_TEST_V0_BINARY").ok_or("missing pinned old executable")?);
     let bytes=fs::read(&old).map_err(|e|e.to_string())?;
     if store::test_api::sha256_chunks_for_test(&[&bytes])!="d9c546acba6046e384b1e0a3ff30a9fc195131244722b7d3f23559fe67292e08"{return Err("old executable hash differs".into());}
-    let root=root("old-refusal")?;let before=protected(&root)?;
+    let root=v2_fixture_root("old-refusal")?;let before=protected(&root)?;
     let out=Command::new(old).arg("__child").arg("probe").arg(&root).stdin(Stdio::null()).output().map_err(|e|e.to_string())?;
     if out.status.code()!=Some(4) || !String::from_utf8_lossy(&out.stderr).contains("schema 2 is newer than supported maximum 0") || before!=protected(&root)?{return Err(format!("old probe={:?}: {}",out.status,String::from_utf8_lossy(&out.stderr)));}
     Ok("preserved accepted V0 PE refused V2; DB/WAL bytes unchanged; old executable not rebuilt".into())
@@ -418,12 +423,12 @@ fn check_new_instance() -> Result<String, String> {
     instance.close().map_err(|e| e.to_string())?;
     let conn = Connection::open(root.join("instance.db")).map_err(|e| e.to_string())?;
     let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).map_err(|e| e.to_string())?;
-    if version != 2 { return Err(format!("new Instance schema version={version}; expected 2")); }
+    if version != 3 { return Err(format!("new Instance schema version={version}; expected 3")); }
     let stored_id: Vec<u8> = conn.query_row("SELECT instance_id FROM instance_meta WHERE id=1", [], |r| r.get(0))
         .map_err(|e| e.to_string())?;
     let history: i64 = conn.query_row("SELECT count(*) FROM yokai_schema_history", [], |r| r.get(0))
         .map_err(|e| e.to_string())?;
-    if stored_id.as_slice() != id.as_bytes() || history != 2 { return Err("identity/history binding failed".into()); }
+    if stored_id.as_slice() != id.as_bytes() || history != 3 { return Err("identity/history binding failed".into()); }
     if root.join("backups").exists() { return Err("new Instance unexpectedly created a backup".into()); }
-    Ok("new V1 identity/history followed by V2 committed; no pre-migration snapshot needed".into())
+    Ok("new V1 identity/history followed by V2 and V3; no pre-migration snapshot needed".into())
 }

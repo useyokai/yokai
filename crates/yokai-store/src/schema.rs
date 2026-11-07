@@ -6,11 +6,13 @@ use crate::InstanceError;
 
 const V1: &str = include_str!("../migrations/V1__instance_meta.sql");
 const V2: &str = include_str!("../migrations/V2__durable_records.sql");
+const V3: &str = include_str!("../migrations/V3__conversation_core.sql");
 const HISTORY: &str = "CREATE TABLE yokai_schema_history (version INTEGER PRIMARY KEY, name TEXT NOT NULL, checksum TEXT NOT NULL CHECK (length(checksum) = 64), applied_at TEXT NOT NULL) STRICT";
 #[derive(Clone,Copy)]
 struct Migration { version:u32,name:&'static str,sql:&'static str }
 const FIRST:Migration=Migration{version:1,name:"instance_meta",sql:V1};
 const SECOND:Migration=Migration{version:2,name:"durable_records",sql:V2};
+const THIRD:Migration=Migration{version:3,name:"conversation_core",sql:V3};
 #[derive(Clone,Copy)]
 pub(crate) struct Plan(&'static [Migration]);
 impl Plan {
@@ -24,13 +26,24 @@ impl Plan {
         Ok(())
     }
 }
-pub(crate) fn production()->Plan{Plan(&[FIRST,SECOND])}
+pub(crate) fn production()->Plan{Plan(&[FIRST,SECOND,THIRD])}
+#[cfg(feature="test-api")]
+pub(crate) fn historical_v2()->Plan{Plan(&[FIRST,SECOND])}
 #[cfg(feature="test-api")]
 pub(crate) fn test_plan(latest:u32,fail:bool)->Result<Plan,InstanceError>{
-    const PROBE:Migration=Migration{version:3,name:"migration_probe",sql:"CREATE TABLE migration_probe (id INTEGER PRIMARY KEY, value TEXT NOT NULL) STRICT; PRAGMA user_version = 3;"};
-    const FAIL:Migration=Migration{version:3,name:"migration_probe",sql:"CREATE TABLE migration_probe (id INTEGER PRIMARY KEY, value TEXT NOT NULL) STRICT; INSERT INTO missing_table VALUES(1); PRAGMA user_version = 3;"};
-    const DATA:Migration=Migration{version:4,name:"probe_data",sql:"INSERT INTO migration_probe VALUES(1,'retained'); PRAGMA user_version = 4;"};
-    match (latest,fail){(0,false)=>Ok(Plan(&[])),(1,false)=>Ok(Plan(&[FIRST])),(2,false)=>Ok(production()),(3,false)=>Ok(Plan(&[FIRST,SECOND,PROBE])),(3,true)=>Ok(Plan(&[FIRST,SECOND,FAIL])),(4,false)=>Ok(Plan(&[FIRST,SECOND,PROBE,DATA])),_=>Err(migration("invalid test-only plan"))}
+    const PROBE:Migration=Migration{version:4,name:"migration_probe",sql:"CREATE TABLE migration_probe (id INTEGER PRIMARY KEY, value TEXT NOT NULL) STRICT; PRAGMA user_version = 4;"};
+    const FAIL:Migration=Migration{version:4,name:"migration_probe",sql:"CREATE TABLE migration_probe (id INTEGER PRIMARY KEY, value TEXT NOT NULL) STRICT; INSERT INTO missing_table VALUES(1); PRAGMA user_version = 4;"};
+    const DATA:Migration=Migration{version:5,name:"probe_data",sql:"INSERT INTO migration_probe VALUES(1,'retained'); PRAGMA user_version = 5;"};
+    match (latest,fail){
+        (0,false)=>Ok(Plan(&[])),
+        (1,false)=>Ok(Plan(&[FIRST])),
+        (2,false)=>Ok(historical_v2()),
+        (3,false)=>Ok(production()),
+        (4,false)=>Ok(Plan(&[FIRST,SECOND,THIRD,PROBE])),
+        (4,true)=>Ok(Plan(&[FIRST,SECOND,THIRD,FAIL])),
+        (5,false)=>Ok(Plan(&[FIRST,SECOND,THIRD,PROBE,DATA])),
+        _=>Err(migration("invalid test-only plan")),
+    }
 }
 
 fn inconsistent(e: impl ToString) -> InstanceError { InstanceError::SchemaInconsistent(e.to_string()) }
@@ -182,8 +195,8 @@ pub(crate) fn lint(sql: &str, version: u32) -> Result<(), String> {
     Ok(())
 }
 
-pub(crate) fn migrate_new(conn: &mut Connection, id: InstanceId, created: &str) -> Result<(), InstanceError> {
-    let plan=production();plan.validate()?;
+pub(crate) fn migrate_new(conn: &mut Connection, id: InstanceId, created: &str, plan: Plan) -> Result<(), InstanceError> {
+    plan.validate()?;
     for m in plan.0 {apply(conn,id,created,*m,plan)?;}
     Ok(())
 }

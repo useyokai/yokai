@@ -2,13 +2,33 @@
 
 This guide describes the custom harnesses configured in
 [`Cargo.toml`](../Cargo.toml). They all require `test-api`; each prints named
-`CHECK` records and a final `RESULT`. Inspect both the process exit and recorded
+`CHECK` records. The historical targets also emit a final `RESULT`. Inspect both the process exit and recorded
 results. An unselected or platform-inapplicable check is not a pass.
+
+## Focused conversation checks
+
+Use a separate fresh synthetic data directory for each target. On Windows
+apply the synthetic-data opt-in described in [Contributing](../../../CONTRIBUTING.md).
+The conversation targets cover request validation, V2-to-V3 migration,
+typed transactions and replay, and the in-process fake runtime.
+
+~~~powershell
+cargo test -p yokai-types --test conversation_types --offline --locked --frozen -j 4
+cargo test -p yokai-store --features test-api --test conversation_migrations --offline --locked --frozen -j 4
+cargo test -p yokai-store --features test-api --test conversation_store --offline --locked --frozen -j 4
+cargo test -p yokai-exec --features test-api --test conversation_runtime --offline --locked --frozen -j 4
+~~~
+
+`durable_primitives` and `store_runtime` accept `-- --only <CHECK>` for one
+named regression. An unknown name exits before fixture setup. Without a
+selector the harness runs its ordinary catalogue.
 
 ## Inputs and recorded scope
 
-The native Windows/MSVC suite includes the following configured targets.
-Recorded Windows runs use fixed NTFS:
+The historical native Windows/MSVC V2 suite included the following configured
+targets. Recorded Windows runs used fixed NTFS. The full historical profile
+requires its original source and inputs. The V3 conversation checks above
+provide a separate development profile.
 
 | Target | CHECK records | Additional inputs beyond the synthetic data directory |
 | --- | ---: | --- |
@@ -257,7 +277,7 @@ not prove that SQLite made no transient filesystem writes while opening.
 
 `WV-STAGEB-LEGACY` copies the pinned accepted version 0 fixture into a fresh
 owned root. The existing diagnostic `open_test_versions` interface now accepts
-an empty version 0 plan only under `test-api`; production still selects V2.
+an empty version 0 plan only under `test-api`. Production selected V2 at that checkpoint.
 This control requires version 0, zero schema objects and no startup report,
 then explicitly checks close success. Before/open/after files and inventories
 are retained, including any active WAL/SHM and their later removal. Complete
@@ -545,7 +565,7 @@ MG-7 compares every typed schema/table value in the new pre-V2 snapshot with
 the retained prior database, using canonical row order. Two distinct command
 payloads provide nonempty data; a same-cardinality changed-value comparison
 must differ. Two earlier backups remain byte-identical, command values
-survive the forward test-only V3 migration, and logical images, the prior
+survive the forward migration through the test-only V4 probe, and logical images, the prior
 main file and backup hashes are retained outside the Instance root.
 
 These are synthetic native Windows witnesses. Parent kill uses Windows

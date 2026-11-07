@@ -67,8 +67,8 @@ fn schema()->Result<String,String>{
     let i=instance("schema")?;let root=i.root().to_owned();let v=store::test_api::user_version(&i).map_err(|e|e.to_string())?;
     i.close().map_err(|e|e.to_string())?;let c=ro(&root)?;
     let tables:i64=c.query_row("SELECT count(*) FROM pragma_table_list WHERE name IN ('runtime_epoch','runs','commands','jobs','events') AND strict=1",[],|r|r.get(0)).map_err(|e|e.to_string())?;
-    if v!=2 || tables!=5 || counts(&root)?!=(0,0,0,0){return Err(format!("version={v}, strict tables={tables}"));}
-    Ok("V2 five STRICT durable tables; empty acceptance set; V1 identity/history retained".into())
+    if v!=3 || tables!=5 || counts(&root)?!=(0,0,0,0){return Err(format!("version={v}, strict tables={tables}"));}
+    Ok("V3 retains five V2 STRICT durable tables and an empty acceptance set".into())
 }
 fn validation()->Result<String,String>{
     let id=CommandId::new("id").map_err(|e|e.to_string())?;
@@ -402,7 +402,7 @@ fn upgrade_v1()->Result<String,String>{
     let before=fs::read(fixture.join("instance.db")).map_err(|e|e.to_string())?;
     let p=parent("upgrade-v1")?;let root=p.join(fixture.file_name().ok_or("fixture name")?);fs::create_dir(&root).map_err(|e|e.to_string())?;
     for name in ["instance.db","instance.id","instance.lock"]{fs::copy(fixture.join(name),root.join(name)).map_err(|e|e.to_string())?;}
-    let i=store::open_instance(&root).map_err(|e|e.to_string())?;
+    let i=store::test_api::open_test_versions(&root,2,false).map_err(|e|e.to_string())?;
     if store::test_api::user_version(&i).map_err(|e|e.to_string())?!=2{return Err("V1 copy did not upgrade".into());}
     i.close().map_err(|e|e.to_string())?;
     let backups:Vec<_>=fs::read_dir(root.join("backups")).map_err(|e|e.to_string())?.collect::<Result<_,_>>().map_err(|e|e.to_string())?;

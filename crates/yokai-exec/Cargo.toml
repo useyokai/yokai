@@ -14,3 +14,23 @@ autobenches = false
 [lib]
 test = false
 doctest = false
+
+[dependencies]
+yokai-store = { path = "../yokai-store" }
+yokai-types.workspace = true
+
+[dev-dependencies]
+yokai-testsupport.workspace = true
+
+[features]
+test-api = ["yokai-store/test-api"]
+
+[[test]]
+name = "conversation_runtime"
+path = "tests/conversation_runtime.rs"
+harness = false
+required-features = ["test-api"]
+
+[[example]]
+name = "conversation_core"
+path = "examples/conversation_core.rs"

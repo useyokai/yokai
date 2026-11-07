@@ -44,10 +44,7 @@ impl PendingCommand {
     pub fn operation_id(&self)->u64{self.inner.operation_id()}
     pub fn wait(self,deadline:Instant)->Result<AcceptOutcome,crate::WriteFailure>{
         let id=self.inner.operation_id();
-        self.inner.wait(deadline)?.command.ok_or_else(|| {
-            let mut evidence=crate::WriteEvidence::queued();evidence.phase=crate::Phase::Done;
-            crate::WriteFailure{operation_id:Some(id),certainty:crate::Certainty::OutcomeUnknown,reason:crate::WriteReason::WriterGone,evidence}
-        })
+        self.inner.wait(deadline)?.command.ok_or_else(|| crate::WriteFailure::missing_reply(id))
     }
 }
 
@@ -55,11 +52,20 @@ impl PendingCommand {
 /// failure engine. The boolean requests COMMIT for insertion, ROLLBACK for replay.
 pub(crate) fn accept(conn:&Connection,request:&CommandRequest)->rusqlite::Result<(AcceptOutcome,bool)>{
     point("accept-after-begin")?;
+    if let Some(outcome)=lookup(conn,request)? {return Ok((outcome,false));}
+    let (run_id,_)=insert(conn,request)?;
+    Ok((AcceptOutcome::Accepted{run_id},true))
+}
+pub(crate) fn lookup(conn:&Connection,request:&CommandRequest)->rusqlite::Result<Option<AcceptOutcome>>{
     let existing:Option<(Vec<u8>,i64)>=conn.query_row("SELECT request_digest,run_id FROM commands WHERE command_id=?1",
         [request.id.as_str()],|r|Ok((r.get(0)?,r.get(1)?))).optional()?;
-    if let Some((digest,run_id))=existing {
-        return Ok((if digest.as_slice()==request.digest.as_slice(){AcceptOutcome::Duplicate{run_id}}else{AcceptOutcome::Conflict{run_id}},false));
-    }
+    Ok(existing.map(|(digest,run_id)| if digest.as_slice()==request.digest.as_slice(){
+        AcceptOutcome::Duplicate{run_id}
+    }else{
+        AcceptOutcome::Conflict{run_id}
+    }))
+}
+pub(crate) fn insert(conn:&Connection,request:&CommandRequest)->rusqlite::Result<(i64,i64)>{
     let epoch:i64=conn.query_row("SELECT epoch FROM runtime_epoch WHERE id=1",[],|r|r.get(0))?;
     conn.execute("INSERT INTO runs(admission,status,recovery_required,created_epoch) VALUES('Queued','Open',0,?1)",[epoch])?;
     let run_id=conn.last_insert_rowid();
@@ -71,7 +77,7 @@ pub(crate) fn accept(conn:&Connection,request:&CommandRequest)->rusqlite::Result
     point("accept-after-job")?;
     conn.execute("INSERT INTO events(run_id,kind,detail,epoch) VALUES(?1,'run.accepted',?2,?3)",params![run_id,request.id.as_str(),epoch])?;
     point("accept-after-event")?;
-    Ok((AcceptOutcome::Accepted{run_id},true))
+    Ok((run_id,epoch))
 }
 pub(crate) fn point(boundary:&str)->rusqlite::Result<()>{
     #[cfg(feature="test-api")]

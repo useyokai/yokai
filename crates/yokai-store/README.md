@@ -1,9 +1,11 @@
 # Instance storage
 
-The current schema version is **2**. V1 contains the STRICT singleton
+The current schema version is **3**. V1 contains the STRICT singleton
 `instance_meta` table and the owned runner's `yokai_schema_history` table.
 V2 adds STRICT `runtime_epoch`, `runs`, `commands`, `jobs` and `events` tables.
-Jobs are records only. Admission, claim, execution and dispatch have no crate API.
+V3 adds conversations, message rows and bindings to the existing runs and
+events. The opaque command API continues to create records only. The typed
+conversation operations admit and settle their own fake runs.
 
 SQL lives in `migrations/V{n}__{name}.sql` and is embedded at compile time.
 Each migration ends with its matching `PRAGMA user_version = n;`. The
@@ -40,8 +42,8 @@ Free-space measurement is implemented for Windows and x86_64 glibc Linux;
 other targets fail closed before upgrade. Native Linux validation is separate
 from Windows validation.
 
-Tests require the explicit `test-api` feature. Synthetic V3/V4 plans and fault
-injection exist only behind that feature; production selects V1 followed by V2. The
+Tests require the explicit `test-api` feature. Historical V2 fixtures, synthetic
+V4/V5 plans and fault injection exist only behind that feature. Production applies V1 through V3. The
 low-level connection functions are exposed only through `test_api`; default builds expose no raw connection, transaction or SQL entry point.
 
 
@@ -121,6 +123,12 @@ V1 upgrades retain a verified pre-upgrade snapshot. V1 binaries refuse V2;
 automatic downgrade and database repair are unsupported. Current validation is
 native Windows MSVC. WSL processing of saved logs does not establish Linux
 runtime validation, power-loss durability or product acceptance.
+
+The [conversation core](../../docs/m1-conversation-core.md) uses this same
+writer and certainty contract. Conversation admission binds the command,
+user message and run in one transaction. The completion ticket carries the
+Instance, conversation, run and epoch. A held run retains its conversation slot.
+Readers page through durable events and messages from a committed snapshot.
 
 Reader cancellation has one guarded query ID. The watchdog interrupts only an
 expired matching ID while holding the mutex used to finish that query and
