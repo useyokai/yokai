@@ -16,7 +16,7 @@ use rusqlite::config::DbConfig;
 use yokai_platform::InstanceLock;
 use crate::InstanceError;
 use crate::conversation::ConversationWrite;
-use yokai_types::{CompleteFakeRun, ConversationId, ConversationState, CreateConversation, MAX_REPLAY_EVENTS, ReplayCursor, ReplayPage, SubmitMessage};
+use yokai_types::{CompleteFakeRun, ConversationId, ConversationState, CreateConversation, MAX_ACTIVE_RUNS, MAX_REPLAY_EVENTS, ReplayCursor, ReplayPage, SubmitMessage};
 
 pub(crate) fn lock<T>(value: &Mutex<T>) -> MutexGuard<'_, T> {
     value.lock().unwrap_or_else(|poison| poison.into_inner())
@@ -137,6 +137,7 @@ enum WriterMessage {
 pub struct StoreHandle {
     shared: Arc<Shared>,
     writer: mpsc::SyncSender<WriterMessage>,
+    terminal: mpsc::SyncSender<WriterMessage>,
     readers: Vec<mpsc::SyncSender<ReadRequest>>,
 }
 
@@ -224,7 +225,14 @@ impl StoreHandle {
         state.next_id = id.checked_add(1);
         let (tx, rx) = mpsc::sync_channel(1);
         let progress = Arc::new(Mutex::new(WriteEvidence::queued()));
-        self.writer.try_send(WriterMessage::Health(WriteRequest { id, deadline, progress: progress.clone(), reply: tx, work }))
+        // Each admitted fake worker submits one terminal write at a time.
+        // Reserve capacity for these writes even when ordinary admission is full.
+        let sender = if matches!(&work, WriteWork::Conversation { request: ConversationWrite::Complete(_), .. }) {
+            &self.terminal
+        } else {
+            &self.writer
+        };
+        sender.try_send(WriterMessage::Health(WriteRequest { id, deadline, progress: progress.clone(), reply: tx, work }))
             .map_err(|e| WriteFailure::queued(None, match e {
                 mpsc::TrySendError::Full(_) => WriteReason::Overloaded,
                 mpsc::TrySendError::Disconnected(_) => { state.status = StoreState::Failed; WriteReason::Failed }
@@ -374,11 +382,12 @@ impl Runtime {
             read_events: Mutex::new(VecDeque::new()),
         });
         let (sender, receiver) = mpsc::sync_channel(options.queue_capacity);
-        let mut runtime = Self { handle: StoreHandle { shared: shared.clone(), writer: sender, readers: Vec::new() },
+        let (terminal, terminal_receiver) = mpsc::sync_channel(MAX_ACTIVE_RUNS);
+        let mut runtime = Self { handle: StoreHandle { shared: shared.clone(), writer: sender, terminal, readers: Vec::new() },
             threads: Vec::new(), ownership: Some(ownership), close_timeout: options.close_timeout };
         let s = shared.clone();
         let wal = root.join("instance.db-wal");
-        match spawn_worker(move || writer::run(conn.take(), receiver, s, wal), "yokai-writer") {
+        match spawn_worker(move || writer::run(conn.take(), receiver, terminal_receiver, s, wal), "yokai-writer") {
             Ok(handle) => runtime.threads.push(handle),
             Err(error) => {
                 // The failed spawn has dropped its RW closure. Close every RO connection

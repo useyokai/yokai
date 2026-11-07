@@ -174,6 +174,35 @@ fn certainty() {
     instance.close().unwrap();
 }
 
+fn completion_capacity() {
+    let instance = fixture("completion-capacity", 1);
+    let handle = instance.store();
+    for n in 1..=5 {
+        assert!(matches!(create(&handle, id(n), &format!("create-{n}")), Decision::Created { .. }));
+    }
+    let tickets: Vec<_> = (1..=4).map(|n| {
+        accepted(submit(&handle, request(id(n), n, &format!("submit-{n}"), "hello")))
+    }).collect();
+    assert_eq!(submit(&handle, request(id(5), 5, "fifth", "hi")), Decision::Busy);
+
+    let blocker = store::test_api::block_writer(&instance).unwrap();
+    let ordinary = handle.submit_health_check(deadline()).unwrap();
+    let overloaded = handle.submit_health_check(deadline()).err().unwrap();
+    assert_eq!((overloaded.certainty, overloaded.reason), (Certainty::NotApplied, WriteReason::Overloaded));
+    let completions: Vec<_> = tickets.iter().enumerate().map(|(n, &ticket)| {
+        handle.complete_fake_run(completion(ticket, 10 + n as u8, "fake: hello"), deadline()).unwrap()
+    }).collect();
+    let excess = handle.complete_fake_run(completion(tickets[0], 10, "fake: hello"), deadline()).err().unwrap();
+    assert_eq!((excess.certainty, excess.reason), (Certainty::NotApplied, WriteReason::Overloaded));
+    drop(blocker);
+    for (pending, ticket) in completions.into_iter().zip(tickets) {
+        assert_eq!(pending.wait(deadline()).unwrap(), Decision::Completed { run_id: ticket.run_id });
+    }
+    ordinary.wait(deadline()).unwrap();
+    accepted(submit(&handle, request(id(5), 5, "fifth", "hi")));
+    instance.close().unwrap();
+}
+
 fn wait_timeout() {
     let instance = fixture("timeout", 64);
     let handle = instance.store();
@@ -262,7 +291,7 @@ fn main() -> ExitCode {
     let protection = yokai_testsupport::make_non_dumpable();
     println!("{}", protection.line());
     if !protection.permits_checks() { return ExitCode::FAILURE; }
-    for (id, check) in [("M1-ADMIT", admission as fn()), ("M1-RACE", concurrency), ("M1-CERTAINTY", certainty), ("M1-TIMEOUT", wait_timeout), ("M1-REPLAY", replay_pages)] {
+    for (id, check) in [("M1-ADMIT", admission as fn()), ("M1-RACE", concurrency), ("M1-CERTAINTY", certainty), ("M1-COMPLETION-CAPACITY", completion_capacity), ("M1-TIMEOUT", wait_timeout), ("M1-REPLAY", replay_pages)] {
         if std::panic::catch_unwind(check).is_err() {
             println!("CHECK {id} FAIL");
             return ExitCode::FAILURE;

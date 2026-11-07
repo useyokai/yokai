@@ -23,6 +23,11 @@ cargo test -p yokai-exec --features test-api --test conversation_runtime --offli
 named regression. An unknown name exits before fixture setup. Without a
 selector the harness runs its ordinary catalogue.
 
+`instance_lifecycle --schema-checks` selects the current-schema creation,
+raw-header and synthetic legacy-fixture checks. To run them through Cargo,
+pass `-- --schema-checks` after the target options. The full lifecycle
+catalogue includes separate process and filesystem scenarios.
+
 ## Inputs and recorded scope
 
 The historical native Windows/MSVC V2 suite included the following configured
@@ -404,10 +409,10 @@ Default builds contain neither the observer nor its public diagnostic endpoint;
 the default header acceptance rules and schema remain unchanged. The empty-file
 shortcut is not a decoded-header event.
 
-PF17 retains 54 ordinary main/identity/lock input and output files for versions
-0/1/2/3/255/256/65536/16777216/4294967295. Every input is a nonempty header, and
+PF17 retains 60 ordinary main/identity/lock input and output files for versions
+0/1/2/3/4/255/256/65536/16777216/4294967295. Every input is a nonempty header, and
 exactly one matching observation is required, followed by an empty second take.
-Accepted 0/1/2 opens reach Stage B and finish at V2 after migration/startup and
+Accepted 0/1/2/3 opens reach Stage B and finish at V3 after migration/startup and
 explicit close. Those opens intentionally change the main database. Future
 versions refuse before SQLite and preserve the complete closed root. Fixed-name
 SQLite inventories and unchanged identity/empty-lock bytes are checked separately;

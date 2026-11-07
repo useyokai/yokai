@@ -20,6 +20,11 @@ use rusqlite::Connection;
 use yokai_store::{self as store, IncompleteReason, Instance, InstanceError};
 use yokai_types::InstanceId;
 
+const CURRENT_SCHEMA: u32 = 3;
+const FUTURE_SCHEMA: u32 = CURRENT_SCHEMA + 1;
+const CURRENT_SCHEMA_OBJECTS: i64 = 17;
+const FUTURE_WAL_MARKER: &[u8] = b"committed-wal-future-version";
+
 const CHECK_IDS: &[&str] = &[
     "IC-1", "IC-2", "IC-3", "IC-4", "IC-5", "IC-6", "IC-8", "IC-9", "IC-F",
     "IL-1", "IL-2", "IL-3", "IL-4", "IL-5", "IL-6", "IL-7", "IL-8", "IL-10",
@@ -27,6 +32,17 @@ const CHECK_IDS: &[&str] = &[
     "PF-1", "PF-2a", "PF-2b", "PF-3a", "PF-3b", "PF-4", "PF-5", "PF-6",
     "PF-8", "PF-9", "PF-10", "PF-11", "PF-12", "PF-13", "PF-14", "PF-15",
     "PF-16", "PF-17", "PF-18", "SV-2", "SV-4", "SHA256-1",
+];
+
+const SCHEMA_CHECKS: &[(&str, fn(&Path) -> Result<String, String>)] = &[
+    ("IC-1", case_create_shape),
+    ("IC-F", case_fixture_instance),
+    ("PF-1", case_pf1),
+    ("PF-2a", case_pf2a),
+    ("PF-2b", case_pf2b),
+    ("PF-8", case_pf8),
+    ("PF-14", case_pf14),
+    ("PF-17", case_pf17),
 ];
 
 struct Checks { total: usize, failed: usize }
@@ -108,16 +124,22 @@ fn main() -> ExitCode {
     if args.get(1).is_some_and(|arg| arg == "__child") {
         return ExitCode::from(child_main(&args).unwrap_or(90));
     }
+    let schema_only = match args.as_slice() {
+        [_] => false,
+        [_, flag] if flag == "--schema-checks" => true,
+        _ => return ExitCode::from(2),
+    };
+    let expected = if schema_only { SCHEMA_CHECKS.len() } else { CHECK_IDS.len() };
     let mut checks = Checks { total: 0, failed: 0 };
-    if let Err(error) = run(&mut checks) {
+    if let Err(error) = run(&mut checks, schema_only) {
         checks.record("S0_setup", Err(error));
     }
-    if checks.total != CHECK_IDS.len() {
+    if checks.total != expected {
         checks.record("S0_check_count", Err(format!(
-            "emitted {} checks; configuration requires {}", checks.total, CHECK_IDS.len()
+            "emitted {} checks; configuration requires {expected}", checks.total
         )));
     }
-    if checks.failed == 0 && checks.total == CHECK_IDS.len() {
+    if checks.failed == 0 && checks.total == expected {
         println!("RESULT PASS {}/{}", checks.total, checks.total);
         ExitCode::SUCCESS
     } else {
@@ -192,10 +214,10 @@ fn child_main(args: &[String]) -> Option<u8> {
             let path = PathBuf::from(args.get(3)?);
             let marker = PathBuf::from(args.get(4)?);
             let Ok(connection) = Connection::open(path) else { return Some(11) };
-            if connection.execute_batch(
-                "PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0; PRAGMA user_version=3;"
-            ).is_err() { return Some(12); }
-            if retain_file(&marker, b"committed-wal-version3").is_err() { return Some(6); }
+            if connection.execute_batch(&format!(
+                "PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0; PRAGMA user_version={FUTURE_SCHEMA};"
+            )).is_err() { return Some(12); }
+            if retain_file(&marker, FUTURE_WAL_MARKER).is_err() { return Some(6); }
             // The live connection stays owned until the parent kills and reaps us.
             loop { std::thread::park_timeout(Duration::from_secs(1)); }
         }
@@ -203,7 +225,7 @@ fn child_main(args: &[String]) -> Option<u8> {
     }
 }
 
-fn run(checks: &mut Checks) -> Result<(), String> {
+fn run(checks: &mut Checks, schema_only: bool) -> Result<(), String> {
     let configured = std::env::var_os("YOKAI_TEST_DATA_DIR")
         .map(PathBuf::from).ok_or("YOKAI_TEST_DATA_DIR is not set")?;
     if !configured.is_absolute() || !configured.is_dir() {
@@ -211,6 +233,13 @@ fn run(checks: &mut Checks) -> Result<(), String> {
     }
     let run_dir = fresh_dir(&configured, "instance_lifecycle")?;
     println!("INFO test_data={}", run_dir.display());
+
+    if schema_only {
+        for (id, run) in SCHEMA_CHECKS {
+            checks.record(id, run(&run_dir));
+        }
+        return Ok(());
+    }
 
     checks.record("IC-1", case_create_shape(&run_dir));
     checks.record("IC-2", case_invalid_parents(&run_dir));
@@ -271,8 +300,20 @@ fn fresh_dir(base: &Path, label: &str) -> Result<PathBuf, String> {
 }
 
 fn new_root(base: &Path, label: &str) -> Result<PathBuf, String> {
+    closed_root(base, label, store::create_instance)
+}
+
+fn new_v2_root(base: &Path, label: &str) -> Result<PathBuf, String> {
+    closed_root(base, label, store::test_api::create_test_v2)
+}
+
+fn closed_root(
+    base: &Path,
+    label: &str,
+    create: fn(&Path) -> Result<Instance, InstanceError>,
+) -> Result<PathBuf, String> {
     let parent = fresh_dir(base, label)?;
-    let instance = store::create_instance(&parent).map_err(|e| format!("create Instance: {e}"))?;
+    let instance = create(&parent).map_err(|e| format!("create Instance: {e}"))?;
     let root = instance.root().to_path_buf();
     instance.close().map_err(|e| format!("close Instance: {e}"))?;
     Ok(root)
@@ -411,7 +452,7 @@ fn case_create_shape(base: &Path) -> Result<String, String> {
         && actual == expected
         && identity.lines().count() == 3
         && identity.starts_with("yokai-instance format 1\nid ")
-        && version == 2 && objects == 11 && private_root && instance.is_locked();
+        && version == i64::from(CURRENT_SCHEMA) && objects == CURRENT_SCHEMA_OBJECTS && private_root && instance.is_locked();
     instance.close().map_err(|e| e.to_string())?;
     if good { Ok(format!("root={} entries={actual:?} version={version} objects={objects}", root.display())) }
     else { Err(format!("root={} entries={actual:?} expected={expected:?} version={version} objects={objects} private={private_root}", root.display())) }
@@ -637,8 +678,11 @@ fn case_fixture_instance(base: &Path) -> Result<String, String> {
     let root = new_root(base, "ic-fixture")?;
     let db = fs::read(db_path(&root)).map_err(|e| e.to_string())?;
     let hash = store::test_api::sha256_chunks_for_test(&[&db]);
+    if db.get(60..64) != Some(CURRENT_SCHEMA.to_be_bytes().as_slice()) {
+        return Err("fixture does not have the current schema version".into());
+    }
     println!("INFO IC-F fixture={} instance.db_sha256={hash}", root.display());
-    Ok(format!("current version-2 fixture preserved; historical accepted version-0 fixture remains separate; sha256={hash}"))
+    Ok(format!("current version-{CURRENT_SCHEMA} fixture preserved; sha256={hash}"))
 }
 
 fn case_same_process_busy(base: &Path) -> Result<String, String> {
@@ -1078,7 +1122,7 @@ fn case_tmpfs_test_override(base: &Path) -> Result<String, String> {
 fn case_pf1(base: &Path) -> Result<String, String> {
     let root = new_root(base, "pf1")?;
     if side_path(&root, "wal").exists() || side_path(&root, "shm").exists() || side_path(&root, "journal").exists() {
-        return Err("new version-2 fixture unexpectedly retained side files".into());
+        return Err("new current-schema fixture unexpectedly retained side files".into());
     }
     store::test_api::clear();
     let instance = store::open_instance(&root).map_err(|e| e.to_string())?;
@@ -1086,19 +1130,19 @@ fn case_pf1(base: &Path) -> Result<String, String> {
     let version = store::test_api::user_version(&instance).map_err(|e| e.to_string())?;
     let objects = store::test_api::schema_objects(&instance).map_err(|e| e.to_string())?;
     instance.close().map_err(|e| e.to_string())?;
-    if events == ["stage-b-read-write"] && version == 2 && objects == 11 {
-        Ok("raw-header Stage A opened no SQLite connection; Stage B accepted current version 2".into())
+    if events == ["stage-b-read-write"] && version == i64::from(CURRENT_SCHEMA) && objects == CURRENT_SCHEMA_OBJECTS {
+        Ok(format!("raw-header Stage A opened no SQLite connection; Stage B accepted current version {CURRENT_SCHEMA}"))
     } else { Err(format!("events={events:?} version={version} objects={objects}")) }
 }
 
 fn case_pf2a(base: &Path) -> Result<String, String> {
     let root = new_root(base, "pf2a")?;
-    set_header_u32(&root, 60, 3)?;
+    set_header_u32(&root, 60, FUTURE_SCHEMA)?;
     let before = root_snapshot(&root)?;
     store::test_api::clear();
     let result = store::open_instance(&root);
     let events = store::test_api::connection_events();
-    if matches!(&result, Err(InstanceError::SchemaTooNew { found: 3, maximum: 2 }))
+    if matches!(&result, Err(InstanceError::SchemaTooNew { found: FUTURE_SCHEMA, maximum: CURRENT_SCHEMA }))
         && events.is_empty() && before == root_snapshot(&root)? {
         Ok("future raw-header version refused without SQLite or inventory changes".into())
     } else { Err(format!("result={} events={events:?}", describe_instance_result(&result))) }
@@ -1106,13 +1150,12 @@ fn case_pf2a(base: &Path) -> Result<String, String> {
 
 fn case_pf2b(base: &Path) -> Result<String, String> {
     let root = new_root(base, "pf2b")?;
-    set_header_u32(&root, 60, 2)?;
     fs::write(side_path(&root, "shm"), b"stale").map_err(|e| e.to_string())?;
     let before = root_snapshot(&root)?;
     store::test_api::clear();
     let result = store::open_instance(&root);
     let events = store::test_api::connection_events();
-    if matches!(&result, Err(InstanceError::SideFileStateUnverified { header_version: 2 }))
+    if matches!(&result, Err(InstanceError::SideFileStateUnverified { header_version: CURRENT_SCHEMA }))
         && events.is_empty() && before == root_snapshot(&root)? {
         Ok("stale SHM without WAL refused before SQLite; inventory unchanged".into())
     } else { Err(format!("result={} events={events:?}", describe_instance_result(&result))) }
@@ -1126,8 +1169,8 @@ fn make_wal_future(root: &Path) -> Result<(), String> {
     let mut command = child_command("wal-version", &[&db_path(root), &marker])?;
     command.stdin(Stdio::null());
     let mut child = OwnedChild(command.spawn().map_err(|e| e.to_string())?);
-    wait_owned_marker(&mut child, &marker, b"committed-wal-version3")?;
-    kill_child(&mut child, "committed-wal-version3")?;
+    wait_owned_marker(&mut child, &marker, FUTURE_WAL_MARKER)?;
+    kill_child(&mut child, "committed-wal-future-version")?;
     let main = fs::read(db_path(root)).map_err(|e| e.to_string())?;
     if main.get(60..64) != Some(prior_version.as_slice()) || !side_path(root, "wal").is_file() {
         return Err("killed producer did not leave the original main version and committed future WAL".into());
@@ -1149,7 +1192,7 @@ fn case_pf3(base: &Path, keep_shm: bool) -> Result<String, String> {
     let db_same = fs::read(db_path(&root)).map_err(|e| e.to_string())? == db_before;
     let wal_same = fs::read(side_path(&root, "wal")).map_err(|e| e.to_string())? == wal_before;
     match result {
-        Err(InstanceError::SchemaTooNew { found: 3, maximum: 2 }) if db_same && wal_same
+        Err(InstanceError::SchemaTooNew { found: FUTURE_SCHEMA, maximum: CURRENT_SCHEMA }) if db_same && wal_same
             && events.iter().any(|event| *event == "stage-a-read-only") =>
             Ok(format!("WAL-only version was read; main and WAL preserved; shm_present={}", side_path(&root, "shm").exists())),
         other => Err(format!("result={} db_same={db_same} wal_same={wal_same} events={events:?}", describe_instance_result(&other))),
@@ -1213,7 +1256,7 @@ fn case_pf6(base: &Path) -> Result<String, String> {
 }
 
 fn legacy_root(base:&Path,label:&str)->Result<PathBuf,String>{
-    let root=new_root(base,label)?;
+    let root=new_v2_root(base,label)?;
     let c=Connection::open(db_path(&root)).map_err(|e|e.to_string())?;
     c.execute_batch("DROP TABLE events; DROP TABLE jobs; DROP TABLE commands; DROP TABLE runs; DROP TABLE runtime_epoch; DROP TABLE instance_meta; DROP TABLE yokai_schema_history; PRAGMA user_version=0;").map_err(|e|e.to_string())?;
     drop(c);Ok(root)
@@ -1431,8 +1474,12 @@ fn pf17_retain(root:&Path,label:&str,snapshot:&BTreeMap<String,Vec<u8>>)->Result
     Ok(copy)
 }
 fn case_pf17(base: &Path) -> Result<String, String> {
-    for value in [0, 1, 2, 3, 255, 256, 65_536, 16_777_216, u32::MAX] {
-        let root = if value==0 {legacy_root(base,"pf17")?}else{new_root(base,"pf17")?};
+    for value in [0, 1, 2, CURRENT_SCHEMA, FUTURE_SCHEMA, 255, 256, 65_536, 16_777_216, u32::MAX] {
+        let root = match value {
+            0 => legacy_root(base, "pf17")?,
+            1 | 2 => new_v2_root(base, "pf17")?,
+            _ => new_root(base, "pf17")?,
+        };
         if value==1 {let c=Connection::open(root.join("instance.db")).map_err(|e|e.to_string())?;
             c.execute_batch("DROP TABLE events; DROP TABLE jobs; DROP TABLE commands; DROP TABLE runs; DROP TABLE runtime_epoch; DELETE FROM yokai_schema_history WHERE version=2; PRAGMA user_version=1;").map_err(|e|e.to_string())?;
             c.close().map_err(|(_,e)|e.to_string())?;}
@@ -1446,14 +1493,14 @@ fn case_pf17(base: &Path) -> Result<String, String> {
         let decoded=store::test_api::header_versions()?;let second_take=store::test_api::header_versions()?;
         let events=store::test_api::connection_events();
         let (outcome,expected_events)=match result {
-            Ok(i) if value<=2=>{
+            Ok(i) if value<=CURRENT_SCHEMA=>{
                 let current=store::test_api::user_version(&i).map_err(|e|e.to_string())?;
                 i.close().map_err(|e|e.to_string())?;
-                if current!=2{return Err(format!("PF17 accepted input{value} ended at version{current}"));}
-                ("AcceptedV2".to_owned(),vec!["stage-b-read-write"])
+                if current!=i64::from(CURRENT_SCHEMA){return Err(format!("PF17 accepted input{value} ended at version{current}"));}
+                (format!("AcceptedV{CURRENT_SCHEMA}"),vec!["stage-b-read-write"])
             },
             Ok(i)=>{i.close().map_err(|e|e.to_string())?;return Err(format!("PF17 future input{value} unexpectedly opened"));},
-            Err(InstanceError::SchemaTooNew{found,maximum:2}) if value>2 && found==value=>(format!("SchemaTooNew({found},2)"),Vec::new()),
+            Err(InstanceError::SchemaTooNew{found,maximum:CURRENT_SCHEMA}) if value>CURRENT_SCHEMA && found==value=>(format!("SchemaTooNew({found},{CURRENT_SCHEMA})"),Vec::new()),
             Err(error)=>return Err(format!("PF17 input{value} wrong outcome {error:?}")),
         };
         let after=root_snapshot(&root)?;let inventory_after=pf17_inventory(&root)?;
@@ -1462,10 +1509,10 @@ fn case_pf17(base: &Path) -> Result<String, String> {
         if before.get("instance.id")!=after.get("instance.id") || before.get("instance.lock")!=after.get("instance.lock")
             || before.get("instance.lock")!=Some(&Vec::new()){return Err("PF17 identity/persistent empty lock changed".into());}
         let changed=before.get("instance.db")!=after.get("instance.db");
-        if (value<=2 && !changed) || (value>2 && before!=after){return Err("PF17 unexpected accepted/refused closed effects".into());}
+        if (value<=CURRENT_SCHEMA && !changed) || (value>CURRENT_SCHEMA && before!=after){return Err("PF17 unexpected accepted/refused closed effects".into());}
         println!("INFO PF17 header_decode fixture={} value={value} retained_before={} retained_after={} input_bytes={} decoded={decoded:?} second_take={second_take:?} sqlite_events={events:?} outcome={outcome} main_changed={changed} identity_lock_bytes_unchanged=true inventories_scope=fixed_SQLite_names copies_scope=main_id_lock inventory_before={inventory_before:?} inventory_after={inventory_after:?}",root.display(),retained_before.display(),retained_after.display(),main.len());
     }
-    Ok("nine exact raw-header decoded-version events include accepted0/1/2 and six future unsigned values; take drains,54 retained main/id/lock files and fixed-name inventories; accepted migrations/startup intentionally write, future refusals preserve the complete closed root".into())
+    Ok("ten exact raw-header decoded-version events include accepted0/1/2/3 and six future unsigned values; take drains,60 retained main/id/lock files and fixed-name inventories; accepted migrations/startup intentionally write, future refusals preserve the complete closed root".into())
 }
 
 fn case_pf18(base: &Path) -> Result<String, String> {

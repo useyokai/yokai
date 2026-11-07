@@ -122,6 +122,33 @@ fn terminal_failure(client: &ConversationClient, instance_id: yokai_types::Insta
     assert_eq!(client.read_conversation(ticket.conversation_id, deadline()).unwrap().unwrap().latest_run, Some((ticket.run_id, RunState::Failed)));
 }
 
+fn maximum_size_progress() {
+    let input = "x".repeat(MAX_USER_BYTES);
+    let largest_reply = "x".repeat(MAX_RESPONSE_BYTES);
+    for (name, fake, expected) in [
+        ("maximum-input", TestFake::default(), format!("fake: {input}")),
+        ("maximum-reply", TestFake::with_reply(&largest_reply).unwrap(), largest_reply),
+    ] {
+        let mut runtime = ConversationRuntime::with_test_fake(instance(name), fake.clone());
+        let client = runtime.handle();
+        create(&client, 1);
+        let (ticket, stream) = streaming(client.submit_message(request(1, 1, &input), mid(2), deadline()).unwrap());
+        if name == "maximum-input" {
+            // Simulate the producer filling the buffer before the reader is scheduled.
+            let end = deadline();
+            while !fake.progress_was_full() {
+                assert!(Instant::now() < end, "producer never reached the full buffer");
+                std::thread::yield_now();
+            }
+        }
+        let output = chunks(&stream.progress);
+        assert_eq!(output.len(), expected.len().div_ceil(MAX_CHUNK_BYTES));
+        assert_eq!(output.iter().map(|chunk| chunk.text.as_str()).collect::<String>(), expected);
+        assert_eq!(stream.completion.wait(deadline()).unwrap(), Decision::Completed { run_id: ticket.run_id });
+        runtime.close(deadline()).unwrap();
+    }
+}
+
 fn bounded_progress() {
     let instance = instance("full");
     let iid = instance.id();
@@ -197,6 +224,7 @@ fn main() -> ExitCode {
     if !protection.permits_checks() { return ExitCode::FAILURE; }
     for (id, check) in [
         ("M1-STREAM-PERSIST", duplicates_and_persistence as fn()),
+        ("M1-STREAM-MAX", maximum_size_progress),
         ("M1-STREAM-BOUND", bounded_progress),
         ("M1-STREAM-FAULT", adapter_and_disconnect),
         ("M1-STREAM-HELD", hold_and_reopen),

@@ -162,11 +162,19 @@ fn message(conn: &Connection, shared: &Shared, message: WriterMessage) {
         }
     }
 }
-pub(super) fn run(conn: Connection, receiver: mpsc::Receiver<WriterMessage>, shared: Arc<Shared>, wal: std::path::PathBuf) {
+pub(super) fn run(
+    conn: Connection,
+    receiver: mpsc::Receiver<WriterMessage>,
+    terminal: mpsc::Receiver<WriterMessage>,
+    shared: Arc<Shared>,
+    wal: std::path::PathBuf,
+) {
     worker(&shared, "writer");
     let mut idle = Instant::now();
     while !shared.closing.load(Ordering::Acquire) {
-        match receiver.recv_timeout(Duration::from_millis(10)) {
+        // A completed fake should release its durable slot ahead of more admissions.
+        let next = terminal.try_recv().map_or_else(|_| receiver.recv_timeout(Duration::from_millis(10)), Ok);
+        match next {
             Ok(request) => { message(&conn, &shared, request); observe_wal(&shared, &wal); idle = Instant::now(); }
             Err(mpsc::RecvTimeoutError::Timeout) => {
                 if idle.elapsed() >= Duration::from_secs(1) && shared.status() != StoreState::Failed {
@@ -176,6 +184,7 @@ pub(super) fn run(conn: Connection, receiver: mpsc::Receiver<WriterMessage>, sha
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
         }
     }
+    while let Ok(request) = terminal.try_recv() { message(&conn, &shared, request); }
     while let Ok(request) = receiver.try_recv() { message(&conn, &shared, request); }
     while shared.readers_alive.load(Ordering::Acquire) != 0 { thread::sleep(Duration::from_millis(1)); }
     let final_checkpoint = {

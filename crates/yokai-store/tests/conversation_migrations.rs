@@ -40,6 +40,10 @@ fn fresh_and_future() {
     assert_eq!(rows[0].2, "434298f48d27b0725e69b4520a9fbfe89b8c7769c7d69cb4ad74a43966771ed7");
     assert_eq!(rows[1].2, "cc01ccc6ec50fd703818709ed322fb874153619b4a6961a8568cdac390fc723d");
     assert_eq!(rows[2].1, "conversation_core");
+    let v3_bytes = include_bytes!("../migrations/V3__conversation_core.sql");
+    let v3_checksum = store::test_api::sha256_chunks_for_test(&[v3_bytes]);
+    assert_eq!(rows[2].2, v3_checksum);
+    println!("INFO V3 migration checksum={v3_checksum}");
     assert!(!root.join("backups").exists());
     conn.execute_batch("PRAGMA user_version=4").unwrap();
     drop(conn);
