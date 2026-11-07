@@ -8,7 +8,7 @@ mod runtime;
 mod durable;
 pub use durable::{CommandRequest,InvalidCommand,AcceptOutcome,PendingCommand};
 mod conversation;
-pub use conversation::PendingConversation;
+pub use conversation::{FakeAdmission, PendingConversation, PendingFakeRun, WorkerCompletion};
 mod startup;
 pub use startup::StartupReport;
 pub use runtime::{StoreHandle, StoreOptions, StoreState, Phase, Certainty, WriteReason,

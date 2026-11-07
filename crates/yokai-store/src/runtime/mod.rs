@@ -7,7 +7,7 @@ pub use types::*;
 use std::collections::VecDeque;
 
 use std::path::Path;
-use std::sync::{Arc, Mutex, MutexGuard, mpsc};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, mpsc};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -33,6 +33,7 @@ struct State {
 pub(crate) struct Shared {
     instance_id: yokai_types::InstanceId,
     state: Mutex<State>,
+    writer_ready: Condvar,
     pub closing: AtomicBool,
     readers_alive: AtomicUsize,
     close_failed: Arc<AtomicBool>,
@@ -41,8 +42,18 @@ pub(crate) struct Shared {
     skip_checkpoint: AtomicBool,
     #[cfg(feature = "test-api")]
     read_events: Mutex<VecDeque<crate::test_api::ReaderEvent>>,
+    #[cfg(feature = "test-api")]
+    writer_idle_probe: Mutex<Option<mpsc::SyncSender<()>>>,
 }
 impl Shared {
+    fn writer_idle_wait(&self) -> Duration {
+        #[cfg(feature = "test-api")]
+        if let Some(ready) = lock(&self.writer_idle_probe).take() {
+            let _ = ready.try_send(());
+            return Duration::from_secs(2);
+        }
+        Duration::from_millis(10)
+    }
     fn status(&self) -> StoreState { lock(&self.state).status }
     fn change(&self, status: StoreState) {
         let mut state = lock(&self.state);
@@ -157,11 +168,17 @@ impl StoreHandle {
         self.submit_conversation(ConversationWrite::Submit(request), deadline)
     }
 
+    /// The runtime requests a single worker permit with durable admission.
+    pub fn submit_worker_message(&self, request: SubmitMessage, deadline: Instant) -> Result<crate::PendingFakeRun, WriteFailure> {
+        let pending = self.submit_message(request, deadline)?;
+        Ok(crate::PendingFakeRun { pending, store: self.clone() })
+    }
+
     pub fn complete_fake_run(&self, request: CompleteFakeRun, deadline: Instant) -> Result<crate::PendingConversation, WriteFailure> {
         self.submit_conversation(ConversationWrite::Complete(request), deadline)
     }
 
-    fn submit_conversation(&self, request: ConversationWrite, deadline: Instant) -> Result<crate::PendingConversation, WriteFailure> {
+    pub(crate) fn submit_conversation(&self, request: ConversationWrite, deadline: Instant) -> Result<crate::PendingConversation, WriteFailure> {
         let inner = self.submit_write(deadline, WriteWork::Conversation {
             request, #[cfg(feature="test-api")] fault: crate::test_api::WriteFault::None,
         })?;
@@ -225,9 +242,8 @@ impl StoreHandle {
         state.next_id = id.checked_add(1);
         let (tx, rx) = mpsc::sync_channel(1);
         let progress = Arc::new(Mutex::new(WriteEvidence::queued()));
-        // Each admitted fake worker submits one terminal write at a time.
-        // Reserve capacity for these writes even when ordinary admission is full.
-        let sender = if matches!(&work, WriteWork::Conversation { request: ConversationWrite::Complete(_), .. }) {
+        // Only a consumed worker permit can use the reserved queue.
+        let sender = if matches!(&work, WriteWork::Conversation { request: ConversationWrite::CompleteWorker(_), .. }) {
             &self.terminal
         } else {
             &self.writer
@@ -237,6 +253,7 @@ impl StoreHandle {
                 mpsc::TrySendError::Full(_) => WriteReason::Overloaded,
                 mpsc::TrySendError::Disconnected(_) => { state.status = StoreState::Failed; WriteReason::Failed }
             }))?;
+        self.shared.writer_ready.notify_one();
         Ok(PendingWrite { id, reply: rx, progress })
     }
     pub fn submit_metadata(&self, deadline: Instant) -> Result<PendingRead, ReadError> {
@@ -374,12 +391,15 @@ impl Runtime {
         let shared = Arc::new(Shared {
             instance_id,
             state: Mutex::new(State { status: StoreState::Running, degradation_generation: 0, next_id: Some(1), next_reader: 0, completed: VecDeque::new(), metrics: StoreMetrics::default() }), closing: AtomicBool::new(false),
+            writer_ready: Condvar::new(),
             readers_alive: AtomicUsize::new(0), close_failed,
             workers: Mutex::new(Vec::new()),
             #[cfg(feature = "test-api")]
             skip_checkpoint: AtomicBool::new(false),
             #[cfg(feature = "test-api")]
             read_events: Mutex::new(VecDeque::new()),
+            #[cfg(feature = "test-api")]
+            writer_idle_probe: Mutex::new(None),
         });
         let (sender, receiver) = mpsc::sync_channel(options.queue_capacity);
         let (terminal, terminal_receiver) = mpsc::sync_channel(MAX_ACTIVE_RUNS);
@@ -434,8 +454,13 @@ impl Runtime {
 
     pub(crate) fn close_before(&mut self, deadline: Instant) -> Result<(), InstanceError> {
         if self.ownership.is_none() { return Ok(()); }
-        lock(&self.handle.shared.state).status = StoreState::ShuttingDown;
-        self.handle.shared.closing.store(true, Ordering::Release);
+        {
+            let shared = &self.handle.shared;
+            let mut state = lock(&shared.state);
+            state.status = StoreState::ShuttingDown;
+            shared.closing.store(true, Ordering::Release);
+            shared.writer_ready.notify_one();
+        }
         #[cfg(feature = "test-api")]
         if crate::failpoint::hit("close-before-workers-join").is_err() {
             if let Some(ownership) = self.ownership.take() { std::mem::forget(ownership); }
@@ -479,14 +504,21 @@ impl Runtime {
     pub(crate) fn set_next_request_id(&self, id: u64) { lock(&self.handle.shared.state).next_id = Some(id); }
 
     #[cfg(feature = "test-api")]
+    pub(crate) fn observe_writer_idle(&self) -> Result<(), InstanceError> {
+        let (ready, observed) = mpsc::sync_channel(1);
+        *lock(&self.handle.shared.writer_idle_probe) = Some(ready);
+        observed.recv_timeout(Duration::from_secs(5)).map_err(|e| InstanceError::Store(e.to_string()))
+    }
+
+    #[cfg(feature = "test-api")]
     pub(crate) fn block_writer(&self) -> Result<crate::test_api::Pause, InstanceError> {
         let (tx, rx) = mpsc::sync_channel(1);
         let pause = crate::test_api::Pause::new();
         let released = pause.released.clone();
-        self.handle.writer.try_send(WriterMessage::Control(Box::new(move |_| {
+        self.send_control(WriterMessage::Control(Box::new(move |_| {
             let _ = tx.send(());
             while !released.load(Ordering::Acquire) { thread::sleep(Duration::from_millis(1)); }
-        }))).map_err(|e| InstanceError::Store(e.to_string()))?;
+        })))?;
         rx.recv_timeout(Duration::from_secs(2)).map_err(|e| InstanceError::Store(e.to_string()))?;
         Ok(pause)
     }
@@ -494,10 +526,18 @@ impl Runtime {
     #[cfg(feature = "test-api")]
     pub(crate) fn control<T: Send + 'static>(&self, run: impl FnOnce(&Connection) -> Result<T, String> + Send + 'static) -> Result<T, InstanceError> {
         let (tx, rx) = mpsc::sync_channel(1);
-        self.handle.writer.try_send(WriterMessage::Control(Box::new(move |c| { let _ = tx.send(run(c)); })))
-            .map_err(|e| InstanceError::Store(format!("test control admission: {e}")))?;
+        self.send_control(WriterMessage::Control(Box::new(move |c| { let _ = tx.send(run(c)); })))?;
         rx.recv_timeout(Duration::from_secs(10)).map_err(|e| InstanceError::Store(e.to_string()))?
             .map_err(InstanceError::Store)
+    }
+
+    #[cfg(feature = "test-api")]
+    fn send_control(&self, message: WriterMessage) -> Result<(), InstanceError> {
+        let shared = &self.handle.shared;
+        let _state = lock(&shared.state);
+        self.handle.writer.try_send(message).map_err(|e| InstanceError::Store(format!("test control admission: {e}")))?;
+        shared.writer_ready.notify_one();
+        Ok(())
     }
 
     #[cfg(feature = "test-api")]

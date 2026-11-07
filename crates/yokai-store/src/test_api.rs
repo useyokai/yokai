@@ -39,6 +39,8 @@ impl Pause {
 }
 impl Drop for Pause { fn drop(&mut self) { self.released.store(true, std::sync::atomic::Ordering::Release); } }
 pub fn block_writer(instance: &Instance) -> Result<Pause, InstanceError> { instance.runtime.block_writer() }
+/// Observe the next idle wait, extended to make queue wakeups testable without a millisecond race.
+pub fn observe_writer_idle(instance: &Instance) -> Result<(), InstanceError> { instance.runtime.observe_writer_idle() }
 pub fn read_probe(instance: &Instance, deadline: std::time::Instant, steps: u32, rows: u32, gap: std::time::Duration) -> Result<crate::PendingRead, crate::ReadError> {
     instance.store().read_probe(deadline, steps, rows, gap)
 }

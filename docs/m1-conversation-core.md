@@ -43,8 +43,9 @@ disconnects. The run becomes failed when the failure transaction commits.
 An adapter failure also leaves no committed assistant message. Read progress
 while the fake runs and wait separately for the terminal decision.
 
-The writer reserves four queue slots for terminal writes, so ordinary queue
-saturation cannot refuse a worker's completion. It commits the final message,
+The writer reserves four queue slots for admitted fake workers. Confirmed
+admission grants one terminal submission per worker. Completion retries use
+the ordinary queue, and arrivals on either queue wake the writer. It commits the final message,
 run and job state, slot release and completion event together. A store error
 retains its `NotApplied` or `OutcomeUnknown` evidence. A caller wait timeout
 leaves a handed-off operation eligible to finish. Resolve ambiguity through the original command identity

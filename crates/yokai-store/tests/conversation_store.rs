@@ -50,6 +50,13 @@ fn complete(handle: &StoreHandle, request: CompleteFakeRun) -> Decision {
     handle.complete_fake_run(request, deadline()).unwrap().wait(deadline()).unwrap()
 }
 
+fn worker(handle: &StoreHandle, request: SubmitMessage) -> store::WorkerCompletion {
+    match handle.submit_worker_message(request, deadline()).unwrap().wait(deadline()).unwrap() {
+        store::FakeAdmission::Accepted(permit) => permit,
+        store::FakeAdmission::Decision(decision) => panic!("expected a worker permit, got {decision:?}"),
+    }
+}
+
 fn admission() {
     let instance = fixture("admission", 64);
     let handle = instance.store();
@@ -175,31 +182,66 @@ fn certainty() {
 }
 
 fn completion_capacity() {
-    let instance = fixture("completion-capacity", 1);
+    let instance = fixture("completion-capacity", 4);
     let handle = instance.store();
-    for n in 1..=5 {
+    for n in 1..=6 {
         assert!(matches!(create(&handle, id(n), &format!("create-{n}")), Decision::Created { .. }));
     }
-    let tickets: Vec<_> = (1..=4).map(|n| {
-        accepted(submit(&handle, request(id(n), n, &format!("submit-{n}"), "hello")))
+    let retired = accepted(submit(&handle, request(id(6), 6, "retired", "hi")));
+    let retired_response = completion(retired, 16, "fake: hi");
+    assert_eq!(complete(&handle, retired_response.clone()), Decision::Completed { run_id: retired.run_id });
+    let permits: Vec<_> = (1..=4).map(|n| {
+        worker(&handle, request(id(n), n, &format!("submit-{n}"), "hello"))
     }).collect();
+    let duplicate = handle.submit_worker_message(request(id(1), 1, "submit-1", "hello"), deadline())
+        .unwrap().wait(deadline()).unwrap();
+    assert!(matches!(duplicate, store::FakeAdmission::Decision(Decision::Duplicate { state: RunState::Open, .. })));
     assert_eq!(submit(&handle, request(id(5), 5, "fifth", "hi")), Decision::Busy);
 
     let blocker = store::test_api::block_writer(&instance).unwrap();
-    let ordinary = handle.submit_health_check(deadline()).unwrap();
-    let overloaded = handle.submit_health_check(deadline()).err().unwrap();
-    assert_eq!((overloaded.certainty, overloaded.reason), (Certainty::NotApplied, WriteReason::Overloaded));
-    let completions: Vec<_> = tickets.iter().enumerate().map(|(n, &ticket)| {
-        handle.complete_fake_run(completion(ticket, 10 + n as u8, "fake: hello"), deadline()).unwrap()
+    let retries: Vec<_> = (0..4).map(|_| {
+        handle.complete_fake_run(retired_response.clone(), deadline()).unwrap()
     }).collect();
-    let excess = handle.complete_fake_run(completion(tickets[0], 10, "fake: hello"), deadline()).err().unwrap();
+    let completions: Vec<_> = permits.into_iter().enumerate().map(|(n, permit)| {
+        let ticket = permit.ticket();
+        let pending = permit.submit(completion(ticket, 10 + n as u8, "fake: hello").outcome, deadline()).unwrap();
+        (ticket, pending)
+    }).collect();
+    let excess = handle.submit_health_check(deadline()).err().unwrap();
     assert_eq!((excess.certainty, excess.reason), (Certainty::NotApplied, WriteReason::Overloaded));
     drop(blocker);
-    for (pending, ticket) in completions.into_iter().zip(tickets) {
+    for (ticket, pending) in completions {
         assert_eq!(pending.wait(deadline()).unwrap(), Decision::Completed { run_id: ticket.run_id });
     }
-    ordinary.wait(deadline()).unwrap();
-    accepted(submit(&handle, request(id(5), 5, "fifth", "hi")));
+    for retry in retries {
+        assert_eq!(retry.wait(deadline()).unwrap(), Decision::Duplicate { run_id: retired.run_id, state: RunState::Completed });
+    }
+    let permit = worker(&handle, request(id(5), 5, "fifth", "hi"));
+    let ticket = permit.ticket();
+    let collision = completion(ticket, 16, "fake: hi").outcome;
+    assert_eq!(permit.submit(collision, deadline()).unwrap().wait(deadline()).unwrap(),
+        Decision::Failed { run_id: ticket.run_id, reason: yokai_types::FakeFailure::InvalidResponse });
+    accepted(submit(&handle, request(id(5), 7, "after-collision", "hi")));
+    instance.close().unwrap();
+}
+
+fn writer_wakes_for_both_queues() {
+    let instance = fixture("writer-wakeup", 4);
+    let handle = instance.store();
+    let conversation = id(1);
+    create(&handle, conversation, "create");
+    let permit = worker(&handle, request(conversation, 2, "submit", "hi"));
+    let ticket = permit.ticket();
+
+    store::test_api::observe_writer_idle(&instance).unwrap();
+    let operation_deadline = Instant::now() + Duration::from_millis(500);
+    handle.submit_health_check(operation_deadline).unwrap().wait(deadline()).unwrap();
+
+    store::test_api::observe_writer_idle(&instance).unwrap();
+    let operation_deadline = Instant::now() + Duration::from_millis(500);
+    let done = permit.submit(completion(ticket, 3, "fake: hi").outcome, operation_deadline)
+        .unwrap().wait(deadline()).unwrap();
+    assert_eq!(done, Decision::Completed { run_id: ticket.run_id });
     instance.close().unwrap();
 }
 
@@ -291,12 +333,14 @@ fn main() -> ExitCode {
     let protection = yokai_testsupport::make_non_dumpable();
     println!("{}", protection.line());
     if !protection.permits_checks() { return ExitCode::FAILURE; }
-    for (id, check) in [("M1-ADMIT", admission as fn()), ("M1-RACE", concurrency), ("M1-CERTAINTY", certainty), ("M1-COMPLETION-CAPACITY", completion_capacity), ("M1-TIMEOUT", wait_timeout), ("M1-REPLAY", replay_pages)] {
+    let mut failed = false;
+    for (id, check) in [("M1-ADMIT", admission as fn()), ("M1-RACE", concurrency), ("M1-CERTAINTY", certainty), ("M1-COMPLETION-CAPACITY", completion_capacity), ("M1-WRITER-WAKEUP", writer_wakes_for_both_queues), ("M1-TIMEOUT", wait_timeout), ("M1-REPLAY", replay_pages)] {
         if std::panic::catch_unwind(check).is_err() {
             println!("CHECK {id} FAIL");
-            return ExitCode::FAILURE;
+            failed = true;
+        } else {
+            println!("CHECK {id} PASS");
         }
-        println!("CHECK {id} PASS");
     }
-    ExitCode::SUCCESS
+    if failed { ExitCode::FAILURE } else { ExitCode::SUCCESS }
 }

@@ -3,10 +3,10 @@ use std::fmt;
 use std::sync::{Arc, Mutex, MutexGuard, mpsc};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
-use yokai_store::{Instance, InstanceError, ReadError, StoreHandle, WriteFailure};
+use yokai_store::{FakeAdmission, Instance, InstanceError, ReadError, StoreHandle, WorkerCompletion, WriteFailure};
 use yokai_types::{
-    CompleteFakeRun, ConversationDecision as Decision, ConversationId, ConversationState,
-    CreateConversation, FakeFailure, FakeOutcome, MAX_ACTIVE_RUNS, MessageId, PROGRESS_CAPACITY,
+    ConversationDecision as Decision, ConversationId, ConversationState,
+    CreateConversation, MAX_ACTIVE_RUNS, MessageId, PROGRESS_CAPACITY,
     ReplayCursor, ReplayPage, RunTicket, SubmitMessage,
 };
 
@@ -196,17 +196,17 @@ impl ConversationClient {
         if gate.closing || gate.panicked {
             return Err(ClientError::Closing);
         }
-        let pending = self.store.submit_message(request.clone(), deadline)?;
+        let pending = self.store.submit_worker_message(request.clone(), deadline)?;
         drop(gate);
-        let decision = pending.wait(deadline)?;
-        let Decision::Accepted(ticket) = decision else {
+        Ok(match pending.wait(deadline)? {
+            FakeAdmission::Accepted(worker) => self.start(worker, request, assistant_id, deadline),
             // Duplicate and refusal decisions carry no authority to start a fake.
-            return Ok(Submission::Decision(decision));
-        };
-        Ok(self.start(ticket, request, assistant_id, deadline))
+            FakeAdmission::Decision(decision) => Submission::Decision(decision),
+        })
     }
 
-    fn start(&self, ticket: RunTicket, request: SubmitMessage, assistant_id: MessageId, deadline: Instant) -> Submission {
+    fn start(&self, completion_permit: WorkerCompletion, request: SubmitMessage, assistant_id: MessageId, deadline: Instant) -> Submission {
+        let ticket = completion_permit.ticket();
         let mut gate = loop {
             let mut gate = self.dispatch();
             gate.reap();
@@ -227,13 +227,12 @@ impl ConversationClient {
 
         let (chunks, progress) = mpsc::sync_channel(PROGRESS_CAPACITY);
         let (terminal, completion) = mpsc::sync_channel(1);
-        let store = self.store.clone();
         let model = self.model.clone();
         let worker = thread::Builder::new().name(format!("yokai-fake-{}", ticket.run_id)).spawn(move || {
             let outcome = model.run(&request, assistant_id, &chunks, deadline);
             drop(chunks);
             let Some(outcome) = outcome else { return; };
-            let result = finish(&store, CompleteFakeRun { ticket, outcome }, deadline);
+            let result = completion_permit.submit(outcome, deadline).and_then(|pending| pending.wait(deadline));
             let _ = terminal.send(result);
         });
         match worker {
@@ -252,17 +251,4 @@ impl ConversationClient {
     pub fn replay_events(&self, id: ConversationId, cursor: ReplayCursor, limit: usize, deadline: Instant) -> Result<ReplayPage, ReadError> {
         self.store.replay_events(id, cursor, limit, deadline)?.wait(deadline)
     }
-}
-
-fn finish(store: &StoreHandle, request: CompleteFakeRun, deadline: Instant) -> Result<Decision, WriteFailure> {
-    let ticket = request.ticket;
-    let response = matches!(request.outcome, FakeOutcome::Response(_));
-    let decision = store.complete_fake_run(request, deadline)?.wait(deadline)?;
-    if response && decision == Decision::Conflict {
-        // A caller-supplied assistant ID can collide. A confirmed refusal left
-        // this run open, so a terminal failure can still release its slot.
-        let request = CompleteFakeRun { ticket, outcome: FakeOutcome::Failed(FakeFailure::InvalidResponse) };
-        return store.complete_fake_run(request, deadline)?.wait(deadline);
-    }
-    Ok(decision)
 }

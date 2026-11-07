@@ -162,6 +162,25 @@ fn message(conn: &Connection, shared: &Shared, message: WriterMessage) {
         }
     }
 }
+fn next_write(
+    receiver: &mpsc::Receiver<WriterMessage>,
+    terminal: &mpsc::Receiver<WriterMessage>,
+    shared: &Shared,
+) -> Option<WriterMessage> {
+    // Producers enqueue and signal under the same mutex. Checking both queues
+    // before atomically entering the wait prevents a missed terminal wakeup.
+    let state = lock(&shared.state);
+    if shared.closing.load(Ordering::Acquire) { return None; }
+    let take = || terminal.try_recv().or_else(|_| receiver.try_recv()).ok();
+    if let Some(request) = take() {
+        return Some(request);
+    }
+    let (_state, _) = shared.writer_ready.wait_timeout(state, shared.writer_idle_wait())
+        .unwrap_or_else(|poison| poison.into_inner());
+    if shared.closing.load(Ordering::Acquire) { return None; }
+    take()
+}
+
 pub(super) fn run(
     conn: Connection,
     receiver: mpsc::Receiver<WriterMessage>,
@@ -172,16 +191,14 @@ pub(super) fn run(
     worker(&shared, "writer");
     let mut idle = Instant::now();
     while !shared.closing.load(Ordering::Acquire) {
-        // A completed fake should release its durable slot ahead of more admissions.
-        let next = terminal.try_recv().map_or_else(|_| receiver.recv_timeout(Duration::from_millis(10)), Ok);
-        match next {
-            Ok(request) => { message(&conn, &shared, request); observe_wal(&shared, &wal); idle = Instant::now(); }
-            Err(mpsc::RecvTimeoutError::Timeout) => {
+        match next_write(&receiver, &terminal, &shared) {
+            Some(request) => { message(&conn, &shared, request); observe_wal(&shared, &wal); idle = Instant::now(); }
+            None => {
+                if shared.closing.load(Ordering::Acquire) { break; }
                 if idle.elapsed() >= Duration::from_secs(1) && shared.status() != StoreState::Failed {
                     checkpoint(&conn, &shared, &wal); idle = Instant::now();
                 }
             }
-            Err(mpsc::RecvTimeoutError::Disconnected) => break,
         }
     }
     while let Ok(request) = terminal.try_recv() { message(&conn, &shared, request); }

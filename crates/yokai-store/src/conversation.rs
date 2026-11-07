@@ -8,7 +8,7 @@ use yokai_types::{
     ReplayCursor, ReplayPage, RunState, RunTicket, SubmitMessage,
 };
 
-use crate::{AcceptOutcome, CommandRequest, PendingWrite, WriteFailure, durable};
+use crate::{AcceptOutcome, CommandRequest, PendingWrite, StoreHandle, WriteFailure, durable};
 
 const CREATE: &str = "conversation.create";
 const SUBMIT: &str = "conversation.submit";
@@ -34,10 +34,47 @@ impl PendingConversation {
     }
 }
 
+/// Admission requested by the runtime that owns fake dispatch.
+pub struct PendingFakeRun {
+    pub(crate) pending: PendingConversation,
+    pub(crate) store: StoreHandle,
+}
+
+pub enum FakeAdmission {
+    Accepted(WorkerCompletion),
+    Decision(Decision),
+}
+
+impl PendingFakeRun {
+    pub fn wait(self, deadline: Instant) -> Result<FakeAdmission, WriteFailure> {
+        Ok(match self.pending.wait(deadline)? {
+            Decision::Accepted(ticket) => FakeAdmission::Accepted(WorkerCompletion { store: self.store, ticket }),
+            decision => FakeAdmission::Decision(decision),
+        })
+    }
+}
+
+/// One reserved terminal submission for a freshly accepted fake run.
+/// Duplicates resolve through the ordinary store queue.
+pub struct WorkerCompletion {
+    store: StoreHandle,
+    ticket: RunTicket,
+}
+
+impl WorkerCompletion {
+    pub fn ticket(&self) -> RunTicket { self.ticket }
+
+    pub fn submit(self, outcome: FakeOutcome, deadline: Instant) -> Result<PendingConversation, WriteFailure> {
+        let request = CompleteFakeRun { ticket: self.ticket, outcome };
+        self.store.submit_conversation(ConversationWrite::CompleteWorker(request), deadline)
+    }
+}
+
 pub(crate) enum ConversationWrite {
     Create(CreateConversation),
     Submit(SubmitMessage),
     Complete(CompleteFakeRun),
+    CompleteWorker(CompleteFakeRun),
 }
 
 impl ConversationWrite {
@@ -45,7 +82,8 @@ impl ConversationWrite {
         match self {
             Self::Create(request) => create(conn, request),
             Self::Submit(request) => submit(conn, instance_id, request),
-            Self::Complete(request) => complete(conn, instance_id, request),
+            Self::Complete(request) => complete(conn, instance_id, request, false),
+            Self::CompleteWorker(request) => complete(conn, instance_id, request, true),
         }
     }
 }
@@ -123,7 +161,12 @@ fn submit(conn: &Connection, instance_id: InstanceId, request: &SubmitMessage) -
     Ok((Decision::Accepted(RunTicket { instance_id, conversation_id: request.conversation_id, run_id, epoch }), true))
 }
 
-fn complete(conn: &Connection, instance_id: InstanceId, request: &CompleteFakeRun) -> rusqlite::Result<(Decision, bool)> {
+fn complete(
+    conn: &Connection,
+    instance_id: InstanceId,
+    request: &CompleteFakeRun,
+    worker: bool,
+) -> rusqlite::Result<(Decision, bool)> {
     let RunTicket { instance_id: source, conversation_id, run_id, epoch } = request.ticket;
     if source != instance_id {
         return Ok((Decision::StaleRun, false));
@@ -141,10 +184,9 @@ fn complete(conn: &Connection, instance_id: InstanceId, request: &CompleteFakeRu
                  WHERE run_id=?1 AND role='assistant' AND message_id=?2 AND body=?3)",
                 params![run_id, response.message_id.as_bytes().as_slice(), response.text()], |row| row.get(0),
             )?,
-            (FakeOutcome::Failed(reason), RunState::Failed) => conn.query_row(
-                "SELECT EXISTS(SELECT 1 FROM events WHERE run_id=?1 AND kind=?2 AND detail=?3)",
-                params![run_id, FAILED, failure_name(*reason)], |row| row.get(0),
-            )?,
+            (FakeOutcome::Failed(reason), RunState::Failed) => failure_matches(conn, run_id, *reason)?,
+            (FakeOutcome::Response(_), RunState::Failed) if worker =>
+                failure_matches(conn, run_id, FakeFailure::InvalidResponse)?,
             _ => false,
         };
         return Ok((if equivalent { Decision::Duplicate { run_id, state } } else { Decision::Conflict }, false));
@@ -154,11 +196,20 @@ fn complete(conn: &Connection, instance_id: InstanceId, request: &CompleteFakeRu
         return Ok((Decision::StaleRun, false));
     }
 
-    let decision = match &request.outcome {
-        FakeOutcome::Response(response) => {
-            if message_exists(conn, response.message_id)? {
+    // A worker has one terminal submission. Resolve an assistant ID collision
+    // as a failed run in this transaction so it can release its slot.
+    let invalid_response = FakeOutcome::Failed(FakeFailure::InvalidResponse);
+    let outcome = match &request.outcome {
+        FakeOutcome::Response(response) if message_exists(conn, response.message_id)? => {
+            if !worker {
                 return Ok((Decision::Conflict, false));
             }
+            &invalid_response
+        }
+        outcome => outcome,
+    };
+    let decision = match outcome {
+        FakeOutcome::Response(response) => {
             insert_message(conn, run_id, response.message_id, "assistant", response.text())?;
             finish_records(conn, run_id, "Completed", "Done")?;
             event(conn, run_id, COMPLETED, "", epoch)?;
@@ -172,6 +223,13 @@ fn complete(conn: &Connection, instance_id: InstanceId, request: &CompleteFakeRu
     };
     changed_one(conn.execute("UPDATE conversation_runs SET active=0 WHERE run_id=?1 AND active=1", [run_id])?)?;
     Ok((decision, true))
+}
+
+fn failure_matches(conn: &Connection, run_id: i64, reason: FakeFailure) -> rusqlite::Result<bool> {
+    conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM events WHERE run_id=?1 AND kind=?2 AND detail=?3)",
+        params![run_id, FAILED, failure_name(reason)], |row| row.get(0),
+    )
 }
 
 fn admit_records(conn: &Connection, run_id: i64, epoch: i64, owner: &str) -> rusqlite::Result<()> {
