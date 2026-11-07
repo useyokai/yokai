@@ -1,7 +1,7 @@
 use std::fmt;
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant};
-use yokai_types::InstanceId;
+use yokai_types::{ConversationDecision, ConversationState, InstanceId, ReplayPage};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StoreState { Running, Degraded, Failed, ShuttingDown, Closed }
@@ -36,6 +36,12 @@ impl WriteFailure {
     pub(crate) fn queued(id: Option<u64>, reason: WriteReason) -> Self {
         Self { operation_id: id, certainty: Certainty::NotApplied, reason, evidence: WriteEvidence::queued() }
     }
+    pub(crate) fn missing_reply(id: u64) -> Self {
+        let mut evidence = WriteEvidence::queued();
+        evidence.phase = Phase::Done;
+        Self { operation_id: Some(id), certainty: Certainty::OutcomeUnknown,
+            reason: WriteReason::WriterGone, evidence }
+    }
 }
 impl fmt::Display for WriteFailure {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -46,21 +52,39 @@ impl std::error::Error for WriteFailure {}
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct WriteSuccess {
     pub operation_id: u64,
-    /// Worker-confirmed command decision; health maintenance returns None.
+    /// Worker-confirmed opaque command decision. Other operations return None here.
     pub command: Option<crate::AcceptOutcome>,
 }
 pub type WriteResult = Result<WriteSuccess, WriteFailure>;
+pub(crate) enum WriteValue {
+    Maintenance,
+    Command(crate::AcceptOutcome),
+    Conversation(ConversationDecision),
+}
+impl WriteValue {
+    pub(crate) fn success(&self, operation_id: u64) -> WriteSuccess {
+        let command = match self { Self::Command(decision) => Some(*decision), _ => None };
+        WriteSuccess { operation_id, command }
+    }
+    pub(crate) fn conversation(self) -> Option<ConversationDecision> {
+        match self { Self::Conversation(decision) => Some(decision), _ => None }
+    }
+}
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Completion { pub operation_id: u64, pub phase: Phase, pub result: WriteResult }
 pub struct PendingWrite {
     pub(crate) id: u64,
-    pub(crate) reply: mpsc::Receiver<WriteResult>,
+    pub(crate) reply: mpsc::Receiver<Result<WriteValue, WriteFailure>>,
     pub(crate) progress: Arc<Mutex<WriteEvidence>>,
 }
 impl PendingWrite {
     pub fn operation_id(&self) -> u64 { self.id }
     /// A caller wait timeout cannot cancel a handed-off write or infer NotApplied.
     pub fn wait(self, deadline: Instant) -> WriteResult {
+        let id = self.id;
+        self.wait_value(deadline).map(|value| value.success(id))
+    }
+    pub(crate) fn wait_value(self, deadline: Instant) -> Result<WriteValue, WriteFailure> {
         match self.reply.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
             Ok(result) => result,
             Err(error) => {
@@ -82,21 +106,27 @@ pub struct InstanceMetadata {
     pub last_health_check: Option<String>,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ReadError { Overloaded, Expired, WaitExpired, Interrupted, Failed, ShuttingDown, StorageError, Corrupt, Invalid }
+pub enum ReadError { Overloaded, Expired, WaitExpired, Interrupted, Failed, ShuttingDown, StorageError, Corrupt, Invalid, NotFound, InvalidCursor }
 impl fmt::Display for ReadError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { write!(f, "read: {self:?}") }
 }
 impl std::error::Error for ReadError {}
-pub struct PendingRead {
-    pub(crate) id: u64,
-    pub(crate) reply: mpsc::Receiver<Result<InstanceMetadata, ReadError>>,
+pub(crate) enum ReadValue {
+    Metadata(InstanceMetadata),
+    Conversation(Option<ConversationState>),
+    Replay(ReplayPage),
 }
-impl PendingRead {
+pub struct PendingRead<T = InstanceMetadata> {
+    pub(crate) id: u64,
+    pub(crate) reply: mpsc::Receiver<Result<ReadValue, ReadError>>,
+    pub(crate) extract: fn(ReadValue) -> Option<T>,
+}
+impl<T> PendingRead<T> {
     pub fn query_id(&self) -> u64 { self.id }
-    pub fn wait(self, deadline: Instant) -> Result<InstanceMetadata, ReadError> {
+    pub fn wait(self, deadline: Instant) -> Result<T, ReadError> {
         self.reply.recv_timeout(deadline.saturating_duration_since(Instant::now())).unwrap_or_else(|error| {
             Err(if matches!(error, mpsc::RecvTimeoutError::Timeout) { ReadError::WaitExpired } else { ReadError::Failed })
-        })
+        }).and_then(|value| (self.extract)(value).ok_or(ReadError::Failed))
     }
 }
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]

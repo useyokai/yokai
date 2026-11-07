@@ -121,6 +121,10 @@ pub fn create_instance(parent: &Path) -> Result<Instance, InstanceError> {
     create_instance_with_options(parent, crate::StoreOptions::default())
 }
 pub fn create_instance_with_options(parent: &Path, options: crate::StoreOptions) -> Result<Instance, InstanceError> {
+    create_with_plan(parent, options, crate::schema::production())
+}
+
+pub(crate) fn create_with_plan(parent: &Path, options: crate::StoreOptions, plan: crate::schema::Plan) -> Result<Instance, InstanceError> {
     options.validate()?;
     let parent = yokai_platform::location::validate_parent(parent).map_err(|e| path_error(e, true))?;
     let id = chosen_identity()?;
@@ -143,7 +147,7 @@ pub fn create_instance_with_options(parent: &Path, options: crate::StoreOptions)
     hit_failpoint("after-db")?;
 
     let created = utc_timestamp().map_err(InstanceError::Identity)?;
-    crate::schema::migrate_new(&mut connection,id,&created)?;
+    crate::schema::migrate_new(&mut connection,id,&created,plan)?;
     hit_failpoint("after-migration")?;
     write_identity(&root.join("instance.id"), id, &created)?;
     yokai_platform::location::flush_directory(&root)
@@ -394,4 +398,10 @@ impl Instance {
     /// Rejects new/queued work, joins workers and closes all connections before releasing ownership.
     /// A close deadline failure deliberately retains the lock until process exit.
     pub fn close(mut self) -> Result<(), InstanceError> { self.runtime.close() }
+
+    /// The caller may shorten the configured close timeout. A failed close
+    /// retains ownership under the same rules as `close`.
+    pub fn close_before(mut self, deadline: std::time::Instant) -> Result<(), InstanceError> {
+        self.runtime.close_before(deadline)
+    }
 }

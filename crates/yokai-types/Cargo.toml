@@ -14,3 +14,11 @@ autobenches = false
 [lib]
 test = false
 doctest = false
+
+[dev-dependencies]
+yokai-testsupport.workspace = true
+
+[[test]]
+name = "conversation_types"
+path = "tests/conversation_types.rs"
+harness = false

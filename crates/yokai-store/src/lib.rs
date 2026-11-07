@@ -7,6 +7,8 @@ pub(crate) use connection::{create_file, init_connection, foreign_key_violations
 mod runtime;
 mod durable;
 pub use durable::{CommandRequest,InvalidCommand,AcceptOutcome,PendingCommand};
+mod conversation;
+pub use conversation::{FakeAdmission, PendingConversation, PendingFakeRun, WorkerCompletion};
 mod startup;
 pub use startup::StartupReport;
 pub use runtime::{StoreHandle, StoreOptions, StoreState, Phase, Certainty, WriteReason,

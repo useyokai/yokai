@@ -4,6 +4,9 @@
 use std::fmt;
 use std::str::FromStr;
 
+mod conversation;
+pub use conversation::*;
+
 /// Identity of one Yokai Instance: 16 bytes chosen when the Instance is created.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct InstanceId([u8; 16]);

@@ -1,8 +1,7 @@
 # Contributing
 
-The current checkpoint is the storage foundation through PR #23, recorded on
-2026-10-17. Keep changes small and reviewable, and describe the behavior and
-validation scope a reviewer can establish from the change.
+Keep changes small and reviewable, and describe the behavior and validation
+scope a reviewer can establish from the change.
 
 ## Windows build prerequisites
 
@@ -22,14 +21,16 @@ From the repository root in the configured native developer environment:
 
 ```powershell
 cargo check --workspace --all-targets --offline --locked --frozen -j 4
-cargo check --workspace --all-targets --features yokai-store/test-api --offline --locked --frozen -j 4
+cargo check --workspace --all-targets --features yokai-store/test-api,yokai-exec/test-api --offline --locked --frozen -j 4
 cargo build --workspace --release --offline --locked --frozen -j 4
 ```
 
 The default checks omit custom targets that require `test-api`. The second
-command compiles those targets without executing them. These command profiles
-passed in the recorded Windows checkpoint; this documentation change does not
-run them again.
+command compiles those targets without executing them.
+
+See the [conversation core guide](docs/m1-conversation-core.md) for the headless
+example and the [focused harnesses](crates/yokai-store/tests/README.md#focused-conversation-checks)
+for checks that use fresh synthetic data.
 
 ## Running storage checks
 

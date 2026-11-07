@@ -62,3 +62,15 @@ name = "windows_validation"
 path = "tests/windows_validation.rs"
 harness = false
 required-features = ["test-api"]
+
+[[test]]
+name = "conversation_migrations"
+path = "tests/conversation_migrations.rs"
+harness = false
+required-features = ["test-api"]
+
+[[test]]
+name = "conversation_store"
+path = "tests/conversation_store.rs"
+harness = false
+required-features = ["test-api"]

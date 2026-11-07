@@ -29,19 +29,28 @@ fn main() -> ExitCode {
         ("WR-9", writer_panics), ("WR-10", busy_binding), ("WR-13", corrupt_binding),
         ("WR-BOUNDS", bounds_and_drop),
     ];
+    let selected = match args.as_slice() {
+        [_] => None,
+        [_, flag, id] if flag == "--only" && checks.iter().any(|(known, _)| *known == id) => Some(id.as_str()),
+        _ => {
+            eprintln!("expected no arguments or --only <known check ID>");
+            return ExitCode::from(2);
+        }
+    };
+    let count = if selected.is_some() { 1 } else { checks.len() };
     println!("INFO WR-7 not_run: real ENOSPC requires a separately bounded size-limited tmpfs profile; max_page_count is simulated FULL only");
     println!("INFO FC-14 deferred: command identity and idempotent domain operations are outside the V1 storage API");
-    for (id, run) in checks {
+    for (id, run) in checks.iter().filter(|(id, _)| selected.is_none_or(|selected| *id == selected)) {
         match run() {
             Ok(detail) => println!("CHECK {id} PASS {detail}"),
             Err(error) => {
                 println!("CHECK {id} FAIL {error}");
-                println!("RESULT FAIL 1/{}", checks.len());
+                println!("RESULT FAIL 1/{count}");
                 return ExitCode::FAILURE;
             }
         }
     }
-    println!("RESULT PASS {}/{}", checks.len(), checks.len());
+    println!("RESULT PASS {count}/{count}");
     ExitCode::SUCCESS
 }
 fn review_regressions() -> Result<String, String> {

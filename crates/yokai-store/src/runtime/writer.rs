@@ -41,7 +41,7 @@ fn observe_wal(shared: &Shared, wal: &Path) {
     state.metrics.wal_size_verified = sample.1;
     state.metrics.wal_sampled_at = Some(Instant::now());
 }
-fn health(conn: &Connection, shared: &Shared, request: &WriteRequest) -> WriteResult {
+fn execute_write(conn: &Connection, shared: &Shared, request: &WriteRequest) -> Result<WriteValue, WriteFailure> {
     let health_generation = {
         // This short state-locked decision reserves the dequeued request as current work.
         // Close may then let it finish; requests still queued are rejected. Never hold the
@@ -54,7 +54,7 @@ fn health(conn: &Connection, shared: &Shared, request: &WriteRequest) -> WriteRe
         if Instant::now() >= request.deadline { return Err(WriteFailure::queued(Some(request.id), WriteReason::Expired)); }
         state.degradation_generation
     };
-    let execute = || -> Result<Option<crate::AcceptOutcome>, OperationError> {
+    let execute = || -> Result<WriteValue, OperationError> {
         #[cfg(feature = "test-api")]
         if let Some(fault) = request.work.fault() {
             match fault { WriteFault::PanicQueued => panic!("test-api panic before BEGIN"),
@@ -65,17 +65,24 @@ fn health(conn: &Connection, shared: &Shared, request: &WriteRequest) -> WriteRe
         lock(&request.progress).phase = Phase::Begun;
         #[cfg(feature="test-api")]
         if matches!(request.work.fault(),Some(WriteFault::PanicBegun)){panic!("test-api panic after BEGIN");}
-        let command=if let WriteWork::Accept{command,..}=&request.work {
-            let (outcome,commit)=crate::durable::accept(conn,command)?;
-            if !commit {
-                #[cfg(feature="test-api")]
-                if let Some(WriteFault::RollbackFailure(code))=request.work.fault(){return Err(injected(*code).into());}
-                conn.execute_batch("ROLLBACK")?;
-                if !conn.is_autocommit(){return Err(rusqlite::Error::InvalidQuery.into());}
-                return Ok(Some(outcome));
+        let (value, commit) = match &request.work {
+            WriteWork::Accept { command, .. } => {
+                let (outcome, commit) = crate::durable::accept(conn, command)?;
+                (WriteValue::Command(outcome), commit)
             }
-            Some(outcome)
-        } else {None};
+            WriteWork::Conversation { request, .. } => {
+                let (outcome, commit) = request.apply(conn, shared.instance_id)?;
+                (WriteValue::Conversation(outcome), commit)
+            }
+            _ => (WriteValue::Maintenance, true),
+        };
+        if !commit {
+            #[cfg(feature="test-api")]
+            if let Some(WriteFault::RollbackFailure(code))=request.work.fault(){return Err(injected(*code).into());}
+            conn.execute_batch("ROLLBACK")?;
+            if !conn.is_autocommit(){return Err(rusqlite::Error::InvalidQuery.into());}
+            return Ok(value);
+        }
         if request.work.is_health() {
                 let stamp = crate::instance::utc_timestamp().map_err(|_| rusqlite::Error::InvalidQuery)?;
                 if conn.execute("UPDATE instance_meta SET last_health_check=?1 WHERE id=1", [stamp])? != 1 {
@@ -114,10 +121,10 @@ fn health(conn: &Connection, shared: &Shared, request: &WriteRequest) -> WriteRe
         }
         #[cfg(feature = "test-api")]
         if matches!(request.work.fault(),Some(WriteFault::PanicAfterCommit)){panic!("test-api panic after acknowledged COMMIT before reply");}
-        Ok(command)
+        Ok(value)
     };
     match execute() {
-        Ok(command) => {
+        Ok(value) => {
             if request.work.is_health() {
                 // This commit can recover only the generation it checked. A reader fault
                 // during or after the transaction requires a subsequent health commit.
@@ -126,14 +133,14 @@ fn health(conn: &Connection, shared: &Shared, request: &WriteRequest) -> WriteRe
                     state.status = StoreState::Running;
                 }
             }
-            Ok(WriteSuccess { operation_id: request.id, command }) }
+            Ok(value) }
         Err(error) => Err(failure::classify(conn, shared, request, &error)),
     }
 }
 fn message(conn: &Connection, shared: &Shared, message: WriterMessage) {
     match message {
         WriterMessage::Health(request) => {
-            let result = catch_unwind(AssertUnwindSafe(|| health(conn, shared, &request))).unwrap_or_else(|_| {
+            let result = catch_unwind(AssertUnwindSafe(|| execute_write(conn, shared, &request))).unwrap_or_else(|_| {
                 shared.change(StoreState::Failed);
                 let mut evidence = lock(&request.progress).clone();
                 evidence.autocommit_after_error = Some(conn.is_autocommit());
@@ -145,7 +152,7 @@ fn message(conn: &Connection, shared: &Shared, message: WriterMessage) {
                     certainty: if evidence.phase == Phase::Queued { Certainty::NotApplied } else { Certainty::OutcomeUnknown },
                     reason: WriteReason::WriterGone, evidence })
             });
-            shared.complete(request.id, result.clone());
+            shared.complete(request.id, result.as_ref().map(|value| value.success(request.id)).map_err(Clone::clone));
             lock(&request.progress).phase = Phase::Done;
             let _ = request.reply.send(result);
         }
@@ -155,20 +162,46 @@ fn message(conn: &Connection, shared: &Shared, message: WriterMessage) {
         }
     }
 }
-pub(super) fn run(conn: Connection, receiver: mpsc::Receiver<WriterMessage>, shared: Arc<Shared>, wal: std::path::PathBuf) {
+fn next_write(
+    receiver: &mpsc::Receiver<WriterMessage>,
+    terminal: &mpsc::Receiver<WriterMessage>,
+    shared: &Shared,
+) -> Option<WriterMessage> {
+    // Producers enqueue and signal under the same mutex. Checking both queues
+    // before atomically entering the wait prevents a missed terminal wakeup.
+    let state = lock(&shared.state);
+    if shared.closing.load(Ordering::Acquire) { return None; }
+    let take = || terminal.try_recv().or_else(|_| receiver.try_recv()).ok();
+    if let Some(request) = take() {
+        return Some(request);
+    }
+    let (_state, _) = shared.writer_ready.wait_timeout(state, shared.writer_idle_wait())
+        .unwrap_or_else(|poison| poison.into_inner());
+    if shared.closing.load(Ordering::Acquire) { return None; }
+    take()
+}
+
+pub(super) fn run(
+    conn: Connection,
+    receiver: mpsc::Receiver<WriterMessage>,
+    terminal: mpsc::Receiver<WriterMessage>,
+    shared: Arc<Shared>,
+    wal: std::path::PathBuf,
+) {
     worker(&shared, "writer");
     let mut idle = Instant::now();
     while !shared.closing.load(Ordering::Acquire) {
-        match receiver.recv_timeout(Duration::from_millis(10)) {
-            Ok(request) => { message(&conn, &shared, request); observe_wal(&shared, &wal); idle = Instant::now(); }
-            Err(mpsc::RecvTimeoutError::Timeout) => {
+        match next_write(&receiver, &terminal, &shared) {
+            Some(request) => { message(&conn, &shared, request); observe_wal(&shared, &wal); idle = Instant::now(); }
+            None => {
+                if shared.closing.load(Ordering::Acquire) { break; }
                 if idle.elapsed() >= Duration::from_secs(1) && shared.status() != StoreState::Failed {
                     checkpoint(&conn, &shared, &wal); idle = Instant::now();
                 }
             }
-            Err(mpsc::RecvTimeoutError::Disconnected) => break,
         }
     }
+    while let Ok(request) = terminal.try_recv() { message(&conn, &shared, request); }
     while let Ok(request) = receiver.try_recv() { message(&conn, &shared, request); }
     while shared.readers_alive.load(Ordering::Acquire) != 0 { thread::sleep(Duration::from_millis(1)); }
     let final_checkpoint = {

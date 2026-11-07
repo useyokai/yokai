@@ -39,6 +39,8 @@ impl Pause {
 }
 impl Drop for Pause { fn drop(&mut self) { self.released.store(true, std::sync::atomic::Ordering::Release); } }
 pub fn block_writer(instance: &Instance) -> Result<Pause, InstanceError> { instance.runtime.block_writer() }
+/// Observe the next idle wait, extended to make queue wakeups testable without a millisecond race.
+pub fn observe_writer_idle(instance: &Instance) -> Result<(), InstanceError> { instance.runtime.observe_writer_idle() }
 pub fn read_probe(instance: &Instance, deadline: std::time::Instant, steps: u32, rows: u32, gap: std::time::Duration) -> Result<crate::PendingRead, crate::ReadError> {
     instance.store().read_probe(deadline, steps, rows, gap)
 }
@@ -71,6 +73,12 @@ pub struct WriteProbe { pub sql: String, pub fault: WriteFault }
 pub fn accept_command_fault(instance:&Instance,request:crate::CommandRequest,deadline:std::time::Instant,fault:WriteFault)->Result<crate::PendingCommand,crate::WriteFailure>{
     instance.store().command_fault(request,deadline,fault)
 }
+pub fn submit_message_fault(instance: &Instance, request: yokai_types::SubmitMessage, deadline: std::time::Instant, fault: WriteFault) -> Result<crate::PendingConversation, crate::WriteFailure> {
+    instance.store().conversation_fault(crate::conversation::ConversationWrite::Submit(request), deadline, fault)
+}
+pub fn complete_fake_run_fault(instance: &Instance, request: yokai_types::CompleteFakeRun, deadline: std::time::Instant, fault: WriteFault) -> Result<crate::PendingConversation, crate::WriteFailure> {
+    instance.store().conversation_fault(crate::conversation::ConversationWrite::Complete(request), deadline, fault)
+}
 pub fn write_probe(instance: &Instance, deadline: std::time::Instant, probe: WriteProbe) -> Result<crate::PendingWrite, crate::WriteFailure> {
     instance.store().write_probe(deadline, probe)
 }
@@ -85,6 +93,10 @@ pub fn hold_write(instance: &Instance, deadline: std::time::Instant, sql: &str) 
 }
 pub fn worker_threads(instance: &Instance) -> Vec<(String, String)> { instance.runtime.worker_threads() }
 pub fn open_test_versions(root:&Path,latest:u32,fail:bool)->Result<Instance,InstanceError>{crate::instance::open_with_plan(root,crate::schema::test_plan(latest,fail)?)}
+/// Create an actual V2 fixture using the historical migrations and normal Instance ownership.
+pub fn create_test_v2(parent: &Path) -> Result<Instance, InstanceError> {
+    crate::instance::create_with_plan(parent, crate::StoreOptions::default(), crate::schema::historical_v2())
+}
 pub fn lint_migration(sql:&str,version:u32)->Result<(),String>{crate::schema::lint(sql,version)}
 pub fn backup_warning_for_test(total:u64,threshold:u64)->bool{crate::snapshot::policy(total,threshold).warning}
 

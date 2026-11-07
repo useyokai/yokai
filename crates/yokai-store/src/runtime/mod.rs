@@ -7,7 +7,7 @@ pub use types::*;
 use std::collections::VecDeque;
 
 use std::path::Path;
-use std::sync::{Arc, Mutex, MutexGuard, mpsc};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, mpsc};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -15,6 +15,8 @@ use rusqlite::{Connection, OpenFlags};
 use rusqlite::config::DbConfig;
 use yokai_platform::InstanceLock;
 use crate::InstanceError;
+use crate::conversation::ConversationWrite;
+use yokai_types::{CompleteFakeRun, ConversationId, ConversationState, CreateConversation, MAX_ACTIVE_RUNS, MAX_REPLAY_EVENTS, ReplayCursor, ReplayPage, SubmitMessage};
 
 pub(crate) fn lock<T>(value: &Mutex<T>) -> MutexGuard<'_, T> {
     value.lock().unwrap_or_else(|poison| poison.into_inner())
@@ -31,6 +33,7 @@ struct State {
 pub(crate) struct Shared {
     instance_id: yokai_types::InstanceId,
     state: Mutex<State>,
+    writer_ready: Condvar,
     pub closing: AtomicBool,
     readers_alive: AtomicUsize,
     close_failed: Arc<AtomicBool>,
@@ -39,8 +42,18 @@ pub(crate) struct Shared {
     skip_checkpoint: AtomicBool,
     #[cfg(feature = "test-api")]
     read_events: Mutex<VecDeque<crate::test_api::ReaderEvent>>,
+    #[cfg(feature = "test-api")]
+    writer_idle_probe: Mutex<Option<mpsc::SyncSender<()>>>,
 }
 impl Shared {
+    fn writer_idle_wait(&self) -> Duration {
+        #[cfg(feature = "test-api")]
+        if let Some(ready) = lock(&self.writer_idle_probe).take() {
+            let _ = ready.try_send(());
+            return Duration::from_secs(2);
+        }
+        Duration::from_millis(10)
+    }
     fn status(&self) -> StoreState { lock(&self.state).status }
     fn change(&self, status: StoreState) {
         let mut state = lock(&self.state);
@@ -68,12 +81,13 @@ struct WriteRequest {
     id: u64,
     deadline: Instant,
     progress: Arc<Mutex<WriteEvidence>>,
-    reply: mpsc::SyncSender<WriteResult>,
+    reply: mpsc::SyncSender<Result<WriteValue, WriteFailure>>,
     work: WriteWork,
 }
 enum WriteWork {
     Health,
     Accept{command:crate::CommandRequest,#[cfg(feature="test-api")] fault:crate::test_api::WriteFault},
+    Conversation { request: ConversationWrite, #[cfg(feature="test-api")] fault: crate::test_api::WriteFault },
     #[cfg(feature = "test-api")]
     HealthPaused { ready: mpsc::SyncSender<()>, released: Arc<AtomicBool> },
     #[cfg(feature = "test-api")]
@@ -82,12 +96,12 @@ enum WriteWork {
 impl WriteWork {
     #[cfg(feature="test-api")]
     fn fault(&self)->Option<&crate::test_api::WriteFault>{match self{
-        Self::Probe(probe)=>Some(&probe.fault),Self::Accept{fault,..}=>Some(fault),_=>None,
+        Self::Probe(probe)=>Some(&probe.fault),Self::Accept{fault,..}|Self::Conversation{fault,..}=>Some(fault),_=>None,
     }}
     fn is_health(&self) -> bool {
         match self {
             Self::Health => true,
-            Self::Accept{..} => false,
+            Self::Accept{..} | Self::Conversation{..} => false,
             #[cfg(feature = "test-api")]
             Self::HealthPaused { .. } => true,
             #[cfg(feature = "test-api")]
@@ -109,10 +123,12 @@ struct ReadRequest {
     id: u64,
     deadline: Instant,
     work: ReadWork,
-    reply: mpsc::SyncSender<Result<InstanceMetadata, ReadError>>,
+    reply: mpsc::SyncSender<Result<ReadValue, ReadError>>,
 }
 enum ReadWork {
     Metadata,
+    Conversation(ConversationId),
+    Replay(ReplayCursor, usize),
     #[cfg(feature = "test-api")]
     Compute { steps: u32, rows: u32, gap: Duration },
     #[cfg(feature = "test-api")]
@@ -132,6 +148,7 @@ enum WriterMessage {
 pub struct StoreHandle {
     shared: Arc<Shared>,
     writer: mpsc::SyncSender<WriterMessage>,
+    terminal: mpsc::SyncSender<WriterMessage>,
     readers: Vec<mpsc::SyncSender<ReadRequest>>,
 }
 
@@ -143,6 +160,55 @@ fn write_refusal(status: StoreState) -> Option<WriteReason> {
     }
 }
 impl StoreHandle {
+    pub fn create_conversation(&self, request: CreateConversation, deadline: Instant) -> Result<crate::PendingConversation, WriteFailure> {
+        self.submit_conversation(ConversationWrite::Create(request), deadline)
+    }
+
+    pub fn submit_message(&self, request: SubmitMessage, deadline: Instant) -> Result<crate::PendingConversation, WriteFailure> {
+        self.submit_conversation(ConversationWrite::Submit(request), deadline)
+    }
+
+    /// The runtime requests a single worker permit with durable admission.
+    pub fn submit_worker_message(&self, request: SubmitMessage, deadline: Instant) -> Result<crate::PendingFakeRun, WriteFailure> {
+        let pending = self.submit_message(request, deadline)?;
+        Ok(crate::PendingFakeRun { pending, store: self.clone() })
+    }
+
+    pub fn complete_fake_run(&self, request: CompleteFakeRun, deadline: Instant) -> Result<crate::PendingConversation, WriteFailure> {
+        self.submit_conversation(ConversationWrite::Complete(request), deadline)
+    }
+
+    pub(crate) fn submit_conversation(&self, request: ConversationWrite, deadline: Instant) -> Result<crate::PendingConversation, WriteFailure> {
+        let inner = self.submit_write(deadline, WriteWork::Conversation {
+            request, #[cfg(feature="test-api")] fault: crate::test_api::WriteFault::None,
+        })?;
+        Ok(crate::PendingConversation { inner })
+    }
+
+    #[cfg(feature="test-api")]
+    pub(crate) fn conversation_fault(&self, request: ConversationWrite, deadline: Instant, fault: crate::test_api::WriteFault) -> Result<crate::PendingConversation, WriteFailure> {
+        let inner = self.submit_write(deadline, WriteWork::Conversation { request, fault })?;
+        Ok(crate::PendingConversation { inner })
+    }
+
+    pub fn read_conversation(&self, id: ConversationId, deadline: Instant) -> Result<PendingRead<Option<ConversationState>>, ReadError> {
+        self.submit_read_as(deadline, ReadWork::Conversation(id), |value| match value {
+            ReadValue::Conversation(state) => Some(state), _ => None,
+        })
+    }
+
+    pub fn replay_events(&self, id: ConversationId, cursor: ReplayCursor, limit: usize, deadline: Instant) -> Result<PendingRead<ReplayPage>, ReadError> {
+        if cursor.instance_id != self.shared.instance_id || cursor.conversation_id != id || cursor.after < 0 {
+            return Err(ReadError::InvalidCursor);
+        }
+        if !(1..=MAX_REPLAY_EVENTS).contains(&limit) {
+            return Err(ReadError::Invalid);
+        }
+        self.submit_read_as(deadline, ReadWork::Replay(cursor, limit), |value| match value {
+            ReadValue::Replay(page) => Some(page), _ => None,
+        })
+    }
+
     pub fn accept_command(&self,request:crate::CommandRequest,deadline:Instant)->Result<crate::PendingCommand,WriteFailure>{
         self.submit_write(deadline,WriteWork::Accept{command:request,#[cfg(feature="test-api")] fault:crate::test_api::WriteFault::None}).map(|inner|crate::PendingCommand{inner})
     }
@@ -176,11 +242,18 @@ impl StoreHandle {
         state.next_id = id.checked_add(1);
         let (tx, rx) = mpsc::sync_channel(1);
         let progress = Arc::new(Mutex::new(WriteEvidence::queued()));
-        self.writer.try_send(WriterMessage::Health(WriteRequest { id, deadline, progress: progress.clone(), reply: tx, work }))
+        // Only a consumed worker permit can use the reserved queue.
+        let sender = if matches!(&work, WriteWork::Conversation { request: ConversationWrite::CompleteWorker(_), .. }) {
+            &self.terminal
+        } else {
+            &self.writer
+        };
+        sender.try_send(WriterMessage::Health(WriteRequest { id, deadline, progress: progress.clone(), reply: tx, work }))
             .map_err(|e| WriteFailure::queued(None, match e {
                 mpsc::TrySendError::Full(_) => WriteReason::Overloaded,
                 mpsc::TrySendError::Disconnected(_) => { state.status = StoreState::Failed; WriteReason::Failed }
             }))?;
+        self.shared.writer_ready.notify_one();
         Ok(PendingWrite { id, reply: rx, progress })
     }
     pub fn submit_metadata(&self, deadline: Instant) -> Result<PendingRead, ReadError> {
@@ -205,6 +278,11 @@ impl StoreHandle {
         Ok((pause, pending))
     }
     fn submit_read(&self, deadline: Instant, work: ReadWork) -> Result<PendingRead, ReadError> {
+        self.submit_read_as(deadline, work, |value| match value {
+            ReadValue::Metadata(metadata) => Some(metadata), _ => None,
+        })
+    }
+    fn submit_read_as<T>(&self, deadline: Instant, work: ReadWork, extract: fn(ReadValue) -> Option<T>) -> Result<PendingRead<T>, ReadError> {
         let mut state = lock(&self.shared.state);
         match state.status {
             StoreState::Failed => return Err(ReadError::Failed),
@@ -219,7 +297,7 @@ impl StoreHandle {
         state.next_reader = (start + 1) % self.readers.len();
         for offset in 0..self.readers.len() {
             match self.readers[(start + offset) % self.readers.len()].try_send(request) {
-                Ok(()) => return Ok(PendingRead { id, reply: rx }),
+                Ok(()) => return Ok(PendingRead { id, reply: rx, extract }),
                 Err(mpsc::TrySendError::Full(unsent)) => request = unsent,
                 Err(mpsc::TrySendError::Disconnected(_)) => { state.status = StoreState::Failed; return Err(ReadError::Failed); }
             }
@@ -313,19 +391,23 @@ impl Runtime {
         let shared = Arc::new(Shared {
             instance_id,
             state: Mutex::new(State { status: StoreState::Running, degradation_generation: 0, next_id: Some(1), next_reader: 0, completed: VecDeque::new(), metrics: StoreMetrics::default() }), closing: AtomicBool::new(false),
+            writer_ready: Condvar::new(),
             readers_alive: AtomicUsize::new(0), close_failed,
             workers: Mutex::new(Vec::new()),
             #[cfg(feature = "test-api")]
             skip_checkpoint: AtomicBool::new(false),
             #[cfg(feature = "test-api")]
             read_events: Mutex::new(VecDeque::new()),
+            #[cfg(feature = "test-api")]
+            writer_idle_probe: Mutex::new(None),
         });
         let (sender, receiver) = mpsc::sync_channel(options.queue_capacity);
-        let mut runtime = Self { handle: StoreHandle { shared: shared.clone(), writer: sender, readers: Vec::new() },
+        let (terminal, terminal_receiver) = mpsc::sync_channel(MAX_ACTIVE_RUNS);
+        let mut runtime = Self { handle: StoreHandle { shared: shared.clone(), writer: sender, terminal, readers: Vec::new() },
             threads: Vec::new(), ownership: Some(ownership), close_timeout: options.close_timeout };
         let s = shared.clone();
         let wal = root.join("instance.db-wal");
-        match spawn_worker(move || writer::run(conn.take(), receiver, s, wal), "yokai-writer") {
+        match spawn_worker(move || writer::run(conn.take(), receiver, terminal_receiver, s, wal), "yokai-writer") {
             Ok(handle) => runtime.threads.push(handle),
             Err(error) => {
                 // The failed spawn has dropped its RW closure. Close every RO connection
@@ -367,15 +449,24 @@ impl Runtime {
     pub(crate) fn is_locked(&self) -> bool { self.ownership.as_ref().is_some_and(InstanceLock::is_locked) }
 
     pub(crate) fn close(&mut self) -> Result<(), InstanceError> {
+        self.close_before(Instant::now() + self.close_timeout)
+    }
+
+    pub(crate) fn close_before(&mut self, deadline: Instant) -> Result<(), InstanceError> {
         if self.ownership.is_none() { return Ok(()); }
-        lock(&self.handle.shared.state).status = StoreState::ShuttingDown;
-        self.handle.shared.closing.store(true, Ordering::Release);
+        {
+            let shared = &self.handle.shared;
+            let mut state = lock(&shared.state);
+            state.status = StoreState::ShuttingDown;
+            shared.closing.store(true, Ordering::Release);
+            shared.writer_ready.notify_one();
+        }
         #[cfg(feature = "test-api")]
         if crate::failpoint::hit("close-before-workers-join").is_err() {
             if let Some(ownership) = self.ownership.take() { std::mem::forget(ownership); }
             return Err(InstanceError::CloseIncomplete);
         }
-        let deadline = Instant::now() + self.close_timeout;
+        let deadline = deadline.min(Instant::now() + self.close_timeout);
         while self.threads.iter().any(|handle| !handle.is_finished()) && Instant::now() < deadline {
             thread::sleep(Duration::from_millis(1));
         }
@@ -413,14 +504,21 @@ impl Runtime {
     pub(crate) fn set_next_request_id(&self, id: u64) { lock(&self.handle.shared.state).next_id = Some(id); }
 
     #[cfg(feature = "test-api")]
+    pub(crate) fn observe_writer_idle(&self) -> Result<(), InstanceError> {
+        let (ready, observed) = mpsc::sync_channel(1);
+        *lock(&self.handle.shared.writer_idle_probe) = Some(ready);
+        observed.recv_timeout(Duration::from_secs(5)).map_err(|e| InstanceError::Store(e.to_string()))
+    }
+
+    #[cfg(feature = "test-api")]
     pub(crate) fn block_writer(&self) -> Result<crate::test_api::Pause, InstanceError> {
         let (tx, rx) = mpsc::sync_channel(1);
         let pause = crate::test_api::Pause::new();
         let released = pause.released.clone();
-        self.handle.writer.try_send(WriterMessage::Control(Box::new(move |_| {
+        self.send_control(WriterMessage::Control(Box::new(move |_| {
             let _ = tx.send(());
             while !released.load(Ordering::Acquire) { thread::sleep(Duration::from_millis(1)); }
-        }))).map_err(|e| InstanceError::Store(e.to_string()))?;
+        })))?;
         rx.recv_timeout(Duration::from_secs(2)).map_err(|e| InstanceError::Store(e.to_string()))?;
         Ok(pause)
     }
@@ -428,10 +526,18 @@ impl Runtime {
     #[cfg(feature = "test-api")]
     pub(crate) fn control<T: Send + 'static>(&self, run: impl FnOnce(&Connection) -> Result<T, String> + Send + 'static) -> Result<T, InstanceError> {
         let (tx, rx) = mpsc::sync_channel(1);
-        self.handle.writer.try_send(WriterMessage::Control(Box::new(move |c| { let _ = tx.send(run(c)); })))
-            .map_err(|e| InstanceError::Store(format!("test control admission: {e}")))?;
+        self.send_control(WriterMessage::Control(Box::new(move |c| { let _ = tx.send(run(c)); })))?;
         rx.recv_timeout(Duration::from_secs(10)).map_err(|e| InstanceError::Store(e.to_string()))?
             .map_err(InstanceError::Store)
+    }
+
+    #[cfg(feature = "test-api")]
+    fn send_control(&self, message: WriterMessage) -> Result<(), InstanceError> {
+        let shared = &self.handle.shared;
+        let _state = lock(&shared.state);
+        self.handle.writer.try_send(message).map_err(|e| InstanceError::Store(format!("test control admission: {e}")))?;
+        shared.writer_ready.notify_one();
+        Ok(())
     }
 
     #[cfg(feature = "test-api")]

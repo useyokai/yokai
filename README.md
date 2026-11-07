@@ -1,9 +1,9 @@
 # Yokai
 
 Yokai is a Windows-first, local-first, model-agnostic application in development.
-This checkout currently provides a Rust storage foundation. It does not yet
-contain a desktop application, a running supervisor, model adapters, or a
-conversation interface.
+This checkout provides a Rust storage foundation and a headless conversation
+service with a deterministic fake response. A desktop application, running
+supervisor and real model adapters are future work.
 
 ## Implemented foundation
 
@@ -13,8 +13,9 @@ conversation interface.
 - One owned writer, bounded read workers and queues, explicit deadlines,
   write-outcome classification, and coordinated close.
 - Durable command identity and digest checks, atomic command/run/job/event
-  records, and conservative startup epochs and holds. Jobs are records;
-  admission, claiming, execution, and dispatch are not implemented APIs.
+  records, and conservative startup epochs and holds.
+- Typed conversation admission, bounded fake streaming, committed responses
+  and replay after reopen. See the [headless demonstration](docs/m1-conversation-core.md).
 
 The [store documentation](crates/yokai-store/README.md) describes these contracts
 and their limits. Native Windows validation covers selected storage and file
@@ -27,9 +28,10 @@ durability, or a release-ready application.
 | --- | --- |
 | `yokai-store` | Instance lifecycle, migrations, owned SQLite workers, durable records |
 | `yokai-platform` | Filesystem locations, Instance locks, and randomness |
-| `yokai-types` | Shared Instance and command identifiers |
+| `yokai-types` | Shared identifiers and typed conversation requests and events |
 | `yokai-testsupport` | Explicit diagnostic harness support |
-| `yokai-exec`, `yokai-ipc`, `yokai-supervisor`, `yokai-vault` | Boundary stubs; runtime services are not implemented |
+| `yokai-exec` | In-process conversation runtime and deterministic fake |
+| `yokai-ipc`, `yokai-supervisor`, `yokai-vault` | Boundary stubs |
 
 Workspace members are explicit in [Cargo.toml](Cargo.toml). The toolchain is
 pinned by [rust-toolchain.toml](rust-toolchain.toml), and dependencies by
