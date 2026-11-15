@@ -25,6 +25,8 @@ impl FakeModel {
         progress: &SyncSender<Chunk>,
         deadline: Instant,
     ) -> Option<FakeOutcome> {
+        #[cfg(all(windows, feature = "test-api"))]
+        if !crate::local_runtime::test_api::before_fake(deadline) { return None; }
         #[cfg(feature = "test-api")]
         if let Some(test) = &self.test {
             if let Some(pause) = &test.pause {

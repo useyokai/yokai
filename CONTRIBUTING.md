@@ -32,6 +32,25 @@ See the [conversation core guide](docs/m1-conversation-core.md) for the headless
 example and the [focused harnesses](crates/yokai-store/tests/README.md#focused-conversation-checks)
 for checks that use fresh synthetic data.
 
+## Local runtime builds and checks
+
+The Windows targets include `yokai-runtime`, the `native_client` example,
+protocol/adapter tests and a custom cross-process helper. `yokai-exec/test-api`
+also enables the store, IPC and platform test APIs. Do not ship a runtime with
+these fixture controls enabled.
+
+Keep compilation separate from bounded runtime validation. Compile tests with
+`--no-run`, record the exact executable from Cargo JSON output, and invoke that
+executable directly during the runtime phase. `cargo test` without `--no-run`
+and `cargo run` can compile and do not belong in that phase. Compilation does
+not authorize every generated target.
+
+The [local runtime testing guide](docs/m1-local-runtime-testing.md) describes
+profiles, enrollment, fixture setup and evidence limits. `local_runtime_windows`
+requires an explicit case mode and externally owned runtime; it is not a
+self-contained suite. Do not use an unrestricted workspace test command to
+reproduce the selected matrix. Storage checks below have their own side effects.
+
 ## Running storage checks
 
 The custom harnesses require the explicit `test-api` feature and an absolute,

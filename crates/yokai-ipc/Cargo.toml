@@ -14,3 +14,21 @@ autobenches = false
 [lib]
 test = false
 doctest = false
+
+[dependencies]
+serde = { version = "=1.0.228", features = ["derive"] }
+serde_json = "=1.0.145"
+yokai-platform.workspace = true
+yokai-types.workspace = true
+
+[features]
+test-api = []
+
+[[example]]
+name = "native_client"
+path = "examples/native_client.rs"
+
+[[test]]
+name = "protocol"
+path = "tests/protocol.rs"
+required-features = ["test-api"]
