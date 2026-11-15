@@ -37,6 +37,10 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
+    if std::env::var_os("YOKAI_TEST_CONTROLLER_DIR").is_some() && selected != Some("FC-13") {
+        eprintln!("controller mode requires --only FC-13");
+        return ExitCode::FAILURE;
+    }
     let count = if selected.is_some() { 1 } else { checks.len() };
     println!("INFO WR-7 not_run: real ENOSPC requires a separately bounded size-limited tmpfs profile; max_page_count is simulated FULL only");
     println!("INFO FC-14 deferred: command identity and idempotent domain operations are outside the V1 storage API");
@@ -347,10 +351,57 @@ fn begin_failure() -> Result<String, String> {
     Ok(format!("never begun; observed autocommit; {error:?}; new-process reopen absent"))
 }
 fn truth(root: &Path, present: bool) -> Result<(), String> {
+    if std::env::var_os("YOKAI_TEST_CONTROLLER_DIR").is_some() {
+        if !present { return Err("controller mode requires a committed marker".into()); }
+        return controller_child(root);
+    }
     let out = Command::new(std::env::current_exe().map_err(|e| e.to_string())?).arg("__truth").arg(root)
         .arg(if present { "present" } else { "absent" }).stdin(Stdio::null()).output().map_err(|e| e.to_string())?;
     if !out.status.success() { return Err(format!("durable truth: {out:?}")); }
     Ok(())
+}
+
+fn controller_child(root: &Path) -> Result<(), String> {
+    use std::io::{Read, Write};
+    let token = std::env::var("YOKAI_TEST_CONTROLLER_TOKEN").map_err(|e| e.to_string())?;
+    if token.len() != 32 || !token.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)) {
+        return Err("invalid controller token".into());
+    }
+    let data = std::fs::canonicalize(std::env::var_os("YOKAI_TEST_DATA_DIR").ok_or("missing data root")?)
+        .map_err(|e| e.to_string())?;
+    let root = std::fs::canonicalize(root).map_err(|e| e.to_string())?;
+    let relative = root.strip_prefix(data).map_err(|e| e.to_string())?.to_str()
+        .ok_or("fixture path is not Unicode")?.replace('\\', "/");
+    if relative.is_empty() || relative.len() > 240 || relative.contains(['\r', '\n']) {
+        return Err("invalid controller fixture path".into());
+    }
+    let control = std::path::PathBuf::from(std::env::var_os("YOKAI_TEST_CONTROLLER_DIR").ok_or("missing controller directory")?);
+    let pending = control.join("controller-child.request.pending");
+    let mut request = std::fs::OpenOptions::new().write(true).create_new(true).open(&pending).map_err(|e| e.to_string())?;
+    writeln!(request, "{token}\n{relative}").map_err(|e| e.to_string())?;
+    request.sync_all().map_err(|e| e.to_string())?;
+    drop(request);
+    std::fs::rename(pending, control.join("controller-child.request")).map_err(|e| e.to_string())?;
+
+    let until = Instant::now() + Duration::from_secs(10);
+    loop {
+        if Instant::now() >= until { return Err("controller child confirmation timed out".into()); }
+        match std::fs::File::open(control.join("controller-child.result")) {
+            Ok(file) => {
+                let mut reply = String::new();
+                file.take(1025).read_to_string(&mut reply).map_err(|e| e.to_string())?;
+                let fields: Vec<_> = reply.lines().collect();
+                if reply.len() > 1024 || fields.len() != 5 || fields[0] != token || fields[1] != relative
+                    || fields[2].parse::<u32>().ok().filter(|n| *n > 0).is_none()
+                    || fields[3].parse::<u64>().ok().filter(|n| *n > 0).is_none() || fields[4] != "0" {
+                    return Err("invalid controller child confirmation".into());
+                }
+                return Ok(());
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => std::thread::sleep(Duration::from_millis(20)),
+            Err(error) => return Err(error.to_string()),
+        }
+    }
 }
 
 fn cancellation_boundaries() -> Result<String, String> {

@@ -10,6 +10,8 @@ pub use conversation::{
     StreamError, Submission,
 };
 pub use fake::Chunk;
+#[cfg(windows)]
+pub mod local_runtime;
 
 #[cfg(feature = "test-api")]
 pub mod test_api {

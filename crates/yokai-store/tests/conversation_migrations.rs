@@ -109,10 +109,14 @@ fn rollback() {
     let before = readonly(&root.join("instance.db"));
     let prior = history(&before);
     drop(before);
-    let child = Command::new(std::env::current_exe().unwrap())
-        .arg("--expect-v3-error").arg(&root)
-        .env("YOKAI_TEST_FAILPOINT", "migration-3-before-commit:error").output().unwrap();
-    assert!(child.status.success(), "{}", String::from_utf8_lossy(&child.stderr));
+    if std::env::var_os("YOKAI_TEST_CONTROLLER_DIR").is_some() {
+        controller_child(&root).unwrap();
+    } else {
+        let child = Command::new(std::env::current_exe().unwrap())
+            .arg("--expect-v3-error").arg(&root)
+            .env("YOKAI_TEST_FAILPOINT", "migration-3-before-commit:error").output().unwrap();
+        assert!(child.status.success(), "{}", String::from_utf8_lossy(&child.stderr));
+    }
     let conn = readonly(&root.join("instance.db"));
     assert_eq!(version(&conn), 2);
     assert_eq!(history(&conn), prior);
@@ -122,6 +126,49 @@ fn rollback() {
     let upgraded = store::open_instance(&root).unwrap();
     assert_eq!(store::test_api::user_version(&upgraded).unwrap(), 3);
     upgraded.close().unwrap();
+}
+
+fn controller_child(root: &Path) -> Result<(), String> {
+    use std::io::{Read, Write};
+    let token = std::env::var("YOKAI_TEST_CONTROLLER_TOKEN").map_err(|e| e.to_string())?;
+    if token.len() != 32 || !token.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)) {
+        return Err("invalid controller token".into());
+    }
+    let data = std::fs::canonicalize(std::env::var_os("YOKAI_TEST_DATA_DIR").ok_or("missing data root")?)
+        .map_err(|e| e.to_string())?;
+    let root = std::fs::canonicalize(root).map_err(|e| e.to_string())?;
+    let relative = root.strip_prefix(data).map_err(|e| e.to_string())?.to_str()
+        .ok_or("fixture path is not Unicode")?.replace('\\', "/");
+    if relative.is_empty() || relative.len() > 240 || relative.contains(['\r', '\n']) {
+        return Err("invalid controller fixture path".into());
+    }
+    let control = std::path::PathBuf::from(std::env::var_os("YOKAI_TEST_CONTROLLER_DIR").ok_or("missing controller directory")?);
+    let pending = control.join("controller-child.request.pending");
+    let mut request = std::fs::OpenOptions::new().write(true).create_new(true).open(&pending).map_err(|e| e.to_string())?;
+    writeln!(request, "{token}\n{relative}").map_err(|e| e.to_string())?;
+    request.sync_all().map_err(|e| e.to_string())?;
+    drop(request);
+    std::fs::rename(pending, control.join("controller-child.request")).map_err(|e| e.to_string())?;
+
+    let until = Instant::now() + Duration::from_secs(10);
+    loop {
+        if Instant::now() >= until { return Err("controller child confirmation timed out".into()); }
+        match std::fs::File::open(control.join("controller-child.result")) {
+            Ok(file) => {
+                let mut reply = String::new();
+                file.take(1025).read_to_string(&mut reply).map_err(|e| e.to_string())?;
+                let fields: Vec<_> = reply.lines().collect();
+                if reply.len() > 1024 || fields.len() != 5 || fields[0] != token || fields[1] != relative
+                    || fields[2].parse::<u32>().ok().filter(|n| *n > 0).is_none()
+                    || fields[3].parse::<u64>().ok().filter(|n| *n > 0).is_none() || fields[4] != "0" {
+                    return Err("invalid controller child confirmation".into());
+                }
+                return Ok(());
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => std::thread::sleep(Duration::from_millis(20)),
+            Err(error) => return Err(error.to_string()),
+        }
+    }
 }
 
 fn main() -> ExitCode {

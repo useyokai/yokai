@@ -12,10 +12,12 @@ autotests = false
 autobenches = false
 
 [lib]
-test = false
+test = true
 doctest = false
 
 [dependencies]
+yokai-ipc = { path = "../yokai-ipc" }
+yokai-platform.workspace = true
 yokai-store = { path = "../yokai-store" }
 yokai-types.workspace = true
 
@@ -23,7 +25,17 @@ yokai-types.workspace = true
 yokai-testsupport.workspace = true
 
 [features]
-test-api = ["yokai-store/test-api"]
+test-api = ["yokai-store/test-api", "yokai-ipc/test-api", "yokai-platform/test-api"]
+
+[[bin]]
+name = "yokai-runtime"
+path = "src/bin/yokai-runtime.rs"
+
+[[test]]
+name = "local_runtime_windows"
+path = "tests/local_runtime_windows.rs"
+harness = false
+required-features = ["test-api"]
 
 [[test]]
 name = "conversation_runtime"

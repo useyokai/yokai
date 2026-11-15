@@ -19,5 +19,24 @@ doctest = false
 getrandom = { workspace = true }
 yokai-types = { workspace = true }
 
+[target.'cfg(windows)'.dependencies]
+sha2.workspace = true
+windows-sys = { version = "=0.61.2", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
+    "Win32_System_Memory",
+    "Win32_System_Pipes",
+    "Win32_System_SystemServices",
+    "Win32_System_Threading",
+] }
+
 [features]
 test-api = []
+
+[[test]]
+name = "local_ipc_windows"
+path = "tests/local_ipc_windows.rs"
+required-features = ["test-api"]

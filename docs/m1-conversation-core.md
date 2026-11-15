@@ -1,5 +1,7 @@
 # Headless conversation core
 
+For the Windows transport, see [Local runtime connection](m1-local-runtime.md).
+
 The conversation runtime can accept a message, stream a deterministic reply,
 commit the result and replay it after an ordinary close and reopen. The trusted
 Rust caller owns the Instance and supplies command, conversation and message IDs.

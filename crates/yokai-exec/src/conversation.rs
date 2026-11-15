@@ -68,6 +68,23 @@ impl ConversationRuntime {
         self.client.clone()
     }
 
+    /// Permanently stop mutation admission while retaining the current owner.
+    pub(crate) fn begin_draining(&self) {
+        self.client.dispatch().closing = true;
+    }
+
+    /// Only a known worker drain can be retried; consuming the Instance or a
+    /// worker panic makes this false even if the public error is CloseIncomplete.
+    pub(crate) fn drain_retryable(&self) -> bool {
+        let dispatch = self.client.dispatch();
+        self.instance.is_some() && !self.close_failed && dispatch.closing && !dispatch.panicked
+    }
+
+    #[cfg(feature = "test-api")]
+    pub(crate) fn test_submit_fault(&self, request: SubmitMessage, deadline: Instant, observation_deadline: Instant, fault: yokai_store::test_api::WriteFault) -> Result<Decision, WriteFailure> {
+        yokai_store::test_api::submit_message_fault(self.instance.as_ref().expect("test owner"), request, deadline, fault)?.wait(observation_deadline)
+    }
+
     /// Stop admission and join fake workers before closing the store. If a fake
     /// worker misses the deadline, this owner retains the Instance for a later close.
     pub fn close(&mut self, deadline: Instant) -> Result<(), InstanceError> {
@@ -175,6 +192,10 @@ impl PendingCompletion {
 }
 
 impl ConversationClient {
+    pub fn store_state(&self) -> yokai_store::StoreState {
+        self.store.state()
+    }
+
     fn dispatch(&self) -> MutexGuard<'_, Dispatch> {
         self.dispatch.lock().unwrap_or_else(|error| error.into_inner())
     }
@@ -233,6 +254,8 @@ impl ConversationClient {
             drop(chunks);
             let Some(outcome) = outcome else { return; };
             let result = completion_permit.submit(outcome, deadline).and_then(|pending| pending.wait(deadline));
+            #[cfg(all(windows, feature = "test-api"))]
+            if result.is_ok() { crate::local_runtime::test_api::event("writer-confirmed"); }
             let _ = terminal.send(result);
         });
         match worker {
