@@ -96,3 +96,15 @@ input pinning, output gate, process limits, cleanup, and evidence custody.
 Submit a pull request with the concrete change, relevant checks, and material
 limits. Documentation changes that leave executable inputs unchanged need
 documentation checks rather than another runtime qualification batch.
+
+## Merging pull requests
+
+- **Squash and merge** self-contained PRs when intermediate commits are fixups,
+  review follow-ups, or work in progress. Use a commit message that describes
+  the change as merged.
+- **Create a merge commit** when the original commits serve as validation
+  checkpoints or when follow-up work depends on the branch’s ancestry. Identify
+  the relevant commits and checks in the PR.
+- **Record the revision actually tested.** Tie validation results to the exact
+  commit or source snapshot used. If a result is reported for the landed
+  revision, verify that revision and record the checks run.
