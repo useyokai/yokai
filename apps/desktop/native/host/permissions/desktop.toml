@@ -1,0 +1,4 @@
+[[permission]]
+identifier = "desktop-conversation"
+description = "Typed bounded conversation commands for the packaged main window."
+commands.allow = ["view_snapshot", "connect", "submit", "reconcile", "save_draft"]
