@@ -5,28 +5,46 @@ scope a reviewer can establish from the change.
 
 ## Windows build prerequisites
 
-The recorded native profile uses Rust and Cargo **1.99.0**, target
-`x86_64-pc-windows-msvc`, and an x64 MSVC developer environment with the Windows
-SDK. The recorded compiler tools were MSVC 14.51.36231. The linked bundled
-SQLite engine reported **3.53.2**; the runtime harness checks its version,
-source ID, and required compile options. A system SQLite installation is not
-used by the configured `rusqlite` dependency.
+Install [Rustup](https://rustup.rs/) and Visual Studio or Visual Studio Build
+Tools with the **Desktop development with C++** workload and a Windows SDK.
+Open **Developer PowerShell for VS** with the x64 host and target. Run the
+commands from the repository root. The recorded native build used Rust and
+Cargo **1.99.0**, MSVC **14.51.36231**, and the **10.0.26100.0** SDK.
 
-Have the pinned Rust toolchain, MSVC tools, and locked dependency cache available
-before running offline commands. Cargo's offline flags do not provision those
-prerequisites or constrain OS filesystem/network access. A fresh cache with
-missing archives will fail; do not silently switch to an online build.
-
-From the repository root in the configured native developer environment:
+For a fresh checkout with network access, install the pinned toolchain and
+download the locked dependencies once. [Cargo fetch documentation](https://doc.rust-lang.org/cargo/commands/cargo-fetch.html)
 
 ```powershell
-cargo check --workspace --all-targets --offline --locked --frozen -j 4
-cargo check --workspace --all-targets --features yokai-store/test-api,yokai-exec/test-api --offline --locked --frozen -j 4
-cargo build --workspace --release --offline --locked --frozen -j 4
+rustup toolchain install 1.99.0-x86_64-pc-windows-msvc --profile minimal
+rustc -Vv
+cargo fetch --locked --target x86_64-pc-windows-msvc
 ```
 
-The default checks omit custom targets that require `test-api`. The second
-command compiles those targets without executing them.
+Check that `rustc -Vv` reports release `1.99.0` and host
+`x86_64-pc-windows-msvc`. The `--frozen` flag uses the checked-in lockfile and
+the local cache without network access.
+
+## Build and run focused tests
+
+```powershell
+cargo check --workspace --all-targets --target x86_64-pc-windows-msvc --frozen -j 4
+cargo check --workspace --all-targets --features yokai-store/test-api,yokai-exec/test-api --target x86_64-pc-windows-msvc --frozen -j 4
+cargo build --workspace --release --target x86_64-pc-windows-msvc --frozen -j 4
+```
+
+The second command also checks compilation of the targets gated by
+`test-api`.
+
+Run these two checks with synthetic inputs. The conversation harness prints
+three `CHECK ... PASS` lines. The protocol test reports seven passing tests.
+Both checks run in memory. Use the Windows opt-in in a dedicated shell for
+synthetic tests because the harness cannot disable process dumps on Windows.
+
+```powershell
+$env:YOKAI_TEST_ALLOW_UNPROTECTED_WINDOWS = '1'
+cargo test -p yokai-types --test conversation_types --target x86_64-pc-windows-msvc --frozen -j 4
+cargo test -p yokai-ipc --features test-api --test protocol --target x86_64-pc-windows-msvc --frozen -j 4
+```
 
 See the [conversation core guide](docs/m1-conversation-core.md) for the headless
 example and the [focused harnesses](crates/yokai-store/tests/README.md#focused-conversation-checks)
@@ -63,12 +81,14 @@ Windows dumpability protection is unsupported. Set
 opt-in does not disable Windows Error Reporting or prevent crash dumps.
 
 After setting `YOKAI_TEST_DATA_DIR`, this command selects the self-contained
-SQLite target:
+SQLite target. It checks the bundled engine's version and source ID along
+with file-backed behavior. The dangling-link case records whether Windows
+allowed symlink creation.
 
 ```powershell
 if (-not $env:YOKAI_TEST_DATA_DIR) { throw 'Set YOKAI_TEST_DATA_DIR to the dedicated test directory.' }
 $env:YOKAI_TEST_ALLOW_UNPROTECTED_WINDOWS = '1'
-cargo test -p yokai-store --features test-api --test sqlite_runtime --offline --locked --frozen -j 4
+cargo test -p yokai-store --features test-api --test sqlite_runtime --target x86_64-pc-windows-msvc --frozen -j 4
 if ($LASTEXITCODE -ne 0) { throw 'SQLite validation failed; preserve the output and test directory.' }
 ```
 
@@ -92,6 +112,9 @@ input pinning, output gate, process limits, cleanup, and evidence custody.
 - Include only maintainable source and developer documentation. Keep raw logs,
   caches, binaries, local paths, private notes, credentials, and real Instance
   data out of commits and issue attachments.
+- Preserve third-party license and attribution notices. In the pull request,
+  identify upstream sources for copied code and explain dependency changes.
+- Follow [SECURITY.md](SECURITY.md) for suspected vulnerabilities.
 
 Submit a pull request with the concrete change, relevant checks, and material
 limits. Documentation changes that leave executable inputs unchanged need

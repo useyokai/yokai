@@ -1,12 +1,14 @@
 # Yokai
 
-Yokai is a Windows-first, local-first, model-agnostic application in development.
-This checkout provides a Rust storage foundation and a headless conversation
-service with a deterministic fake response. On Windows, a separate ordinary-user
-runtime exposes that service to an enrolled native client over local named pipes.
-A desktop application, running supervisor and real model adapters are future work.
+Yokai is a Windows-first, local-first application in development. The current
+checkout lets developers try a headless conversation, save it locally, and
+replay the committed messages after reopening.
 
-## Implemented foundation
+**Pre-alpha.** Rust APIs, CLI arguments, the local IPC protocol and its JSON
+records, and the on-disk Instance layout and SQLite schema are unstable.
+Compatibility across revisions is unguaranteed. Use disposable test data.
+
+## Implemented
 
 - Instance creation, exclusive ownership locks, path checks, and startup
   compatibility refusals.
@@ -15,16 +17,29 @@ A desktop application, running supervisor and real model adapters are future wor
   write-outcome classification, and coordinated close.
 - Durable command identity and digest checks, atomic command/run/job/event
   records, and conservative startup epochs and holds.
-- Typed conversation admission, bounded fake streaming, committed responses
-  and replay after reopen. See the [headless demonstration](docs/m1-conversation-core.md).
-- Authenticated local connections, bounded messages and explicit runtime
-  shutdown/reopen. See the [local runtime contract](docs/m1-local-runtime.md)
-  for the trusted same-user boundary, lifecycle behavior and validation limits.
+- A typed conversation service with a deterministic fake response, bounded
+  streaming, committed messages and replay after reopen.
+- A Windows runtime and sample native client that connect over authenticated
+  local named pipes within a trusted Windows user session. The runtime supports
+  explicit shutdown and reopen.
 
-The [store documentation](crates/yokai-store/README.md) describes these contracts
-and their limits. Native Windows validation covers selected storage and file
-semantics; it does not establish complete Windows qualification, power-loss
-durability, or a release-ready application.
+See the [headless demonstration](docs/m1-conversation-core.md), the
+[Windows runtime guide](docs/m1-local-runtime.md) and the
+[storage format guide](crates/yokai-store/README.md).
+
+## Tested
+
+Native Windows checks cover selected storage and filesystem behavior,
+synthetic conversation completion and replay, and selected local runtime
+paths including authenticated connections and ordinary shutdown and reopen.
+Power-loss durability and broader Windows storage and lifecycle qualification
+remain open. See the [storage harness guide](crates/yokai-store/tests/README.md)
+and the [runtime validation boundary](docs/m1-local-runtime.md#validation-boundary).
+
+## Planned
+
+- Desktop application and process supervision.
+- Real model adapters and credential management.
 
 ## Workspace layout
 
@@ -44,11 +59,13 @@ pinned by [rust-toolchain.toml](rust-toolchain.toml), and dependencies by
 
 ## Development
 
-See [CONTRIBUTING.md](CONTRIBUTING.md) for the validated Windows toolchain,
-offline build commands, and review workflow. The
-[storage harness guide](crates/yokai-store/tests/README.md) explains test inputs,
-platform exclusions, and the extra setup needed for the complete custom suite.
+See [CONTRIBUTING.md](CONTRIBUTING.md) for native Windows setup, build commands,
+and tests that run without historical fixtures. See [SECURITY.md](SECURITY.md)
+to report a vulnerability privately.
 
 ## License
 
-The source is licensed under [Apache License 2.0](LICENSE).
+Yokai source is licensed under the [Apache License 2.0](LICENSE).
+Third-party dependencies retain their own licenses. The Rust dependencies are
+pinned in [Cargo.lock](Cargo.lock). SQLite is bundled through
+`rusqlite` and `libsqlite3-sys`. [SQLite's public-domain dedication](https://www.sqlite.org/copyright.html)

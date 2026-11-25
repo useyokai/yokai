@@ -7,12 +7,15 @@ results. An unselected or platform-inapplicable check is not a pass.
 
 ## Focused conversation checks
 
-Use a separate fresh synthetic data directory for each target. On Windows
-apply the synthetic-data opt-in described in [Contributing](../../../CONTRIBUTING.md).
-The conversation targets cover request validation, V2-to-V3 migration,
-typed transactions and replay, and the in-process fake runtime.
+The conversation targets cover request validation, V2-to-V3 migration, typed
+transactions and replay, and the in-process fake runtime. On Windows set the
+synthetic-data opt-in before all four targets, including the in-memory
+`conversation_types` check. Before each of the three storage-backed targets,
+set `YOKAI_TEST_DATA_DIR` to a separate fresh absolute directory. See
+[Contributing](../../../CONTRIBUTING.md) for the Windows prerequisites.
 
 ~~~powershell
+$env:YOKAI_TEST_ALLOW_UNPROTECTED_WINDOWS = '1'
 cargo test -p yokai-types --test conversation_types --offline --locked --frozen -j 4
 cargo test -p yokai-store --features test-api --test conversation_migrations --offline --locked --frozen -j 4
 cargo test -p yokai-store --features test-api --test conversation_store --offline --locked --frozen -j 4
@@ -48,10 +51,9 @@ These 154 records describe the ordinary configured catalogue, including
 `WV-HOST-PATHS` and explicitly qualified platform branches. The separate
 [`WV-INTERFERENCE` profile](#controlled-defender-and-indexer-profile) requires
 an explicit selection and operator wrapper; it is not included in that count.
-The [host-path batch](https://github.com/useyokai/yokai/pull/31) passed 154/154.
-The later [controlled-interference batch](https://github.com/useyokai/yokai/pull/32)
-passed five baseline targets 128/128 plus its focused 1/1; it did not
-rerun the ordinary 154-check profile. R12 attempts
+The historical host-path batch passed 154/154. The later
+controlled-interference batch passed five baseline targets (128/128) and one
+focused check. R12 attempts
 the dangling-file-symlink subcheck on Windows and records `checked_windows`
 when the host supports it, or `not_checked` when that capability is unavailable.
 Earlier runs retain their original limits. The Windows-only target reports

@@ -1,5 +1,9 @@
 # Local runtime connection
 
+**Pre-alpha.** The Rust client API, pipe protocol, JSON messages, locators
+and enrollment records may change between revisions. Build the runtime and
+client from the same source revision.
+
 The Windows runtime owns one Instance and exposes the synthetic conversation
 service through a local named pipe. It reuses the existing writer and fake
 adapter. A separate native client creates conversations, submits messages,

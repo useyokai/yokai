@@ -1,5 +1,8 @@
 # Headless conversation core
 
+**Pre-alpha.** Conversation types, event payloads and replay cursors can
+change between revisions. Use disposable test data.
+
 For the Windows transport, see [Local runtime connection](m1-local-runtime.md).
 
 The conversation runtime can accept a message, stream a deterministic reply,

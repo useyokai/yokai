@@ -1,5 +1,9 @@
 # Instance storage
 
+**Pre-alpha.** The Rust storage API, Instance layout, SQLite schema and
+recovery snapshots may change between revisions. Use disposable test
+Instances and expect compatibility checks to refuse unsupported data.
+
 The current schema version is **3**. V1 contains the STRICT singleton
 `instance_meta` table and the owned runner's `yokai_schema_history` table.
 V2 adds STRICT `runtime_epoch`, `runs`, `commands`, `jobs` and `events` tables.
