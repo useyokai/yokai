@@ -1,0 +1,2 @@
+# Migration history hashes the exact SQL bytes embedded at compile time.
+crates/yokai-store/migrations/*.sql text eol=lf

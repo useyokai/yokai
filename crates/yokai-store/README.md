@@ -12,6 +12,9 @@ events. The opaque command API continues to create records only. The typed
 conversation operations admit and settle their own fake runs.
 
 SQL lives in `migrations/V{n}__{name}.sql` and is embedded at compile time.
+Migration checksums use the exact SQL bytes. Git checks these files out with
+LF line endings on every platform. If your checkout predates this rule, use
+a fresh clone for your next build and a fresh directory for synthetic data.
 Each migration ends with its matching `PRAGMA user_version = n;`. The
 conservative lint rejects transaction control, connection-changing statements
 and quoted identifiers; only the exact command refusal trigger grammar is allowed.
