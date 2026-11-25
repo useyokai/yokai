@@ -4,7 +4,8 @@ Yokai is a Windows-first, local-first, model-agnostic application in development
 This checkout provides a Rust storage foundation and a headless conversation
 service with a deterministic fake response. On Windows, a separate ordinary-user
 runtime exposes that service to an enrolled native client over local named pipes.
-A desktop application, running supervisor and real model adapters are future work.
+The [Windows desktop development client](apps/desktop/README.md) supports one
+pre-enrolled local Instance. A running supervisor and real model adapters are future work.
 
 ## Implemented foundation
 

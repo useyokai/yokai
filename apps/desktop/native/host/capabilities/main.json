@@ -1,0 +1,7 @@
+{
+  "identifier": "main",
+  "description": "Only the packaged conversation document can call the five desktop operations.",
+  "local": true,
+  "windows": ["main"],
+  "permissions": ["desktop-conversation"]
+}

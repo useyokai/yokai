@@ -1,0 +1,22 @@
+[package]
+name = "yokai-desktop-contract"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.99"
+publish = false
+
+[lib]
+path = "src/lib.rs"
+
+[features]
+default = []
+bindings = ["dep:ts-rs"]
+
+[dependencies]
+serde = { version = "=1.0.228", features = ["derive"] }
+ts-rs = { version = "=12.0.1", optional = true, default-features = false, features = ["serde-compat"] }
+
+[[bin]]
+name = "export-desktop-contract"
+path = "src/bin/export-desktop-contract.rs"
+required-features = ["bindings"]
