@@ -23,7 +23,7 @@ publish = false
 
 [workspace.dependencies]
 sha2 = { version = "=0.11.1", default-features = false }
-rusqlite = { version = "=0.40.2", default-features = false, features = ["bundled", "cache"] }
+rusqlite = { version = "=0.41.0", default-features = false, features = ["bundled", "cache"] }
 yokai-testsupport = { path = "crates/yokai-testsupport" }
 getrandom = { version = "=0.4.3", default-features = false }
 yokai-platform = { path = "crates/yokai-platform" }
