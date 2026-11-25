@@ -1,0 +1,28 @@
+[package]
+name = "yokai-desktop"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.99"
+publish = false
+
+[lib]
+path = "src/lib.rs"
+
+[features]
+default = []
+
+[dependencies]
+tauri = { version = "=2.12.5", default-features = false, features = ["wry", "custom-protocol"] }
+serde = { version = "=1.0.228", features = ["derive"] }
+serde_json = "=1.0.145"
+yokai-desktop-contract = { path = "../contract" }
+yokai-ipc = { path = "../../../../crates/yokai-ipc" }
+yokai-platform = { path = "../../../../crates/yokai-platform" }
+yokai-types = { path = "../../../../crates/yokai-types" }
+
+[build-dependencies]
+tauri-build = { version = "=2.7.4", default-features = false, features = ["config-json"] }
+
+[target.'cfg(windows)'.dependencies]
+webview2-com = { version = "=0.39.1", default-features = false }
+windows = { version = "=0.62.2", default-features = false, features = ["Win32_UI_Input_KeyboardAndMouse", "Win32_UI_WindowsAndMessaging"] }

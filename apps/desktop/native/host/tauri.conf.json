@@ -1,0 +1,15 @@
+{
+  "productName": "Yokai",
+  "version": "0.1.0",
+  "identifier": "com.useyokai.desktop",
+  "build": { "frontendDist": "../../dist" },
+  "app": {
+    "windows": [],
+    "withGlobalTauri": false,
+    "security": {
+      "capabilities": ["main"],
+      "csp": "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self'; font-src 'self'; connect-src ipc: https://ipc.localhost http://ipc.localhost; frame-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'"
+    }
+  },
+  "bundle": { "active": false }
+}
