@@ -8,7 +8,8 @@ use std::time::Duration;
 use rusqlite::{Connection, OpenFlags};
 
 /// Oldest SQLite release accepted at run time, as (major, minor, patch).
-pub const MIN_SQLITE_VERSION: (u32, u32, u32) = (3, 53, 0);
+/// The first SQLite release with the fix tracked by RUSTSEC-2026-0459.
+pub const MIN_SQLITE_VERSION: (u32, u32, u32) = (3, 54, 0);
 /// Busy timeout set on every connection, in milliseconds.
 pub const BUSY_TIMEOUT_MS: u64 = 5000;
 
